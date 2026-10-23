@@ -10,6 +10,7 @@ regenerates everything else.
 | `apps/<bundleId>/app.json` | hand-edited; created once by sync if missing |
 | `apps/<bundleId>/icon.png` | hand-edited; extracted once from the IPA if missing |
 | `apps/<bundleId>/versions/<semver>.json` | generated |
+| `apps/<bundleId>/retracted.json` | generated: withdrawn versions |
 | `source.json` | generated |
 
 Check everything locally:
@@ -131,6 +132,43 @@ and deletes it when its release is no longer published. Do not edit it.
 | `appJsonAssetId` | id of the release's `app.json` seed, if any (part of the cache key) |
 | `iconUnavailable` | `true` when the IPA had no usable icon, so it is not downloaded again |
 
+## Generated: withdrawn versions
+
+`apps/<bundleId>/retracted.json` lists the versions of an app that were withdrawn: their release was
+deleted, or turned back into a draft by someone other than sync (see
+[operations.md](operations.md#withdraw-a-version)). Only sync writes it, and only after a complete
+release listing. Do not edit it.
+
+```json
+{
+  "schemaVersion": 1,
+  "versions": {
+    "1.4.0": {
+      "date": "2026-10-23T07:13:00Z",
+      "reason": "deleted"
+    }
+  }
+}
+```
+
+| Key | Content |
+|---|---|
+| `schemaVersion` | `1` |
+| `versions` | one entry per withdrawn semver |
+| `date` | when sync noticed the withdrawal, `YYYY-MM-DDTHH:MM:SSZ` |
+| `reason` | `deleted` (the release is gone) or `unpublished` (the release is a draft) |
+
+- A release that sync takes down itself (a gate block, an unexpected asset, a draft titled
+  `[blocked] <tag>`) gets no entry.
+- When a release of the version is published again, sync removes its entry, and the file once it is
+  empty.
+- The file does not change `source.json`, which lists the published releases. It tells the builders
+  what not to build: `poll.yml`, `build.yml` (unless its `force` input is true) and `bin/alt build`
+  (unless `--force`) skip a listed version. `bin/alt status` shows the entries of every app, and
+  `PYTHONPATH=tools python3 -m altsource retracted --bid BID --version V` checks one version.
+- Deleting `apps/<bundleId>/` removes an app. Sync does not create the file again for an app without
+  releases unless it drops one of the app's records in that run.
+
 ## Generated: `source.json`
 
 Each listed app has its `app.json` fields with the defaults above, plus:
@@ -151,5 +189,5 @@ Each listed app has its `app.json` fields with the defaults above, plus:
 An app with no listed version, or with `hidden: true`, is left out.
 
 Clients treat the first listed version as the latest. If a bad version has to go, publish a higher
-version rather than deleting the newest release. Deleting it would offer the older version as an
-"update".
+version rather than only withdrawing the newest release. Withdrawing it would offer the older version
+as an "update" (see [operations.md](operations.md#what-clients-see)).

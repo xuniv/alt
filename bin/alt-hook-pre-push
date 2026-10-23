@@ -8,7 +8,9 @@
 # prints nothing, never fails and never delays the push. A pre-push hook that existed before was
 # moved to pre-push.alt-chained; it runs first, with the same arguments and input, and its exit
 # status still decides the push. Output of the background job, and a line for each skipped invalid
-# tag, goes to ${ALT_CACHE_DIR:-~/.cache/xuniv-alt}/hook.log.
+# tag, goes to ${ALT_CACHE_DIR:-~/.cache/xuniv-alt}/hook.log. The hook never passes --force, so
+# pushing a tag of a withdrawn version (apps/<bid>/retracted.json on main) again builds nothing:
+# "alt build" and build.yml refuse it. A tag of a new version builds as usual.
 
 ALT_BIN=@ALT_BIN@
 ALT_BID=@ALT_BID@

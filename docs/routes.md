@@ -133,7 +133,10 @@ PYTHONPATH=tools python3 -m altsource stage Demo.ipa --dry-run --denylist-file ~
    reset to `<bundleId> <semver>`.
 4. Replace an IPA that passed but is not in normalized form (it was published directly rather than
    through stage). See [Publishing a release directly](#publishing-a-release-directly).
-5. Delete records of releases that are no longer published. Create `apps/<bundleId>/icon.png` and
+5. Delete records of releases that are no longer published. A version whose release was deleted or
+   turned back into a draft (not by sync itself) is added to `apps/<bundleId>/retracted.json`; an
+   entry whose version is published again is removed (see
+   [operations.md](operations.md#withdraw-a-version)). Create `apps/<bundleId>/icon.png` and
    `app.json` if they are missing.
 6. Generate and validate `source.json`. Any validation error stops the run before a commit.
 7. Commit the changed files to `main` in one commit (`catalog: sync <n> app(s), <m> version(s)`). If
@@ -212,7 +215,10 @@ IPA and publishes it. To register an app, see
 ### How a build runs
 
 1. **app** (ubuntu, no secrets): validate the inputs, check that `apps/<bundleId>/app.json` enables
-   `privateBuild`, and work out the alias.
+   `privateBuild`, and work out the alias. Take the version from `ref` with `privateBuild.tagPattern`
+   and refuse a version listed in `apps/<bundleId>/retracted.json` (a
+   [withdrawn version](operations.md#withdraw-a-version)) unless the `force` input is true. A
+   refused build ends here, before any job that can read a secret.
 2. **resolve** (ubuntu, environment `alt-<ALIAS>`):
    - Read the environment's secrets `ALT_KEY` (deploy key) and `ALT_APP` (repository and build
      settings). If either is empty, the build fails.
@@ -372,11 +378,14 @@ up.
 
 ### Triggers
 
-- **On demand:** `bin/alt build io.example.demo v1.4.0 [--no-publish]` starts `build.yml` with
-  `app`, `ref` and `publish`. With `--no-publish`, the build and the gate run, but no release is
+- **On demand:** `bin/alt build io.example.demo v1.4.0 [--no-publish] [--force]` starts `build.yml`
+  with `app`, `ref` and `publish`. With `--no-publish`, the build and the gate run, but no release is
   created (the encrypted payload artifact is deleted as usual). It first checks the run title (see
   [What the public can see](#what-the-public-can-see)); a title with a denylist term or a home path is
-  refused with exit code 2, before any request to GitHub.
+  refused with exit code 2, before any request to GitHub. It then reads
+  `apps/<bundleId>/retracted.json` on `main` and refuses a withdrawn version; `--force` builds it
+  anyway and sets `build.yml`'s `force` input. If the file cannot be read, it only warns, because
+  `build.yml` checks again.
 - **On push, from your machine (the normal way to build new tags):**
   `bin/alt hook install <path-to-private-clone> --bid io.example.demo [--tag-glob 'v*']` installs a
   pre-push hook in that clone (default glob `v*`).
@@ -392,7 +401,9 @@ up.
     built tag becomes part of a public run title, so give release tags plain names.
   - The background job needs what every `bin/alt` command needs: `gh` logged in as `ALT_OWNER` and the
     local denylist. Its output, including any failure, goes only to `~/.cache/xuniv-alt/hook.log`.
-  - The tag must also match `privateBuild.tagPattern`, or the build fails in its resolve job.
+  - The tag must also match `privateBuild.tagPattern`, or the build fails in its first job.
+  - The hook never passes `--force`: pushing a tag of a withdrawn version again builds nothing, while
+    a tag of a new version builds as usual.
   - The hook stores the absolute path of `bin/alt`; after moving this checkout, run `hook install`
     again. Installing twice with the same options changes nothing. `hook install` refuses a
     repository that sets `core.hooksPath`.
@@ -400,8 +411,9 @@ up.
 - **Polling (manual repair):** `gh workflow run poll.yml -R xuniv/alt [-f app=BID] [-f dry_run=true]`
   checks every app whose `app.json` enables `privateBuild`, or only `app`. It lists the private tags
   with `git ls-remote` and keeps those that match `tagPattern`. It then starts `build.yml` for each
-  version that has no published release yet and no `build <bundleId> <ref>` run in the last 30 days
-  (its read-only token cannot see drafts). At most two builds start per app and run, newest first.
+  version that has no published release yet, no `build <bundleId> <ref>` run in the last 30 days
+  (its read-only token cannot see drafts) and no entry in `apps/<bundleId>/retracted.json`. It never
+  sets `force`. At most two builds start per app and run, newest first.
   Tags that `build.yml` would refuse, or whose run title contains a denylist term or a home path, are
   only counted as refused. With `dry_run` it only counts them. `poll.yml` has no schedule; new tags
   are built through the pre-push hook.

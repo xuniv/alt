@@ -55,13 +55,19 @@ they are pushed, through an optional local pre-push hook.
 
 Release tags follow `<bundleId>-v<semver>`, for example `io.example.demo-v1.4.0`.
 
+To withdraw a version, delete its release or turn it back into a draft (`bin/alt retract` does either
+and runs the catalog). Sync then drops it from `source.json` and records it in
+`apps/<bundleId>/retracted.json`, so a private build does not bring it back by itself. See
+[docs/operations.md](docs/operations.md#withdraw-a-version).
+
 ## Documentation
 
 - [docs/routes.md](docs/routes.md): the three routes, the tag grammar, what the gate rejects.
 - [docs/onboarding.md](docs/onboarding.md): one-time setup, then adding an app.
 - [docs/app-json.md](docs/app-json.md): `source.base.json`, `apps/<bundleId>/app.json` and the
   generated files.
-- [docs/operations.md](docs/operations.md): secrets, variables, workflows, recovery.
+- [docs/operations.md](docs/operations.md): secrets, variables, workflows, withdrawing a version,
+  recovery.
 
 ## Repository layout
 
@@ -71,6 +77,7 @@ source.json                    generated catalog (do not edit)
 apps/<bundleId>/app.json       app metadata (edited by hand; sync creates it once if missing)
 apps/<bundleId>/icon.png       app icon (edited by hand, or extracted from the IPA once)
 apps/<bundleId>/versions/*.json  per-version records (generated)
+apps/<bundleId>/retracted.json withdrawn versions that are not built again (generated)
 site/                          Pages landing page and fallback icon
 tools/altsource/               Python package behind every workflow step
 bin/alt                        operator command line

@@ -53,6 +53,7 @@ Local files used only by `bin/alt` (never by CI):
 | `~/.config/xuniv-alt/ipa-denylist` | local denylist, the same terms as the `ALT_DENYLIST` secret; `bin/alt` refuses to run without it |
 | `~/.config/xuniv-alt/log-identity.txt` | `age` identity for `bin/alt diag` |
 | `~/.cache/xuniv-alt/hook.log` | pre-push hook log |
+| `~/.cache/xuniv-alt/retract.log` | one line per `bin/alt retract`: time, tag, what changed and the `--reason` text |
 
 ## Workflows
 
@@ -60,9 +61,9 @@ Local files used only by `bin/alt` (never by CI):
 |---|---|---|
 | `catalog.yml` | release published, edited, unpublished, deleted, released, prereleased (relayed to `main` as `repository_dispatch` type `catalog`); push to `main` touching `apps/**/app.json`, `apps/**/icon.png`, `source.base.json` or `site/**`; daily at 04:43 UTC; manual (optional `rescan`); called by the other workflows | `sync --exit-zero`; deploy Pages when sync committed a change, and on every push or manual run; then a `report` job fails the run when sync blocked releases or hit errors |
 | `stage.yml` | manual (optional `tag`); scheduled windows | gate and publish pending drafts; `catalog.yml` when something was published; then a `report` job fails the run when a draft was rejected or failed |
-| `build.yml` | manual (`app`, `ref`, `publish`, `notes`); started by `bin/alt build`, the pre-push hook and `poll.yml` | route 2 build, gate, publish, then `catalog.yml` |
+| `build.yml` | manual (`app`, `ref`, `publish`, `notes`, `force`); started by `bin/alt build`, the pre-push hook and `poll.yml` | route 2 build, gate, publish, then `catalog.yml`; refuses a [withdrawn version](#withdraw-a-version) in its first job unless `force` is true |
 | `ingest.yml` | `repository_dispatch` type `ingest`; manual (`url`, `sha256`, `semver`, `notes`, `bundle_id`, `allow_home_paths`) | route 3 fetch, gate, publish, then `catalog.yml` |
-| `poll.yml` | manual only (optional `app`, `dry_run`); no schedule | start `build.yml` for new private tags |
+| `poll.yml` | manual only (optional `app`, `dry_run`); no schedule | start `build.yml` for new private tags; withdrawn versions are skipped |
 | `ci.yml` | push, pull request | unit tests and `validate`; `generate --check` on pull requests only; both catalog checks are skipped until `source.json` exists; no secrets |
 
 The scheduled windows of `stage.yml` are `17 1,7,13,19 * * *`: 01:17, 07:17, 13:17 and 19:17 UTC. They
@@ -79,13 +80,14 @@ the current `main`, so any queued run catches up with all earlier changes.
 |---|---|
 | `publish IPA [--semver V] [--notes-file F] [--defer]` | route 1: local gate, draft, then `stage.yml` |
 | `mirror OWNER/REPO TAG [--semver V] [--notes-file F] [--defer]` | route 1 from the single `*.ipa` of another repository's release |
-| `build BID REF [--no-publish]` | route 2: start `build.yml` |
+| `build BID REF [--no-publish] [--force]` | route 2: start `build.yml`; refuses a withdrawn version unless `--force` |
 | `ingest URL [--sha256 H] [--semver V] [--notes-file F] [--app-json F]` | route 3: send the `ingest` dispatch |
+| `retract BID VERSION [--unpublish] [--delete-tag] [--reason TEXT]` | [withdraw a version](#withdraw-a-version): delete its release (or turn it into a draft), then run `catalog.yml` |
 | `register OWNER/REPO --bid BID [--tag-pattern RE] [--build-json F] [--rotate]` | create the deploy key and the app's environment `alt-<ALIAS>` with its secrets |
 | `unregister BID OWNER/REPO` | delete the deploy key and the app's environment |
 | `payload-key [--rotate]` | create the `age` key pair that encrypts `build.yml`'s payload artifact |
 | `hook install PATH --bid BID [--tag-glob G]` / `hook uninstall PATH` | pre-push hook in a local clone of a private repository |
-| `status [--limit N]` | recent build, ingest, stage and catalog runs |
+| `status [--limit N]` | recent build, ingest, stage and catalog runs, and the withdrawn versions of every app |
 | `diag RUN_ID` | download and decrypt a build's log |
 | `doctor` | check the login, the local denylist, workflows, secrets, variables, app environments and Pages |
 
@@ -113,10 +115,12 @@ Run with `PYTHONPATH=tools` from the repository root.
 | `parse-tag TAG` | split a tag into bundle id and semver |
 | `alias BID` | print the alias that names the app's environment |
 | `resolve-build --bid B --ref R --checkout DIR [--json-out F]` | validate route 2 build settings |
+| `retracted --bid B [--version V]` | exit `0` when `apps/<B>/retracted.json` lists the version (without `--version`: any version), `4` when not |
 
 - Commands that scan take `--denylist-file F` (default: `ALT_DENYLIST`).
-- `sync`, `generate`, `validate` and `resolve-build` take `--root DIR`.
-- Exit codes: `0` success, `2` gate rejected or release blocked, `3` conflict, `1` anything else.
+- `sync`, `generate`, `validate`, `resolve-build` and `retracted` take `--root DIR`.
+- Exit codes: `0` success, `2` gate rejected or release blocked, `3` conflict, `4` not withdrawn
+  (`retracted` only), `1` anything else (for `retracted`, a `retracted.json` that is not valid).
 - With `--exit-zero`, `sync` and `stage-draft` exit `0` and report the counts only as outputs.
 
 Outputs, written to `$GITHUB_OUTPUT` when it is set:
@@ -149,6 +153,77 @@ undo the time it was public (see [routes.md](routes.md#publishing-a-release-dire
 
 Do not use the GitHub web editor for commits: it records the browser's time zone in the author date.
 Use `git` or the tools.
+
+## Withdraw a version
+
+A version leaves the source as soon as its release is no longer published. Withdraw it with
+`bin/alt retract`:
+
+```sh
+bin/alt retract io.example.demo 1.4.0                  # delete the release
+bin/alt retract io.example.demo 1.4.0 --delete-tag     # also delete the tag io.example.demo-v1.4.0
+bin/alt retract io.example.demo 1.4.0 --unpublish      # turn the release into a draft instead
+bin/alt retract io.example.demo 1.4.0 --dry-run        # print the changes only
+```
+
+The same works on GitHub: delete the release in the web UI or with
+`gh release delete io.example.demo-v1.4.0 -R xuniv/alt`, or turn it into a draft with
+`gh release edit io.example.demo-v1.4.0 -R xuniv/alt --draft=true`.
+
+`bin/alt retract` checks the login, push access and the local denylist like every command that writes.
+It finds the release `<bundleId>-v<version>`, published or draft, then:
+
+- by default deletes it, and every other release with the same tag, drafts included (a leftover draft
+  could be published again);
+- with `--unpublish` turns the published release into a draft, which keeps its IPA privately;
+- with `--delete-tag` (only together with deleting) also deletes the tag, after the release;
+- starts `catalog.yml` on `main`, so the removal does not depend on the release event, and prints the
+  source URL.
+
+It commits nothing. `--reason TEXT` (one line, at most 200 characters) is written only to the local
+log `~/.cache/xuniv-alt/retract.log`, with the time, the tag and what changed; it is never sent to
+GitHub.
+
+What happens next:
+
+1. The deletion or the change to a draft starts `catalog.yml` through its release event as well. In
+   that run or the dispatched one, whichever comes first, sync deletes the version's record and
+   `source.json` no longer lists the version. Pages then deploys the result.
+2. Sync adds the version to `apps/<bundleId>/retracted.json` with the date and the reason `deleted`
+   or `unpublished` (see [app-json.md](app-json.md#generated-withdrawn-versions)). Releases that sync
+   takes down itself, such as a draft titled `[blocked] <tag>`, get no entry. Do not edit the file.
+3. Builders skip the version. `poll.yml` does not start a build for it. `build.yml` refuses it in its
+   first job, which holds no secret, unless `force` is true. `bin/alt build` refuses it unless
+   `--force`. The pre-push hook never passes `--force`, so pushing the tag again builds nothing. A tag
+   of a new version builds as usual.
+4. Publishing it on purpose still works: `bin/alt publish`, `bin/alt mirror`, `stage.yml` and
+   `ingest.yml` only warn about a withdrawn version.
+
+`bin/alt status` lists the withdrawn versions of every app.
+
+A draft left by `--unpublish` is a pending draft. Scheduled `stage.yml` runs stage every pending
+draft and only warn about a withdrawn version, which publishes it again and ends the withdrawal.
+Delete the release when the version has to stay away.
+
+### Publish a withdrawn version again
+
+Publish a release for the version; `retracted.json` needs no edit. The next sync sees the published
+release and removes the entry (and the file when it is empty).
+
+- **Unpublished:** `gh workflow run stage.yml -R xuniv/alt -f tag=io.example.demo-v1.4.0` gates the
+  draft again and publishes it. `gh release edit io.example.demo-v1.4.0 -R xuniv/alt --draft=false`
+  publishes it directly, without the gate; sync checks it afterwards.
+- **Deleted, private build:** `bin/alt build io.example.demo v1.4.0 --force`.
+- **Deleted, other routes:** publish the IPA again with `bin/alt publish`, `bin/alt mirror` or
+  `bin/alt ingest`.
+
+### What clients see
+
+AltStore, SideStore and Feather treat the first listed version as the latest. Withdrawing the newest
+version makes the previous one the latest, and a device that installed the withdrawn build is offered
+the older one as an "update", because the clients compare version strings. `bin/alt retract` prints a
+note when this applies. If users already installed the version, publish a fixed higher version rather
+than only withdrawing it.
 
 ## Never enable Actions debug logging
 
@@ -290,7 +365,7 @@ normalize output), without writing them to disk. The build job uploads it on eve
 there when the gate job rejected the IPA; it is kept for 3 days. The gate's findings are in the public
 log of the gate job, as rule ids, counts and paths inside the IPA. After fixing the cause, run
 `bin/alt build BID REF` again, or tag a new version. `poll.yml` does not retry a tag that had a build
-run in the last 30 days.
+run in the last 30 days, nor a [withdrawn version](#withdraw-a-version).
 
 The build command runs under `env -i` (see [routes.md](routes.md#the-build-environment)). A script that
 reads runner variables (`RUNNER_TEMP`, `GITHUB_WORKSPACE`, `JAVA_HOME` and the like) finds them unset:

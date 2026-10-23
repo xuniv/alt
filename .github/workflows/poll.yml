@@ -11,8 +11,11 @@
 #   tags come from git ls-remote over SSH with the pinned host keys in .github/known_hosts, and versions
 #   from privateBuild.tagPattern (default ^v<semver>$). A version is a candidate when the token sees no
 #   release <bid>-v<version> (drafts are not listed for a read-only token) and no build.yml run titled
-#   "build <bid> <tag>" was created in the last 30 days, whatever its state. At most two builds per app
-#   are dispatched, newest version first. Job names carry no matrix values and the log shows counts only.
+#   "build <bid> <tag>" was created in the last 30 days, whatever its state, and the version is not
+#   listed in apps/<bid>/retracted.json (a withdrawn version, checked with python3 -m altsource
+#   retracted; build.yml refuses it as well, since poll never sets its force input). At most two
+#   builds per app are dispatched, newest version first. Job names carry no matrix values and the log
+#   shows counts only.
 #   The run title is public as soon as a build is dispatched, so a tag that build.yml would refuse as
 #   its ref, or whose run title holds a denylist term or a home path (repository secret ALT_DENYLIST,
 #   required), is never dispatched; it is only counted as refused.
@@ -197,7 +200,7 @@ jobs:
           fi
           rm -rf "$ssh_dir"
           python3 - "$RUNNER_TEMP/tags.txt" <<'PY'
-          import datetime, json, os, re, sys
+          import datetime, json, os, re, subprocess, sys
           from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
           from altsource.gh import GhError, GitHub
           from altsource.leaks import GateError, load_denylist, scan_text
@@ -221,6 +224,17 @@ jobs:
                       or name.endswith(("/", ".", ".lock"))):
                   return True
               return bool(scan_text("build %s %s" % (bid, name), denylist))
+
+
+          def withdrawn(version):
+              """apps/<bid>/retracted.json lists the version (exit 0) or not (exit 4)."""
+              proc = subprocess.run([sys.executable, "-m", "altsource", "retracted", "--bid", bid,
+                                     "--version", version], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              if proc.returncode not in (0, 4):
+                  print("::error::apps/<app>/retracted.json could not be checked")
+                  sys.exit(1)
+              return proc.returncode == 0
 
 
           try:
@@ -263,6 +277,8 @@ jobs:
               titles = {r.get("display_title") for r in runs if isinstance(r, dict)}
               candidates = [v for v, (name, tag) in versions.items()
                             if tag not in released and "build %s %s" % (bid, name) not in titles]
+              skipped = [v for v in candidates if withdrawn(v)]
+              candidates = [v for v in candidates if v not in skipped]
               candidates.sort(key=lambda v: parse_semver(deps, v), reverse=True)
               chosen = candidates[:MAX_PER_APP]
               if not dry_run:
@@ -272,7 +288,7 @@ jobs:
           except GhError as exc:
               print("::error::" + str(exc))
               sys.exit(1)
-          print("matching tags: %d, refused: %d, candidates: %d, %s: %d" % (
-              len(versions), len(refusals), len(candidates), "would dispatch" if dry_run else "dispatched",
-              len(chosen)))
+          print("matching tags: %d, refused: %d, withdrawn: %d, candidates: %d, %s: %d" % (
+              len(versions), len(refusals), len(skipped), len(candidates),
+              "would dispatch" if dry_run else "dispatched", len(chosen)))
           PY

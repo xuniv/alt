@@ -57,8 +57,9 @@ def load_alt():
 
 alt = load_alt()
 
+# a rule applies when every "match" item is an argument and every "pattern" regex finds an argument
 FAKE_GH = r'''
-import json, os, sys
+import json, os, re, sys
 state = os.environ["FAKE_GH_STATE"]
 argv = sys.argv[1:]
 data = sys.stdin.buffer.read()
@@ -67,7 +68,8 @@ with open(os.path.join(state, "calls.jsonl"), "a", encoding="utf-8") as fh:
 with open(os.path.join(state, "rules.json"), encoding="utf-8") as fh:
     rules = json.load(fh)
 for rule in rules:
-    if all(item in argv for item in rule["match"]):
+    if (all(item in argv for item in rule.get("match", []))
+            and all(any(re.search(p, a) for a in argv) for p in rule.get("pattern", []))):
         for option in ("--dir", "-D"):
             if option in argv and rule.get("files"):
                 target = argv[argv.index(option) + 1]
@@ -133,10 +135,25 @@ if not data.startswith("encrypted:"):
 sys.stdout.write(data[len("encrypted:"):])
 '''
 
+NOT_FOUND = {"code": 1, "stdout": {"message": "Not Found", "status": "404"}, "stderr": "gh: Not Found (HTTP 404)\n"}
 DEFAULT_RULES = [
     {"match": ["api", "user"], "stdout": "xuniv\n"},
     {"match": ["api", "repos/xuniv/alt"], "stdout": {"full_name": "xuniv/alt", "permissions": {"push": True}}},
+    # no app has withdrawn versions unless a test says so
+    dict(NOT_FOUND, match=["api"], pattern=[r"^repos/[^/]+/[^/]+/contents/apps/[^/]+/retracted\.json\?ref=main$"]),
+    {"match": ["api"], "pattern": [r"^repos/[^/]+/[^/]+/git/trees/main\?recursive=1$"],
+     "stdout": {"sha": "0" * 40, "tree": [], "truncated": False}},
 ]
+RETRACTED_PATH = "repos/xuniv/alt/contents/apps/%s/retracted.json?ref=main" % BID
+WITHDRAWN = {"1.2.3": {"date": "2026-10-22T07:13:00Z", "reason": "deleted"}}
+
+
+def retracted_rule(versions, bid=BID, repo="xuniv/alt"):
+    """The contents API answer for apps/<bid>/retracted.json on main."""
+    text = json.dumps({"schemaVersion": 1, "versions": versions}, indent=2, sort_keys=True) + "\n"
+    return {"match": ["api", "repos/%s/contents/apps/%s/retracted.json?ref=main" % (repo, bid)],
+            "stdout": {"type": "file", "encoding": "base64", "path": "apps/%s/retracted.json" % bid,
+                       "content": base64.encodebytes(text.encode("utf-8")).decode("ascii")}}
 
 
 class Untouchable:
@@ -384,6 +401,17 @@ class PublishTests(OperatorCase):
         self.assertTrue(rel["prerelease"])
         self.assertEqual(len(rel["assets"]), 1)
 
+    def test_publishing_a_withdrawn_version_only_warns(self):
+        self.set_rules(retracted_rule(WITHDRAWN))
+        code, out, err = self.run_alt("publish", self.ipa())
+        self.assertEqual(code, 0, err)
+        self.assertIn("version 1.2.3 of %s was withdrawn (deleted, 2026-10-22T07:13:00Z); publishing it again" % BID,
+                      err)
+        self.assertEqual(self.writes(), [["workflow", "run", "stage.yml", "-R", "xuniv/alt", "-f", "tag=" + TAG]])
+        self.assertIn(["api", RETRACTED_PATH], self.argvs())
+        code, _, err = self.run_alt("publish", self.ipa(short_version="1.2.4"), "--semver", "1.2.4", "--defer")
+        self.assertEqual((code, err), (0, ""))
+
     def test_local_argument_checks_come_before_gh(self):
         missing = os.path.join(self.dir, "missing.ipa")
         for argv in (("publish", missing), ("publish", self.ipa(), "--semver", "1.2"),
@@ -440,6 +468,13 @@ class MirrorTests(OperatorCase):
         self.assertEqual(code, 2)
         self.assertFalse(os.path.exists(self.download_dir()))
         self.assertEqual(self.stage_gh.mutations(), [])
+
+    def test_mirroring_a_withdrawn_version_only_warns(self):
+        self.set_rules(self.release_rule("Demo.ipa"), self.download_rule(), retracted_rule(WITHDRAWN))
+        code, _, err = self.run_alt("mirror", PRIVATE, "v1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("was withdrawn", err)
+        self.assertEqual(self.writes(), [["workflow", "run", "stage.yml", "-R", "xuniv/alt", "-f", "tag=" + TAG]])
 
     def test_mirror_validates_arguments(self):
         for argv in (("mirror", "no-slash", "v1"), ("mirror", PRIVATE, "--x"), ("mirror", PRIVATE, "a..b"),
@@ -504,6 +539,73 @@ class BuildTests(OperatorCase):
         self.assertEqual(self.calls(), [])
 
 
+class BuildWithdrawnTests(OperatorCase):
+    DISPATCH = ["workflow", "run", "build.yml", "-R", "xuniv/alt", "-f", "app=" + BID, "-f", "ref=v1.2.3",
+                "-f", "publish=true"]
+
+    def setUp(self):
+        super().setUp()
+        self.app_json({"privateBuild": {"enabled": True}})
+
+    def test_a_withdrawn_version_is_refused(self):
+        self.set_rules(retracted_rule(WITHDRAWN))
+        for argv in (("build", BID, "v1.2.3"), ("build", BID, "v1.2.3", "--no-publish"),
+                     ("--dry-run", "build", BID, "v1.2.3")):
+            code, out, err = self.run_alt(*argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn("version 1.2.3 of %s was withdrawn (deleted, 2026-10-22T07:13:00Z" % BID, err)
+            self.assertIn("pass --force", err)
+            self.assertNotIn("build.yml", out)
+        self.assertEqual(self.writes(), [])
+        self.assertIn(["api", RETRACTED_PATH], self.argvs())
+
+    def test_force_builds_it_and_says_so(self):
+        self.set_rules(retracted_rule(WITHDRAWN))
+        code, out, err = self.run_alt("build", BID, "v1.2.3", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [self.DISPATCH + ["-f", "force=true"]])
+        self.assertIn("building it because of --force", err)
+        self.assertIn("force=true", out)
+        code, out, _ = self.run_alt("--dry-run", "build", BID, "v1.2.3", "--force")
+        self.assertEqual(code, 0)
+        self.assertIn("-f publish=true -f force=true\n", out)
+
+    def test_other_versions_build_normally(self):
+        self.set_rules(retracted_rule(WITHDRAWN))
+        code, _, err = self.run_alt("build", BID, "v1.2.4")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.writes()[0][-1], "publish=true")  # force is only sent when given
+        code, _, err = self.run_alt("build", BID, "v1.2.4", "--force")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.writes()[1][-2:], ["-f", "force=true"])
+
+    def test_the_version_comes_from_the_tag_pattern(self):
+        pattern = r"^release-(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$"
+        self.app_json({"privateBuild": {"enabled": True, "tagPattern": pattern}})
+        self.set_rules(retracted_rule(WITHDRAWN))
+        self.assertEqual(self.run_alt("build", BID, "release-1.2.3")[0], 1)
+        code, _, err = self.run_alt("build", BID, "v1.2.3")  # build.yml refuses a ref outside the pattern
+        self.assertEqual(code, 0)
+        self.assertIn("does not match privateBuild.tagPattern", err)
+        self.assertIn("withdrawn versions were not checked", err)
+
+    def test_a_tombstone_that_cannot_be_read_only_warns(self):
+        # build.yml checks again in its first job, which holds no secret
+        bad = [{"match": ["api", RETRACTED_PATH], "code": 1, "stderr": "gh: Server Error (HTTP 502)\n"},
+               {"match": ["api", RETRACTED_PATH], "stdout": "not json"},
+               {"match": ["api", RETRACTED_PATH], "stdout": {"type": "file", "encoding": "base64",
+                                                            "content": base64.b64encode(b"{").decode()}},
+               {"match": ["api", RETRACTED_PATH], "stdout": {"type": "file", "encoding": "none", "content": ""}},
+               {"match": ["api", RETRACTED_PATH], "stdout": {"type": "file", "encoding": "base64",
+                "content": base64.b64encode(b'{"schemaVersion": 2, "versions": {}}').decode()}}]
+        for rule in bad:
+            self.set_rules(rule)
+            code, _, err = self.run_alt("build", BID, "v1.2.3")
+            self.assertEqual(code, 0, rule)
+            self.assertIn("build.yml checks withdrawn versions again", err)
+            self.assertEqual(self.writes()[-1], self.DISPATCH)
+
+
 class IngestTests(OperatorCase):
     URL = "https://downloads.example.invalid/files/Demo.ipa?x=1"
 
@@ -560,6 +662,187 @@ class IngestTests(OperatorCase):
         leaky = self.write(os.path.join(self.dir, "app2.json"), json.dumps({"subtitle": "leakyuser0 tools"}))
         self.assertEqual(self.run_alt("ingest", self.URL, "--app-json", leaky)[0], 2)
         self.assertEqual(self.writes(), [])
+
+
+class RetractTests(OperatorCase):
+    LIST_PAGE = "repos/xuniv/alt/releases?per_page=100&page=%d"
+    TAG_REF = "repos/xuniv/alt/git/ref/tags/" + TAG
+    CATALOG = ["workflow", "run", "catalog.yml", "-R", "xuniv/alt", "--ref", "main"]
+
+    @staticmethod
+    def rel(rid, tag=TAG, draft=False, name=None):
+        return {"id": rid, "tag_name": tag, "name": name or tag, "draft": draft}
+
+    def listing(self, *releases, page=1):
+        return {"match": ["api", self.LIST_PAGE % page], "stdout": list(releases)}
+
+    def standard(self, *extra, tag_present=None):
+        rules = list(extra) + [self.listing(self.rel(11), self.rel(12, "io.example.demo-v1.2.2"),
+                                            self.rel(13, "io.example.other-v9.0.0"))]
+        if tag_present is not None:
+            rules.append(dict({"match": ["api", self.TAG_REF]},
+                              **({"stdout": {"ref": "refs/tags/" + TAG}} if tag_present else NOT_FOUND)))
+        self.set_rules(*rules)
+
+    def log_text(self):
+        path = os.path.join(self.cache, "retract.log")
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_retract_deletes_the_release_and_runs_the_catalog(self):
+        self.standard()
+        code, out, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [["api", "--method", "DELETE", "repos/xuniv/alt/releases/11"], self.CATALOG])
+        self.assertIn("published release %s deleted" % TAG, out)
+        self.assertIn("dispatched catalog.yml on main: sync removes 1.2.3 from source.json and lists it in "
+                      "apps/%s/retracted.json" % BID, out)
+        self.assertIn("source: https://xuniv.github.io/alt/source.json\n", out)
+        self.assertIn("note: 1.2.3 was the newest published version: clients that installed it are offered 1.2.2 "
+                      "as an update", out)
+        self.assertNotIn(self.TAG_REF, [a[-1] for a in self.argvs()])  # the tag is kept by default
+        self.assertRegex(self.log_text(), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ %s deleted\n$" % TAG)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.cache, "retract.log")).st_mode), 0o600)
+
+    def test_delete_tag_deletes_the_tag_after_the_release(self):
+        self.standard(tag_present=True)
+        code, out, err = self.run_alt("retract", BID, "1.2.3", "--delete-tag", "--reason", "crashes on start")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [["api", "--method", "DELETE", "repos/xuniv/alt/releases/11"],
+                                         ["api", "--method", "DELETE", "repos/xuniv/alt/git/refs/tags/" + TAG],
+                                         self.CATALOG])
+        self.assertIn("tag %s deleted" % TAG, out)
+        self.assertTrue(self.log_text().endswith(" %s deleted, tag deleted; reason: crashes on start\n" % TAG))
+        for call in self.calls():  # the reason stays on this machine
+            self.assertNotIn("crashes", json.dumps(call))
+
+    def test_delete_tag_also_works_when_the_release_is_already_gone(self):
+        self.set_rules(self.listing(self.rel(12, "io.example.demo-v1.2.2")),
+                       {"match": ["api", self.TAG_REF], "stdout": {"ref": "refs/tags/" + TAG}})
+        code, _, err = self.run_alt("retract", BID, "1.2.3", "--delete-tag")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [["api", "--method", "DELETE", "repos/xuniv/alt/git/refs/tags/" + TAG],
+                                         self.CATALOG])
+        self.standard(tag_present=False)
+        code, out, _ = self.run_alt("retract", BID, "1.2.3", "--delete-tag")
+        self.assertEqual(code, 0)
+        self.assertIn("tag %s does not exist" % TAG, out)
+        self.assertEqual(self.writes()[2:], [["api", "--method", "DELETE", "repos/xuniv/alt/releases/11"],
+                                             self.CATALOG])
+
+    def test_drafts_with_the_same_tag_are_deleted_too(self):
+        # a leftover draft would otherwise be published again by a scheduled stage run
+        self.set_rules(self.listing(self.rel(11), self.rel(14, draft=True), self.rel(15, draft=True,
+                                                                                   name="[blocked] " + TAG)))
+        code, out, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([a[-1] for a in self.writes()[:-1]], ["repos/xuniv/alt/releases/%d" % i for i in (11, 14, 15)])
+        self.assertIn("draft release %s deleted" % TAG, out)
+        self.assertIn("note: no other published version of %s remains, so the app leaves source.json" % BID, out)
+
+    def test_unpublish_turns_the_release_into_a_draft(self):
+        self.standard()
+        code, out, err = self.run_alt("retract", BID, "1.2.3", "--unpublish")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [["api", "--method", "PATCH", "repos/xuniv/alt/releases/11", "--input", "-"],
+                                         self.CATALOG])
+        self.assertEqual(json.loads(self.call("api", "--method", "PATCH")["stdin"]), {"draft": True, "tag_name": TAG})
+        self.assertIn("release %s is a draft now" % TAG, out)
+        self.assertIn("to publish it again: gh workflow run stage.yml -R xuniv/alt -f tag=%s" % TAG, out)
+        self.assertTrue(self.log_text().endswith(" %s unpublished\n" % TAG))
+
+    def test_unpublishing_a_draft_changes_nothing_but_runs_the_catalog(self):
+        self.set_rules(self.listing(self.rel(11, draft=True)))
+        code, out, _ = self.run_alt("retract", BID, "1.2.3", "--unpublish")
+        self.assertEqual(code, 0)
+        self.assertIn("release %s is already a draft" % TAG, out)
+        self.assertNotIn("note:", out)
+        self.assertEqual(self.writes(), [self.CATALOG])
+
+    def test_a_higher_version_means_no_note(self):
+        self.set_rules(self.listing(self.rel(11), self.rel(16, "io.example.demo-v1.10.0"),
+                                    self.rel(17, "io.example.demo-v2.0.0", draft=True)))
+        code, out, _ = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 0)
+        self.assertNotIn("note:", out)
+
+    def test_the_listing_is_paged(self):
+        others = [self.rel(100 + i, "io.example.other-v1.0.%d" % i) for i in range(100)]
+        self.set_rules(self.listing(*others), self.listing(self.rel(11), page=2))
+        code, _, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes()[0][-1], "repos/xuniv/alt/releases/11")
+        self.assertEqual([a[-1] for a in self.argvs() if a[-1].startswith("repos/xuniv/alt/releases?")],
+                         [self.LIST_PAGE % 1, self.LIST_PAGE % 2])
+
+    def test_dry_run_prints_every_change(self):
+        self.standard(tag_present=True)
+        code, out, err = self.run_alt("retract", BID, "1.2.3", "--delete-tag", "--dry-run")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [])
+        self.assertIn("+ gh api --method DELETE repos/xuniv/alt/releases/11\n", out)
+        self.assertIn("+ gh api --method DELETE repos/xuniv/alt/git/refs/tags/%s\n" % TAG, out)
+        self.assertIn("+ gh workflow run catalog.yml -R xuniv/alt --ref main\n", out)
+        self.assertNotIn("deleted", out.replace("--method DELETE", ""))
+        code, out, _ = self.run_alt("--dry-run", "retract", BID, "1.2.3", "--unpublish")
+        self.assertEqual(code, 0)
+        self.assertIn("+ gh api --method PATCH repos/xuniv/alt/releases/11 --input -  # draft=true, tag_name=%s\n"
+                      % TAG, out)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.log_text(), "")
+
+    def test_not_found(self):
+        self.set_rules(self.listing(self.rel(12, "io.example.demo-v1.2.2")),
+                       dict(NOT_FOUND, match=["api", self.TAG_REF]))
+        for extra in ((), ("--unpublish",), ("--delete-tag",)):
+            code, _, err = self.run_alt("retract", BID, "1.2.3", *extra)
+            self.assertEqual(code, 1, extra)
+            self.assertIn("no release uses tag %s" % TAG, err)
+        self.assertEqual(self.writes(), [])
+
+    def test_a_failed_change_stops_before_the_catalog_run(self):
+        self.standard({"match": ["api", "--method", "DELETE"], "code": 1, "stderr": "gh: Forbidden (HTTP 403)\n"})
+        code, _, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 403", err)
+        self.assertNotIn(self.CATALOG, self.argvs())
+        self.assertEqual(self.log_text(), "")
+        self.standard({"match": ["api", self.TAG_REF], "code": 1, "stderr": "gh: Server Error (HTTP 500)\n"})
+        self.assertEqual(self.run_alt("retract", BID, "1.2.3", "--delete-tag")[0], 1)
+        self.assertEqual(self.writes(), [["api", "--method", "DELETE", "repos/xuniv/alt/releases/11"]])
+
+    def test_arguments_are_checked_before_gh(self):
+        for argv in (("retract", "io.example.app-v2", "1.2.3"), ("retract", "a b", "1.2.3"),
+                     ("retract", BID, "v1.2.3"), ("retract", BID, "1.2"), ("retract", BID, "1.2.3+5"),
+                     ("retract", BID, "01.2.3"), ("retract", BID, "1.2.3", "--unpublish", "--delete-tag"),
+                     ("retract", BID, "1.2.3", "--reason", "two\nlines"), ("retract", BID, "1.2.3", "--reason", " "),
+                     ("retract", BID, "1.2.3", "--reason", "x" * 201), ("retract", BID)):
+            code, _, err = self.run_alt(*argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn("alt: error:", err)
+        self.assertEqual(self.calls(), [])
+
+    def test_login_denylist_and_push_access_are_required(self):
+        self.standard()
+        os.unlink(self.denylist)
+        self.assertEqual(self.run_alt("retract", BID, "1.2.3")[0], 1)
+        self.assertEqual(self.calls(), [])
+        self.write(self.denylist, "leaky-host-0\n")
+        self.standard({"match": ["api", "user"], "stdout": "personal-account\n"})
+        code, out, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 1)
+        self.assertNotIn("personal-account", out + err)
+        self.standard({"match": ["api", "repos/xuniv/alt"], "stdout": {"full_name": "xuniv/alt",
+                                                                        "permissions": {"push": False}}})
+        self.assertEqual(self.run_alt("retract", BID, "1.2.3")[0], 1)
+        self.assertEqual(self.writes(), [])
+
+    def test_source_url_follows_the_repository(self):
+        self.assertEqual(alt.source_url("xuniv/alt"), "https://xuniv.github.io/alt/source.json")
+        self.assertEqual(alt.source_url("Example/site"), "https://example.github.io/site/source.json")
+        self.assertEqual(alt.source_url("example/example.github.io"), "https://example.github.io/source.json")
 
 
 class RegisterTests(OperatorCase):
@@ -1024,6 +1307,22 @@ class HookTests(OperatorCase):
                                           "-f", "ref=v1.2.3", "-f", "publish=true"]])
         self.assertIn("tag v1.2.3 pushed; starting alt build", self.log_text())
 
+    def test_pushing_a_tag_of_a_withdrawn_version_builds_nothing(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.set_rules(retracted_rule(WITHDRAWN))
+        self.assertEqual(self.install()[0], 0)
+        code = [line for line in self.read(self.hook).splitlines() if not line.lstrip().startswith("#")]
+        self.assertFalse([line for line in code if "force" in line], code)
+        self.git("tag", "v1.2.3")
+        self.git("push", "-q", "origin", "v1.2.3")
+        self.assertTrue(self.wait_for(lambda: "was withdrawn" in self.log_text()), self.log_text())
+        self.assertIn("pass --force", self.log_text())
+        self.assertEqual(self.builds(), [])
+        self.git("tag", "v1.2.4")  # a new version builds as usual
+        self.git("push", "-q", "origin", "v1.2.4")
+        self.assertTrue(self.wait_for(lambda: self.builds() and "dispatched" in self.log_text()), self.log_text())
+        self.assertEqual([a[-3] for a in self.builds()], ["ref=v1.2.4"])
+
     def test_pushing_an_annotated_tag_starts_a_build(self):
         self.app_json({"privateBuild": {"enabled": True}})
         self.assertEqual(self.install()[0], 0)
@@ -1113,6 +1412,44 @@ class StatusDiagDoctorTests(OperatorCase):
                          ["build.yml", "ingest.yml", "stage.yml", "catalog.yml"])
         self.assertTrue(all(a[a.index("--limit") + 1] == "3" for a in listed))
         self.assertEqual(self.run_alt("status", "--limit", "0")[0], 1)
+
+    def test_status_lists_withdrawn_versions_per_app(self):
+        tree = [{"path": "apps", "type": "tree"}, {"path": "apps/%s/app.json" % BID, "type": "blob"},
+                {"path": "apps/%s/retracted.json" % BID, "type": "blob"},
+                {"path": "apps/io.example.other/retracted.json", "type": "blob"},
+                {"path": "apps/io.example.other/versions/retracted.json", "type": "blob"},
+                {"path": "apps/io.example.empty/retracted.json", "type": "blob"}]
+        self.set_rules({"match": ["api", "repos/xuniv/alt/git/trees/main?recursive=1"],
+                        "stdout": {"tree": tree, "truncated": False}},
+                       retracted_rule({"1.2.3": {"date": "2026-10-22T07:13:00Z", "reason": "deleted"},
+                                       "1.10.0": {"date": "2026-10-23T01:00:00Z", "reason": "unpublished"},
+                                       "v9": {}}),
+                       retracted_rule({"0.1.0": {"date": "2026-10-20T00:00:00Z", "reason": "deleted\x1b[2J"}},
+                                      bid="io.example.other"),
+                       retracted_rule({}, bid="io.example.empty"),
+                       {"match": ["run", "list"], "stdout": []})
+        code, out, err = self.run_alt("status")
+        self.assertEqual(code, 0, err)
+        section = out[out.index("withdrawn versions (apps/*/retracted.json on main)\n"):].splitlines()[1:]
+        self.assertEqual([line.split()[:3] for line in section],
+                         [[BID, "1.10.0", "unpublished,"], [BID, "1.2.3", "deleted,"],
+                          ["io.example.other", "0.1.0", "2026-10-20T00:00:00Z"]])
+        self.assertNotIn("\x1b", out)
+        self.assertEqual(self.writes(), [])
+
+    def test_status_without_withdrawn_versions_and_when_unavailable(self):
+        self.set_rules({"match": ["run", "list"], "stdout": []})
+        code, out, _ = self.run_alt("status")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.endswith("withdrawn versions (apps/*/retracted.json on main)\n  none\n"), out)
+        for rule in ({"match": ["api", "repos/xuniv/alt/git/trees/main?recursive=1"], "code": 1,
+                      "stderr": "gh: Server Error (HTTP 500)\n"},
+                     {"match": ["api", "repos/xuniv/alt/git/trees/main?recursive=1"],
+                      "stdout": {"tree": [], "truncated": True}}):
+            self.set_rules(rule, {"match": ["run", "list"], "stdout": []})
+            code, out, _ = self.run_alt("status")
+            self.assertEqual(code, 1, rule)
+            self.assertIn("withdrawn versions (apps/*/retracted.json on main)\n  unavailable: ", out)
 
     def test_diag_decrypts_without_writing_plain_text(self):
         self.write(os.path.join(self.config, "log-identity.txt"), "AGE-SECRET-KEY-PLACEHOLDER\n")
@@ -1292,11 +1629,23 @@ BUILD_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "build.yml")
 FILE_COMMANDS = ("GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY")
 
 
-def step_script(path, name):
-    """The ``run: |`` block of the step called ``name`` (the workflow is read as text; no YAML parser)."""
+def job_lines(path, job):
+    """(first, end) line indexes of the job ``job`` in the workflow at ``path``."""
     with open(path, encoding="utf-8") as fh:
         lines = fh.read().splitlines()
-    start = [i for i, line in enumerate(lines) if line.strip() == "- name: %s" % name]
+    first = lines.index("  %s:" % job)
+    end = next((i for i in range(first + 1, len(lines))
+                if lines[i].startswith("  ") and not lines[i].startswith("   ") and lines[i].strip()), len(lines))
+    return first, end
+
+
+def step_script(path, name, job=None):
+    """The ``run: |`` block of the step called ``name`` (the workflow is read as text; no YAML parser),
+    optionally only within the job ``job``."""
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    first, end = job_lines(path, job) if job else (0, len(lines))
+    start = [i for i, line in enumerate(lines) if line.strip() == "- name: %s" % name and first <= i < end]
     if len(start) != 1:
         raise AssertionError("expected one step named %r" % name)
     key_indent = len(lines[start[0]]) - len(lines[start[0]].lstrip()) + 2
@@ -1420,6 +1769,223 @@ class BuildStepTests(unittest.TestCase):
                 self.assertIn("private-build-output", self.read("diag", "build.log"))
                 proc = self.run_step(bash, "false | true\necho reached")  # pipefail applies to the command
                 self.assertRegex(proc.stdout.decode(), r"^build failed, exit 1, ")
+
+
+POLL_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "poll.yml")
+CATALOG_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "catalog.yml")
+TOOLS = os.path.join(ROOT, "tools")
+
+# Stand-in for "python3 -m altsource retracted --bid B --version V" (exit 0 listed, 4 not listed, else
+# an error), used only while the command is not part of tools/altsource. The package shadows the real
+# one and extends its __path__, so every other module and command is the real one.
+SHIM_INIT = "__path__.append(%r)\n"
+SHIM_MAIN = r"""
+import argparse, json, os, sys
+if sys.argv[1:2] == ["retracted"]:
+    if %(broken)r:
+        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command")
+    parser.add_argument("--bid", required=True)
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--root", default=".")
+    args = parser.parse_args()
+    path = os.path.join(args.root, "apps", args.bid, "retracted.json")
+    if not os.path.exists(path):
+        sys.exit(4)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except ValueError:
+        sys.exit(1)
+    versions = data.get("versions") if isinstance(data, dict) else None
+    if data.get("schemaVersion") != 1 or not isinstance(versions, dict):
+        sys.exit(1)
+    sys.exit(0 if args.version in versions else 4)
+from altsource.cli import main
+sys.exit(main())
+"""
+_RETRACTED_CLI = []
+
+
+def retracted_cli_available():
+    """Whether tools/altsource already provides the retracted command."""
+    if not _RETRACTED_CLI:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run([sys.executable, "-m", "altsource", "retracted", "--help"], cwd=tmp,
+                                  env=dict(os.environ, PYTHONPATH=TOOLS), capture_output=True)
+        _RETRACTED_CLI.append(proc.returncode == 0)
+    return _RETRACTED_CLI[0]
+
+
+def altsource_path(folder, broken=False):
+    """PYTHONPATH for the workflow scripts: the real tools, or the stand-in above in front of them
+    when the retracted command is missing (always with ``broken``, whose command fails)."""
+    if retracted_cli_available() and not broken:
+        return TOOLS
+    package = os.path.join(folder, "altsource")
+    os.makedirs(package, exist_ok=True)
+    with open(os.path.join(package, "__init__.py"), "w", encoding="utf-8") as fh:
+        fh.write(SHIM_INIT % os.path.join(TOOLS, "altsource"))
+    with open(os.path.join(package, "__main__.py"), "w", encoding="utf-8") as fh:
+        fh.write(SHIM_MAIN % {"broken": broken})
+    return folder + os.pathsep + TOOLS
+
+
+def heredoc(script, opener):
+    """The body of the here-document that starts on the line ``opener`` and ends at ``PY``."""
+    lines = script.splitlines()
+    start = lines.index(opener)
+    return "\n".join(lines[start + 1:lines.index("PY", start)]) + "\n"
+
+
+class WithdrawnWorkflowCase(OperatorCase):
+    """A checkout of this repository with one private build app; fake gh as in the operator tests."""
+
+    def setUp(self):
+        super().setUp()
+        self.app_json({"privateBuild": {"enabled": True}})
+
+    def retract(self, *versions, bid=BID):
+        text = json.dumps({"schemaVersion": 1, "versions": {
+            v: {"date": "2026-10-22T07:13:00Z", "reason": "deleted"} for v in versions}}, indent=2, sort_keys=True)
+        self.write(os.path.join(self.root, "apps", bid, "retracted.json"), text + "\n")
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("python3"), "needs bash and python3")
+class BuildFirstJobTests(WithdrawnWorkflowCase):
+    """build.yml's app job refuses a withdrawn version unless force is set, before any secret is used."""
+
+    def run_check(self, ref="v1.2.3", force="false", broken=False):
+        script = step_script(BUILD_WORKFLOW, "Check the version", job="app")
+        temp = self.mkdir("runner-temp")
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.home, "RUNNER_TEMP": temp,
+               "PYTHONPATH": altsource_path(self.mkdir("shim"), broken=broken), "APP": BID, "REF": ref,
+               "FORCE": force, "GITHUB_ACTIONS": "true"}
+        proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=self.root,
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True)
+        return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
+
+    def test_a_withdrawn_version_is_refused_unless_forced(self):
+        self.retract("1.2.3")
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::version 1.2.3 was withdrawn (apps/%s/retracted.json); dispatch the build with "
+                      "force=true" % BID, out)
+        code, out, _ = self.run_check(force="true")
+        self.assertEqual(code, 0, out)
+        self.assertIn("::warning::version 1.2.3 was withdrawn; building it because force is set", out)
+
+    def test_other_versions_and_apps_without_the_file_pass(self):
+        self.retract("1.2.3")
+        code, out, _ = self.run_check(ref="v1.2.4")
+        self.assertEqual(code, 0, out)
+        self.assertIn("version 1.2.4: not withdrawn", out)
+        os.unlink(os.path.join(self.root, "apps", BID, "retracted.json"))
+        self.assertEqual(self.run_check()[0], 0)
+
+    def test_the_version_comes_from_the_tag_pattern(self):
+        pattern = r"^app-(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$"
+        self.app_json({"privateBuild": {"enabled": True, "tagPattern": pattern}})
+        self.retract("1.2.3")
+        self.assertEqual(self.run_check(ref="app-1.2.3")[0], 1)
+        self.assertEqual(self.run_check(ref="app-1.2.4")[0], 0)
+        code, out, _ = self.run_check(ref="v1.2.4")  # outside the pattern: refused here, not in a later job
+        self.assertEqual(code, 1)
+        self.assertIn("::error::ref does not match privateBuild.tagPattern", out)
+
+    def test_an_unreadable_file_fails_closed(self):
+        self.retract("1.2.3")
+        code, out, _ = self.run_check(ref="v1.2.4", broken=True)
+        self.assertEqual(code, 1)
+        self.assertIn("::error::apps/%s/retracted.json could not be checked (exit 1)" % BID, out)
+
+    def test_validate_inputs_wants_a_boolean_force(self):
+        script = step_script(BUILD_WORKFLOW, "Validate inputs", job="app")
+        event = self.write(os.path.join(self.dir, "event.json"), json.dumps({"inputs": {"notes": ""}}))
+        for force, expected in (("false", 0), ("true", 0), ("", 1), ("yes", 1)):
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_REF": "refs/heads/main",
+                   "GITHUB_EVENT_PATH": event, "APP": BID, "REF": "v1.2.3", "PUBLISH": "true", "FORCE": force}
+            proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=self.dir,
+                                  env=env, stdin=subprocess.DEVNULL, capture_output=True)
+            self.assertEqual(proc.returncode, expected, (force, proc.stdout))
+
+    def test_the_check_runs_in_the_job_without_secrets(self):
+        with open(BUILD_WORKFLOW, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        first, end = job_lines(BUILD_WORKFLOW, "app")
+        app_job = "\n".join(lines[first:end])
+        self.assertNotIn("secrets.", app_job)
+        self.assertNotRegex(app_job, r"\n    environment:")
+        self.assertIn("python3 -m altsource retracted --bid", app_job)
+        self.assertIn("FORCE: ${{ inputs.force }}", app_job)
+        for job in ("resolve", "build"):  # every job that can read a secret comes after it
+            first, end = job_lines(BUILD_WORKFLOW, job)
+            self.assertRegex("\n".join(lines[first:end]), r"\n    needs: (app|\[app, resolve\])\n")
+        inputs = "\n".join(lines[lines.index("      force:"):lines.index("      force:") + 4])
+        self.assertIn("type: boolean", inputs)
+        self.assertIn("default: false", inputs)
+
+
+class PollWithdrawnTests(WithdrawnWorkflowCase):
+    """The version selection of poll.yml skips withdrawn versions and never sets build.yml's force."""
+
+    RUNS = r"^repos/xuniv/alt/actions/workflows/build\.yml/runs\?created=%3E%3D\d{4}-\d\d-\d\d&per_page=100&page=1$"
+
+    def run_poll(self, tags, dry_run="false", broken=False, released=()):
+        script = heredoc(step_script(POLL_WORKFLOW, "Find new versions"), 'python3 - "$RUNNER_TEMP/tags.txt" <<\'PY\'')
+        program = self.write(os.path.join(self.dir, "poll.py"), script)
+        listing = self.write(os.path.join(self.dir, "tags.txt"),
+                             "".join("%s\trefs/tags/%s\n" % ("a" * 40, tag) for tag in tags))
+        self.set_rules({"match": ["repos/xuniv/alt/releases?per_page=100&page=1"],
+                        "stdout": [{"id": i + 1, "tag_name": t, "draft": False} for i, t in enumerate(released)]},
+                       {"pattern": [self.RUNS], "stdout": {"total_count": 0, "workflow_runs": []}})
+        env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
+               "PYTHONPATH": altsource_path(self.mkdir("shim"), broken=broken), "ALT_REPO": "xuniv/alt",
+               "BID": BID, "DRY_RUN": dry_run, "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true"}
+        proc = subprocess.run([sys.executable, program, listing], cwd=self.root, env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True)
+        return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
+
+    def dispatched(self):
+        return [json.loads(c["stdin"]) for c in self.calls()
+                if "repos/xuniv/alt/actions/workflows/build.yml/dispatches" in c["argv"]]
+
+    def test_withdrawn_versions_are_skipped(self):
+        self.retract("1.3.0", "1.2.3")
+        code, out, err = self.run_poll(["v1.2.3", "v1.2.4", "v1.3.0", "v1.1.0"], released=["io.example.demo-v1.1.0"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("matching tags: 4, refused: 0, withdrawn: 2, candidates: 1, dispatched: 1", out)
+        self.assertEqual(self.dispatched(), [{"ref": "main", "inputs": {"app": BID, "ref": "v1.2.4",
+                                                                        "publish": "true"}}])
+        self.assertNotIn("1.3.0", out + err)  # counts only
+
+    def test_without_withdrawn_versions_and_in_a_dry_run(self):
+        code, out, _ = self.run_poll(["v1.2.3", "v1.2.4", "v1.3.0"], dry_run="true")
+        self.assertEqual(code, 0, out)
+        self.assertIn("withdrawn: 0, candidates: 3, would dispatch: 2", out)
+        self.assertEqual(self.dispatched(), [])
+
+    def test_an_unreadable_file_dispatches_nothing(self):
+        self.retract("1.2.3")
+        code, out, _ = self.run_poll(["v1.2.4"], broken=True)
+        self.assertEqual(code, 1)
+        self.assertIn("::error::apps/<app>/retracted.json could not be checked", out)
+        self.assertEqual(self.dispatched(), [])
+
+
+class CatalogTriggerTests(unittest.TestCase):
+    def test_deleting_or_unpublishing_a_release_starts_the_catalog(self):
+        # bin/alt retract and the GitHub web UI rely on these events; retract also dispatches catalog.yml
+        with open(CATALOG_WORKFLOW, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        start = lines.index("  release:")
+        types = [line.strip() for line in lines[start + 1:start + 3] if line.strip().startswith("types:")]
+        self.assertEqual(len(types), 1)
+        listed = [t.strip() for t in types[0][len("types:"):].strip(" []").split(",")]
+        self.assertIn("deleted", listed)
+        self.assertIn("unpublished", listed)
+        self.assertIn("  workflow_dispatch:", lines)
 
 
 if __name__ == "__main__":

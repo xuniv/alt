@@ -8,6 +8,9 @@
 #              ^v<semver>$), which yields the version
 #     publish  boolean, default true; false stops after the gate (no release)
 #     notes    optional release notes, at most 4000 characters, gated like the IPA
+#     force    boolean, default false; build a version listed in apps/<app>/retracted.json (a
+#              withdrawn version) anyway. Only bin/alt build --force sets it; poll.yml and the
+#              pre-push hook never do.
 #   The run title is "build <app> <ref>"; poll.yml looks runs up by it. It is public from the moment
 #   of the dispatch, before the app job validates the inputs, so bin/alt build (also run by the
 #   pre-push hook) and poll.yml apply the same input rules and the denylist before they dispatch.
@@ -25,7 +28,10 @@
 #   runner gets its own app's ALT_APP and ALT_KEY and nothing else.
 #
 # Jobs
-#   app      (ubuntu, no secrets) validates the inputs and the app and outputs the alias.
+#   app      (ubuntu, no secrets) validates the inputs and the app, takes the version from ref with
+#            privateBuild.tagPattern, refuses a withdrawn version unless force is set (python3 -m
+#            altsource retracted) and outputs the alias. A refused build ends here, before any job
+#            that can read a secret.
 #   resolve  (ubuntu, environment alt-<ALIAS>) masks the repository name, fetches the tag over SSH
 #            with the pinned host keys in .github/known_hosts, reads .alt.json at the tag and
 #            validates the merged configuration.
@@ -73,6 +79,10 @@ on:
         type: string
         required: false
         default: ""
+      force:
+        description: Build even when the version was withdrawn (listed in apps/<app>/retracted.json)
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -95,6 +105,7 @@ jobs:
           APP: ${{ inputs.app }}
           REF: ${{ inputs.ref }}
           PUBLISH: ${{ inputs.publish }}
+          FORCE: ${{ inputs.force }}
         run: |
           export LC_ALL=C
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
@@ -119,6 +130,10 @@ jobs:
           esac
           if [[ ! "$PUBLISH" =~ ^(true|false)$ ]]; then
             echo "::error::publish must be true or false"
+            exit 1
+          fi
+          if [[ ! "$FORCE" =~ ^(true|false)$ ]]; then
+            echo "::error::force must be true or false"
             exit 1
           fi
           python3 - <<'PY'
@@ -161,6 +176,54 @@ jobs:
           fi
           echo "alias=$alias" >> "$GITHUB_OUTPUT"
           echo "environment: alt-$alias"
+
+      - name: Check the version
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          APP: ${{ inputs.app }}
+          REF: ${{ inputs.ref }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          # the rule of the resolve job and the gate job, applied before any job can read a secret
+          export LC_ALL=C
+          python3 - "$RUNNER_TEMP/alt-version" <<'PY'
+          import json, os, re, sys
+          from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
+          bid, ref = os.environ["APP"], os.environ["REF"]
+          try:
+              with open(os.path.join("apps", bid, "app.json"), encoding="utf-8") as fh:
+                  private = json.load(fh).get("privateBuild") or {}
+              match = re.fullmatch(private.get("tagPattern") or DEFAULT_TAG_PATTERN, ref)
+              version = match.group("version") if match and "version" in match.re.groupindex else None
+          except (OSError, ValueError, AttributeError, TypeError, re.error):
+              version = None
+          if not version or not re.fullmatch(SEMVER_PATTERN, version):
+              print("::error::ref does not match privateBuild.tagPattern or yields no semver")
+              sys.exit(1)
+          with open(sys.argv[1], "w", encoding="utf-8") as fh:
+              fh.write(version)
+          PY
+          version=$(cat "$RUNNER_TEMP/alt-version")
+          # exit 0: withdrawn, 4: not withdrawn, anything else: the file could not be read
+          python3 -m altsource retracted --bid "$APP" --version "$version" && code=0 || code=$?
+          case "$code" in
+            4)
+              echo "version $version: not withdrawn"
+              ;;
+            0)
+              if [ "$FORCE" != "true" ]; then
+                echo "::error::version $version was withdrawn (apps/$APP/retracted.json);" \
+                  "dispatch the build with force=true (bin/alt build --force) to build it anyway"
+                exit 1
+              fi
+              echo "::warning::version $version was withdrawn; building it because force is set." \
+                "Once it is published again, sync removes it from apps/$APP/retracted.json"
+              ;;
+            *)
+              echo "::error::apps/$APP/retracted.json could not be checked (exit $code)"
+              exit 1
+              ;;
+          esac
 
   resolve:
     needs: app

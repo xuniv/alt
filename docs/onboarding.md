@@ -202,13 +202,15 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
    `~/.cache/xuniv-alt/hook.log` if no build appears. `poll.yml` has no schedule; start it with
    `gh workflow run poll.yml -R xuniv/alt` (optionally `-f app=io.example.demo -f dry_run=true`) to
    catch up on tags the hook missed. It skips a version that already has a published release or a
-   build run in the last 30 days.
+   build run in the last 30 days, and a version that was withdrawn (see
+   [operations.md](operations.md#withdraw-a-version)).
 
 To rotate the deploy key, run `bin/alt register` again with the same `--build-json` plus `--rotate`. It
 deletes the old `alt-build` key first. To remove an app's build access, run
 `bin/alt unregister io.example.demo owner/private-repo`. That deletes the deploy key and the
 environment `alt-IO_EXAMPLE_DEMO` with its secrets (and old per-app repository secrets, if any). Then
-set `privateBuild.enabled` to `false`. Releases that are already published stay listed.
+set `privateBuild.enabled` to `false`. Releases that are already published stay listed; to take a
+version down, see [operations.md](operations.md#withdraw-a-version).
 
 ## Add an app from a URL
 
