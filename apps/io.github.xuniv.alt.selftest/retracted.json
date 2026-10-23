@@ -1,10 +1,6 @@
 {
   "schemaVersion": 1,
   "versions": {
-    "0.0.2": {
-      "date": "2026-10-23T14:41:06Z",
-      "reason": "unpublished"
-    },
     "0.0.3": {
       "date": "2026-10-23T14:41:06Z",
       "reason": "deleted"
