@@ -10,6 +10,7 @@ import dataclasses
 import datetime
 import glob
 import hashlib
+import io
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import tempfile
 import types
 import unittest
 
+from altsource import cli
 from altsource import gh as ghmod
 from altsource import retract as retractmod
 from altsource import sync as syncmod
@@ -1786,6 +1788,58 @@ class TombstoneTests(SyncCase):
         self.assertEqual(result.retracted, [self.TAG])
         self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "unpublished"}})
         self.assertIn(self.RECORD, self.gh.commits[-1][2])
+
+    def test_deleted_release_with_a_new_draft_for_its_tag_is_deleted(self):
+        # the operator deleted the release and uploaded a replacement that is still a draft
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        replacement, _ = self.publish(self.TAG, ipa_bytes(), draft=True)
+        result = self.sync()
+        self.assertEqual(result.retracted, [self.TAG])
+        self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "deleted"}})
+        self.assertTrue(self.gh.releases[replacement["id"]]["draft"])
+
+    def test_deleted_release_with_a_blocked_draft_of_another_release_is_deleted(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        blocked, _ = self.publish(self.TAG, ipa_bytes(), draft=True)
+        blocked["name"] = "[blocked] " + self.TAG  # a replacement that the gate rejected
+        result = self.sync()
+        self.assertEqual(result.retracted, [self.TAG])
+        self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "deleted"}})
+
+    def test_draft_marked_withdrawn_is_unpublished(self):
+        rel = self.two_versions()
+        self.gh.releases[rel["id"]].update(draft=True, name="[withdrawn] " + self.TAG)  # bin/alt retract
+        result = self.sync()
+        self.assertEqual(result.retracted, [self.TAG])
+        self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "unpublished"}})
+
+    def test_draft_marked_withdrawn_stays_back_while_sync_fails(self):
+        # the tombstone depends on a successful commit; the mark does not
+        rel = self.two_versions()
+        self.gh.releases[rel["id"]].update(draft=True, name="[withdrawn] " + self.TAG)
+        self.deps.validation_errors = ["apps[1]: an unrelated app fails validation"]
+        with self.assertRaises(syncmod.SyncAborted):
+            self.sync()
+        self.assertIsNone(self.committed(self.PATH))
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(["stage-draft", "--all", "--root", self.root], deps=self.deps, gh=self.gh,
+                        environ={"ALT_DENYLIST": DENY[0]}, out=out, err=err)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("withdrawn drafts skipped: 1 (", err.getvalue())
+        self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+
+    def test_record_without_a_release_id_is_judged_by_any_draft_of_its_tag(self):
+        rel = self.two_versions()
+        path = os.path.join(self.root, *self.RECORD.split("/"))
+        record = load_json(path)
+        del record["releaseId"]
+        self.git.seed({self.RECORD: syncmod.dumps_json(record)})
+        del self.gh.releases[rel["id"]]
+        self.publish(self.TAG, ipa_bytes(), draft=True)
+        self.sync()
+        self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "unpublished"}})
 
     def test_last_version_withdrawn_keeps_the_tombstone_while_the_app_is_unlisted(self):
         rel, _ = self.publish(self.TAG, ipa_bytes())

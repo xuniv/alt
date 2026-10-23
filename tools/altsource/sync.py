@@ -30,12 +30,12 @@ draft. Immutable releases are recorded as they are, with a warning. Without gate
 (``scan_published=False``) nothing is normalized.
 
 Sync also keeps the tombstones of withdrawn versions (``apps/<bid>/retracted.json``, see
-:mod:`altsource.retract`). A record that a run drops because no release uses its tag any more is
-remembered as ``deleted``; one whose release is a draft again (and not marked blocked by the gate)
-as ``unpublished``. Records that sync drops itself (a gate block, an ungated asset, a takedown, a
-replacement left as a draft) get no tombstone, and an aborted run writes none. Once a release for a
-withdrawn version is published again, its entry is removed, and the file with its last entry.
-Tombstones never change ``source.json``; builders read them.
+:mod:`altsource.retract`). A record that a run drops because its release is gone is remembered as
+``deleted``, also when another draft uses the tag; one whose release is a draft again (and not marked
+blocked by the gate) as ``unpublished``. Records that sync drops itself (a gate block, an ungated
+asset, a takedown, a replacement left as a draft) get no tombstone, and an aborted run writes none.
+Once a release for a withdrawn version is published again, its entry is removed, and the file with
+its last entry. Tombstones never change ``source.json``; builders read them.
 """
 
 from __future__ import annotations
@@ -888,15 +888,20 @@ class _Run:
         """Why a dropped record's release is gone (a tombstone reason), or None when it is not a withdrawal.
 
         Only called for records whose tag no published release uses. Releases this sync took down
-        itself and drafts that carry the gate's mark (an earlier run's takedown) do not count.
+        itself and a draft that carries the gate's mark (an earlier run's takedown) do not count.
+        ``unpublished`` means that the record's own release is a draft now; when it is gone, the
+        version was ``deleted``, even if another draft (such as a replacement upload) uses the tag.
         """
-        if _int(record.get("releaseId")) in self.taken_down:
+        rid = _int(record.get("releaseId"))
+        if rid in self.taken_down:
             return None
         if any(_int(r.get("id")) in self.taken_down for r in drafts):
             return None
-        if any(str(r.get("name") or "").startswith(BLOCKED_MARK) for r in drafts):
+        # a record without a release id cannot be matched; any draft with the tag stands for it
+        own = list(drafts) if rid is None else [r for r in drafts if _int(r.get("id")) == rid]
+        if any(str(r.get("name") or "").startswith(BLOCKED_MARK) for r in own):
             return None
-        return retractmod.UNPUBLISHED if drafts else retractmod.DELETED
+        return retractmod.UNPUBLISHED if own else retractmod.DELETED
 
     def tombstone_rules(self, path: str, values: Sequence[Any]) -> List[str]:
         """Blocking rules for the strings of one tombstone (its file path included)."""

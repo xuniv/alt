@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from altsource import cli, retract
+from altsource import stage as stagemod
 from tests.test_sync import BASE, FakeGit, FakeGitHub, FakeToolkit, ipa_bytes, load_json, write_ipa
 from altsource.sync import dumps_json
 
@@ -741,13 +742,31 @@ class RetractedStagingTests(CliCase):
         code, out, err = self.run_cli("stage-draft", "--all", "--root", self.root)
         self.assertEqual(code, 0, err)
         self.assertIn("pending drafts: 1\n", err)
-        self.assertIn("withdrawn drafts skipped: 1 (listed in retracted.json; stage one by tag", err)
+        self.assertIn("withdrawn drafts skipped: 1 (titled [withdrawn] <tag> or listed in retracted.json; stage "
+                      "one by tag", err)
         self.assertIn("io.example.demo-v1.2.4 published=true", out)
         self.assertNotIn("1.2.3", out + err)
         self.assertTrue(self.gh.releases[withdrawn["id"]]["draft"])
         self.assertFalse(self.gh.releases[other["id"]]["draft"])
         values = self.outputs()
         self.assertEqual((values["staged"], values["withdrawn"], values["failed"]), ("1", "1", "0"))
+
+    def test_stage_draft_all_skips_drafts_marked_withdrawn(self):
+        # bin/alt retract --unpublish marks the draft, so it stays back before sync lists the version
+        marked = self.gh.add_release("io.example.demo-v1.2.5", draft=True)
+        marked["name"] = "[withdrawn] io.example.demo-v1.2.5"
+        self.gh.add_asset(marked, "a.ipa", ipa_bytes(short_version="1.2.5"))
+        code, out, err = self.run_cli("stage-draft", "--all", "--root", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("pending drafts: 0\n", err)
+        self.assertIn("withdrawn drafts skipped: 1 (", err)
+        self.assertTrue(self.gh.releases[marked["id"]]["draft"])
+        self.assertEqual(self.outputs()["withdrawn"], "1")
+        # staging it by tag publishes it and restores the title
+        code, out, err = self.run_cli("stage-draft", "io.example.demo-v1.2.5", "--root", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.gh.releases[marked["id"]]["draft"])
+        self.assertFalse(self.gh.releases[marked["id"]]["name"].startswith("[withdrawn]"))
 
     def test_stage_draft_all_keeps_drafts_back_when_tombstones_are_unreadable(self):
         with open(os.path.join(self.root, "apps", "io.example.demo", "retracted.json"), "wb") as fh:
@@ -810,9 +829,13 @@ class StageDraftLabelTests(CliCase):
         self.gh.add_release("io.example.demo-v1.0.0", draft=True)
         b = self.gh.add_release("io.example.demo-v1.1.0", draft=True)
         b["name"] = "[blocked] io.example.demo-v1.1.0"
+        c = self.gh.add_release("io.example.demo-v1.2.0", draft=True)
+        c["name"] = "[withdrawn] io.example.demo-v1.2.0"
         self.gh.add_release("not a grammar tag", draft=True)
         self.gh.add_release("io.example.demo-v2.0.0")  # published
-        self.assertEqual(cli.draft_releases(self.gh, self.deps), ([("io.example.demo-v1.0.0", a["id"])], 1))
+        self.assertEqual(cli.draft_releases(self.gh, self.deps), ([("io.example.demo-v1.0.0", a["id"])], 1, 1))
+        self.assertEqual(stagemod.draft_tags(self.gh, self.deps),
+                         (["io.example.demo-v1.0.0"], ["io.example.demo-v1.1.0"]))
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from .gh import GhError, write_outputs
 from .stage import (
     ARCHIVE_ERRORS,
     BLOCKED_MARK,
+    WITHDRAWN_MARK,
     Conflict,
     GateRejected,
     StageError,
@@ -290,8 +291,9 @@ def cmd_stage(args, ctx: Context) -> int:
     return EXIT_OK
 
 
-def draft_releases(gh: Any, deps: Any) -> Tuple[List[Tuple[str, int]], int]:
-    """((tag, release id) of pending drafts, number of blocked drafts), oldest first.
+def draft_releases(gh: Any, deps: Any) -> Tuple[List[Tuple[str, int]], int, int]:
+    """((tag, release id) of pending drafts, number of blocked drafts, number of drafts marked
+    withdrawn), oldest first.
 
     Like ``stage.draft_tags``, with the release ids: messages name a draft by its id until its tag
     passed the gate.
@@ -299,7 +301,7 @@ def draft_releases(gh: Any, deps: Any) -> Tuple[List[Tuple[str, int]], int]:
     tag_errors = errors_of(deps, "TagError") + (ValueError,)
     pending: List[Tuple[str, int]] = []
     seen = set()
-    blocked = 0
+    blocked = marked = 0
     for rel in sorted(gh.list_releases(), key=lambda r: int(r.get("id", 0))):
         if not rel.get("draft"):
             continue
@@ -311,11 +313,14 @@ def draft_releases(gh: Any, deps: Any) -> Tuple[List[Tuple[str, int]], int]:
         if tag in seen:
             continue
         seen.add(tag)
-        if str(rel.get("name") or "").startswith(BLOCKED_MARK):
+        name = str(rel.get("name") or "")
+        if name.startswith(BLOCKED_MARK):
             blocked += 1
+        elif name.startswith(WITHDRAWN_MARK):
+            marked += 1
         else:
             pending.append((tag, int(rel["id"])))
-    return pending, blocked
+    return pending, blocked, marked
 
 
 def withdrawn_drafts(root: str, pending: Sequence[Tuple[str, int]], deps: Any
@@ -323,8 +328,9 @@ def withdrawn_drafts(root: str, pending: Sequence[Tuple[str, int]], deps: Any
     """(drafts to stage, number of withdrawn ones, ids of drafts whose tombstones cannot be read).
 
     ``stage-draft --all`` runs on a schedule, so it never publishes a version listed in
-    ``apps/<bid>/retracted.json`` by itself; staging such a draft by tag is an explicit action that
-    goes ahead with a warning. A tombstone file that cannot be read keeps the app's drafts back.
+    ``apps/<bid>/retracted.json`` by itself (nor a draft marked withdrawn, see :func:`draft_releases`);
+    staging such a draft by tag is an explicit action that goes ahead with a warning. A tombstone
+    file that cannot be read keeps the app's drafts back.
     """
     keep: List[Tuple[str, int]] = []
     withdrawn = 0
@@ -365,15 +371,16 @@ def cmd_stage_draft(args, ctx: Context) -> int:
     if args.tag:
         drafts = [(args.tag, "")]
     else:
-        pending, blocked = draft_releases(ctx.gh, ctx.deps)
+        pending, blocked, marked = draft_releases(ctx.gh, ctx.deps)
         pending, withdrawn, unreadable = withdrawn_drafts(args.root, pending, ctx.deps)
+        withdrawn += marked
         drafts = [(tag, "release %d: " % rid) for tag, rid in pending]
         ctx.eprint("pending drafts: %d" % len(drafts))
         if blocked:
             ctx.eprint("blocked drafts skipped: %d (stage one by tag to retry it)" % blocked)
         if withdrawn:
-            ctx.eprint("withdrawn drafts skipped: %d (listed in retracted.json; stage one by tag to publish "
-                       "it)" % withdrawn)
+            ctx.eprint("withdrawn drafts skipped: %d (titled %s<tag> or listed in retracted.json; stage one "
+                       "by tag to publish it)" % (withdrawn, WITHDRAWN_MARK))
         for rid in unreadable:
             ctx.eprint("release %d: error: the app's retracted.json is not valid; draft not staged" % rid)
             failed += 1

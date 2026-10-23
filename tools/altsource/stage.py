@@ -29,6 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 APP_JSON_MAX_BYTES = 64 * 1024
 # title prefix of drafts the gate has blocked; ``stage-draft --all`` leaves them alone
 BLOCKED_MARK = "[blocked] "
+# title prefix of drafts withdrawn with ``bin/alt retract --unpublish``; ``stage-draft --all`` leaves
+# them alone as well, whether or not sync has listed the version in retracted.json yet
+WITHDRAWN_MARK = "[withdrawn] "
 # a damaged archive surfaces as one of these from any reader (inspection, normalization, scanning).
 # The readers map zipfile's UnicodeDecodeError (a bad UTF-8 name) and NotImplementedError (an
 # unsupported zip feature) to their own errors; both are listed here as well, so that an injected or
@@ -783,7 +786,10 @@ def mark_blocked(gh: Any, rel: Dict[str, Any], tag: str) -> None:
 
 
 def draft_tags(gh: Any, deps: Any = None) -> Tuple[List[str], List[str]]:
-    """(pending, blocked) tags of draft releases that follow the tag grammar, oldest first."""
+    """(pending, blocked) tags of draft releases that follow the tag grammar, oldest first.
+
+    Drafts marked withdrawn are in neither list.
+    """
     deps = deps if deps is not None else Toolkit()
     tag_errors = errors_of(deps, "TagError") + (ValueError,)
     pending: List[str] = []
@@ -796,12 +802,16 @@ def draft_tags(gh: Any, deps: Any = None) -> Tuple[List[str], List[str]]:
             deps.parse_tag(tag)
         except tag_errors:
             continue
-        bucket = blocked if str(rel.get("name") or "").startswith(BLOCKED_MARK) else pending
+        name = str(rel.get("name") or "")
+        if name.startswith(WITHDRAWN_MARK):
+            continue
+        bucket = blocked if name.startswith(BLOCKED_MARK) else pending
         if tag not in pending and tag not in blocked:
             bucket.append(tag)
     return pending, blocked
 
 
 def pending_drafts(gh: Any, deps: Any = None) -> List[str]:
-    """Tags of draft releases that follow the tag grammar and are not marked blocked, oldest first."""
+    """Tags of draft releases that follow the tag grammar and are marked neither blocked nor withdrawn,
+    oldest first."""
     return draft_tags(gh, deps)[0]

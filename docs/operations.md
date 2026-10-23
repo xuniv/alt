@@ -107,7 +107,7 @@ Run with `PYTHONPATH=tools` from the repository root.
 | `normalize IN OUT` | re-pack an IPA deterministically |
 | `scan IPA [--allow-home-paths]` | run the leak scan only |
 | `stage IPA [--bid B] [--semver V] [--notes-file F] [--app-json F] [--no-publish] [--dry-run] [--allow-home-paths]` | gate, draft and publish; warns when the version is withdrawn |
-| `stage-draft TAG` or `stage-draft --all`, with `[--notes-file F] [--no-publish] [--dry-run] [--allow-home-paths] [--exit-zero]` | gate and publish existing drafts. `--all` skips drafts titled `[blocked] ...` and drafts of a withdrawn version, and names a draft as `release <id>:` in its messages until the gate passed its tag; `TAG` stages a withdrawn version with a warning |
+| `stage-draft TAG` or `stage-draft --all`, with `[--notes-file F] [--no-publish] [--dry-run] [--allow-home-paths] [--exit-zero]` | gate and publish existing drafts. `--all` skips drafts titled `[blocked] ...` or `[withdrawn] ...` and drafts of a withdrawn version, and names a draft as `release <id>:` in its messages until the gate passed its tag; `TAG` stages a withdrawn version with a warning |
 | `sync [--no-commit] [--dry-run] [--rescan] [--exit-zero]` | regenerate and commit the catalog and `retracted.json`; prints `retracted=N restored=N` (tombstones added and removed) |
 | `generate [--check]` | write `source.json`, or check that it is up to date |
 | `validate` | validate `source.json`, every `app.json` and every `retracted.json` |
@@ -176,7 +176,9 @@ It finds the release `<bundleId>-v<version>`, published or draft, then:
 
 - by default deletes it, and every other release with the same tag, drafts included (a leftover draft
   could be published again);
-- with `--unpublish` turns the published release into a draft, which keeps its IPA privately;
+- with `--unpublish` turns the published release into a draft titled `[withdrawn] <tag>`, which keeps
+  its IPA privately. A pending draft of the version gets the same title; a draft titled
+  `[blocked] <tag>` keeps its title;
 - with `--delete-tag` (only together with deleting) also deletes the tag, after the release;
 - starts `catalog.yml` on `main`, so the removal does not depend on the release event, and prints the
   source URL.
@@ -198,13 +200,30 @@ What happens next:
    `--force`. The pre-push hook never passes `--force`, so pushing the tag again builds nothing. A tag
    of a new version builds as usual.
 4. Publishing it on purpose still works: `bin/alt publish`, `bin/alt mirror`, `stage.yml` with a tag
-   and `ingest.yml` only warn about a withdrawn version.
+   and `ingest.yml` only warn about a withdrawn version. With `--defer`, `bin/alt publish` and
+   `bin/alt mirror` upload the draft, but scheduled `stage.yml` runs do not publish it (see below).
+   The command says so and prints the `stage.yml` command that publishes it by tag.
 
 `bin/alt status` lists the withdrawn versions of every app.
 
+Sync adds an entry only for a version that `source.json` listed, that is, one whose record is on
+`main`. A version that was never listed, such as a pending draft or a draft titled `[blocked] <tag>`,
+gets no entry. `bin/alt retract` says so, because then nothing keeps `poll.yml`, `build.yml` or the
+pre-push hook from building that version again.
+
 A draft left by `--unpublish` (or by unpublishing in the GitHub UI) stays a draft. `stage.yml` runs
-without a tag, scheduled or manual, skip drafts of a withdrawn version and only count them. A draft
-is skipped once sync has listed its version, which the catalog run started by the withdrawal does.
+without a tag, scheduled or manual, skip such drafts and only count them:
+
+- A draft titled `[withdrawn] <tag>`, which `bin/alt retract --unpublish` sets, is skipped at once,
+  whether or not its version was ever listed and whether or not a catalog run has succeeded since.
+- Any other draft, such as one unpublished in the GitHub UI, is skipped only once its version is in
+  `retracted.json`, that is, once a catalog run has committed the entry. If sync stops before its
+  commit, for example because `source.json` fails validation, every scheduled run publishes such a
+  draft again until a catalog run succeeds. To keep it back at once, also run
+  `bin/alt retract <bundleId> <version> --unpublish`, which only gives the draft the mark.
+- A draft of a withdrawn version that was uploaded later, for example with `bin/alt publish --defer`,
+  is skipped as well. That includes a draft uploaded after a listed release was deleted but before
+  the catalog run noticed it: sync then lists the version as `deleted`. Stage such a draft by tag.
 
 ### Publish a withdrawn version again
 
@@ -212,8 +231,10 @@ Publish a release for the version; `retracted.json` needs no edit. The next sync
 release and removes the entry (and the file when it is empty).
 
 - **Unpublished:** `gh workflow run stage.yml -R xuniv/alt -f tag=io.example.demo-v1.4.0` gates the
-  draft again and publishes it. `gh release edit io.example.demo-v1.4.0 -R xuniv/alt --draft=false`
-  publishes it directly, without the gate; sync checks it afterwards.
+  draft again, publishes it and gives it its usual title back.
+  `gh release edit io.example.demo-v1.4.0 -R xuniv/alt --draft=false` publishes it directly, without
+  the gate and with its current title (add `--title` to replace `[withdrawn] <tag>`); sync checks it
+  afterwards.
 - **Deleted, private build:** `bin/alt build io.example.demo v1.4.0 --force`.
 - **Deleted, other routes:** publish the IPA again with `bin/alt publish`, `bin/alt mirror` or
   `bin/alt ingest`.
@@ -223,8 +244,9 @@ release and removes the entry (and the file when it is empty).
 AltStore, SideStore and Feather treat the first listed version as the latest. Withdrawing the newest
 version makes the previous one the latest, and a device that installed the withdrawn build is offered
 the older one as an "update", because the clients compare version strings. `bin/alt retract` prints a
-note when this applies. If users already installed the version, publish a fixed higher version rather
-than only withdrawing it.
+note when this applies. It compares the versions that `source.json` lists: prereleases count only when
+the app's `app.json` in your checkout sets `includePrereleases`. If users already installed the
+version, publish a fixed higher version rather than only withdrawing it.
 
 ## Never enable Actions debug logging
 
@@ -262,8 +284,9 @@ gh workflow run stage.yml -R xuniv/alt -f tag=io.example.demo-v1.4.0   # one dra
 gh workflow run stage.yml -R xuniv/alt                                 # every pending draft
 ```
 
-Without a tag, drafts titled `[blocked] <tag>` are skipped. A draft staged by tag is retried even when
-it is marked; once it passes, it is retitled and published.
+Without a tag, drafts titled `[blocked] <tag>` or `[withdrawn] <tag>` are skipped, and so are drafts of
+a withdrawn version. A draft staged by tag is retried even when it is marked; once it passes, it is
+retitled and published.
 
 ### A release was blocked
 

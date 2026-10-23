@@ -156,10 +156,10 @@ release listing. Do not edit it.
 | `schemaVersion` | `1` |
 | `versions` | one entry per withdrawn semver |
 | `date` | when sync noticed the withdrawal, `YYYY-MM-DDTHH:MM:SSZ` |
-| `reason` | `deleted` (the release is gone) or `unpublished` (the release is a draft) |
+| `reason` | `deleted` (the listed release is gone, even if another draft uses the tag) or `unpublished` (the listed release is a draft) |
 
 - A release that sync takes down itself (a gate block, an unexpected asset, a draft titled
-  `[blocked] <tag>`) gets no entry.
+  `[blocked] <tag>`) gets no entry, and neither does a version that `source.json` never listed.
 - When a release of the version is published again, sync removes its entry, and the file once it is
   empty.
 - The file does not change `source.json`, which lists the published releases. It tells the builders

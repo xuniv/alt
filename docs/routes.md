@@ -161,7 +161,10 @@ bin/alt mirror owner/private-repo v1.4.0 [--semver V] [--notes-file notes.md] [-
 
 - `publish` runs the gate locally with the local denylist. It then creates a draft release and uploads
   the normalized IPA. Unless `--defer` is given, it starts `stage.yml` for the new tag right away.
-  With `--defer`, the draft waits for the next scheduled `stage.yml` run.
+  With `--defer`, the draft waits for the next scheduled `stage.yml` run. Scheduled runs skip a draft
+  of a [withdrawn version](operations.md#withdraw-a-version), though, so for one of those `publish`
+  says that the draft stays a draft until it is staged by tag, and prints the command. This includes a
+  version whose listed release was deleted before the catalog run listed it as withdrawn.
 - `mirror` downloads only the `*.ipa` asset of a release in another repository. The release must have
   exactly one. It then runs `publish`. Release notes are not copied: pass `--notes-file` to set them.
 - `stage.yml` downloads the draft's IPA and runs the full gate again in CI with the `ALT_DENYLIST`
@@ -169,6 +172,8 @@ bin/alt mirror owner/private-repo v1.4.0 [--semver V] [--notes-file notes.md] [-
   - Without a tag it processes every pending draft with a grammar tag, oldest first.
   - Drafts titled `[blocked] ...` are skipped; stage one by tag to retry it.
   - A draft the gate rejects gets that title.
+  - Drafts titled `[withdrawn] ...` and drafts of a version listed in `apps/<bundleId>/retracted.json`
+    are skipped as well; stage one by tag to publish it.
 
 ### Publishing a release directly
 

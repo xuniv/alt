@@ -139,13 +139,23 @@ NOT_FOUND = {"code": 1, "stdout": {"message": "Not Found", "status": "404"}, "st
 DEFAULT_RULES = [
     {"match": ["api", "user"], "stdout": "xuniv\n"},
     {"match": ["api", "repos/xuniv/alt"], "stdout": {"full_name": "xuniv/alt", "permissions": {"push": True}}},
-    # no app has withdrawn versions unless a test says so
+    # no app has withdrawn versions, and main has no version records, unless a test says so
     dict(NOT_FOUND, match=["api"], pattern=[r"^repos/[^/]+/[^/]+/contents/apps/[^/]+/retracted\.json\?ref=main$"]),
+    dict(NOT_FOUND, match=["api"],
+         pattern=[r"^repos/[^/]+/[^/]+/contents/apps/[^/]+/versions/[^/]+\.json\?ref=main$"]),
     {"match": ["api"], "pattern": [r"^repos/[^/]+/[^/]+/git/trees/main\?recursive=1$"],
      "stdout": {"sha": "0" * 40, "tree": [], "truncated": False}},
 ]
 RETRACTED_PATH = "repos/xuniv/alt/contents/apps/%s/retracted.json?ref=main" % BID
 WITHDRAWN = {"1.2.3": {"date": "2026-10-22T07:13:00Z", "reason": "deleted"}}
+
+
+def record_rule(version="1.2.3", bid=BID, repo="xuniv/alt"):
+    """The contents API answer for main's version record apps/<bid>/versions/<version>.json."""
+    path = "apps/%s/versions/%s.json" % (bid, version)
+    return {"match": ["api", "repos/%s/contents/%s?ref=main" % (repo, path)],
+            "stdout": {"type": "file", "encoding": "base64", "path": path,
+                       "content": base64.encodebytes(b'{"tag": "placeholder"}\n').decode("ascii")}}
 
 
 def retracted_rule(versions, bid=BID, repo="xuniv/alt"):
@@ -412,6 +422,33 @@ class PublishTests(OperatorCase):
         code, _, err = self.run_alt("publish", self.ipa(short_version="1.2.4"), "--semver", "1.2.4", "--defer")
         self.assertEqual((code, err), (0, ""))
 
+    def test_deferring_a_withdrawn_version_says_it_needs_staging_by_tag(self):
+        # scheduled stage runs skip drafts of withdrawn versions, so the schedule would never publish it
+        self.set_rules(retracted_rule(WITHDRAWN))
+        code, out, err = self.run_alt("publish", self.ipa(), "--defer")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(list(self.stage_gh.releases.values())[0]["draft"])
+        self.assertEqual(self.writes(), [])
+        self.assertIn("version 1.2.3 of %s was withdrawn (deleted, 2026-10-22T07:13:00Z, see apps/%s/retracted.json); "
+                      "scheduled stage runs skip its drafts" % (BID, BID), err)
+        self.assertNotIn("waits for the next scheduled stage run", out)
+        self.assertIn("draft %s stays a draft until it is staged by tag: gh workflow run stage.yml -R xuniv/alt "
+                      "-f tag=%s\n" % (TAG, TAG), out)
+
+    def test_deferring_a_version_still_listed_without_a_release_says_it_needs_staging_by_tag(self):
+        # the listed release was deleted, and the catalog run has not listed the version as withdrawn yet
+        self.set_rules(record_rule())
+        code, out, err = self.run_alt("publish", self.ipa(), "--defer")
+        self.assertEqual(code, 0, err)
+        self.assertIn("version 1.2.3 of %s is still listed on main, but no published release uses its tag: the "
+                      "next catalog run lists it in apps/%s/retracted.json as withdrawn" % (BID, BID), err)
+        self.assertIn("draft %s stays a draft until it is staged by tag" % TAG, out)
+        self.assertEqual(self.writes(), [])
+        # without --defer, stage.yml publishes it right away: the record is not even looked up
+        self.run_alt("publish", self.ipa())
+        self.assertEqual(self.writes(), [["workflow", "run", "stage.yml", "-R", "xuniv/alt", "-f", "tag=" + TAG]])
+        self.assertEqual(len([a for a in self.argvs() if a[-1].endswith("/versions/1.2.3.json?ref=main")]), 1)
+
     def test_local_argument_checks_come_before_gh(self):
         missing = os.path.join(self.dir, "missing.ipa")
         for argv in (("publish", missing), ("publish", self.ipa(), "--semver", "1.2"),
@@ -452,6 +489,14 @@ class MirrorTests(OperatorCase):
         code, _, _ = self.run_alt("mirror", PRIVATE, "v1.2.3", "--notes-file", notes, "--defer")
         self.assertEqual(code, 0)
         self.assertEqual(list(self.stage_gh.releases.values())[0]["body"], "Public notes")
+        self.assertEqual(self.writes(), [])
+
+    def test_mirror_defer_of_a_withdrawn_version_says_it_needs_staging_by_tag(self):
+        self.set_rules(retracted_rule(WITHDRAWN), self.release_rule("Demo.ipa"), self.download_rule())
+        code, out, err = self.run_alt("mirror", PRIVATE, "v1.2.3", "--defer")
+        self.assertEqual(code, 0, err)
+        self.assertIn("scheduled stage runs skip its drafts", err)
+        self.assertIn("draft %s stays a draft until it is staged by tag" % TAG, out)
         self.assertEqual(self.writes(), [])
 
     def test_mirror_needs_exactly_one_ipa(self):
@@ -670,15 +715,15 @@ class RetractTests(OperatorCase):
     CATALOG = ["workflow", "run", "catalog.yml", "-R", "xuniv/alt", "--ref", "main"]
 
     @staticmethod
-    def rel(rid, tag=TAG, draft=False, name=None):
-        return {"id": rid, "tag_name": tag, "name": name or tag, "draft": draft}
+    def rel(rid, tag=TAG, draft=False, name=None, prerelease=False):
+        return {"id": rid, "tag_name": tag, "name": name or tag, "draft": draft, "prerelease": prerelease}
 
     def listing(self, *releases, page=1):
         return {"match": ["api", self.LIST_PAGE % page], "stdout": list(releases)}
 
     def standard(self, *extra, tag_present=None):
-        rules = list(extra) + [self.listing(self.rel(11), self.rel(12, "io.example.demo-v1.2.2"),
-                                            self.rel(13, "io.example.other-v9.0.0"))]
+        rules = list(extra) + [record_rule(), self.listing(self.rel(11), self.rel(12, "io.example.demo-v1.2.2"),
+                                                           self.rel(13, "io.example.other-v9.0.0"))]
         if tag_present is not None:
             rules.append(dict({"match": ["api", self.TAG_REF]},
                               **({"stdout": {"ref": "refs/tags/" + TAG}} if tag_present else NOT_FOUND)))
@@ -700,8 +745,9 @@ class RetractTests(OperatorCase):
         self.assertIn("dispatched catalog.yml on main: sync removes 1.2.3 from source.json and lists it in "
                       "apps/%s/retracted.json" % BID, out)
         self.assertIn("source: https://xuniv.github.io/alt/source.json\n", out)
-        self.assertIn("note: 1.2.3 was the newest published version: clients that installed it are offered 1.2.2 "
+        self.assertIn("note: 1.2.3 was the newest listed version: clients that installed it are offered 1.2.2 "
                       "as an update", out)
+        self.assertNotIn("has no record", err)
         self.assertNotIn(self.TAG_REF, [a[-1] for a in self.argvs()])  # the tag is kept by default
         self.assertRegex(self.log_text(), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ %s deleted\n$" % TAG)
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.cache, "retract.log")).st_mode), 0o600)
@@ -740,7 +786,7 @@ class RetractTests(OperatorCase):
         self.assertEqual(code, 0, err)
         self.assertEqual([a[-1] for a in self.writes()[:-1]], ["repos/xuniv/alt/releases/%d" % i for i in (11, 14, 15)])
         self.assertIn("draft release %s deleted" % TAG, out)
-        self.assertIn("note: no other published version of %s remains, so the app leaves source.json" % BID, out)
+        self.assertIn("note: no other listed version of %s remains, so the app leaves source.json" % BID, out)
 
     def test_unpublish_turns_the_release_into_a_draft(self):
         self.standard()
@@ -748,18 +794,88 @@ class RetractTests(OperatorCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.writes(), [["api", "--method", "PATCH", "repos/xuniv/alt/releases/11", "--input", "-"],
                                          self.CATALOG])
-        self.assertEqual(json.loads(self.call("api", "--method", "PATCH")["stdin"]), {"draft": True, "tag_name": TAG})
-        self.assertIn("release %s is a draft now" % TAG, out)
+        # the mark keeps scheduled stage runs away even when the catalog run that lists it fails
+        self.assertEqual(json.loads(self.call("api", "--method", "PATCH")["stdin"]),
+                         {"draft": True, "name": "[withdrawn] " + TAG, "tag_name": TAG})
+        self.assertIn("release %s is a draft titled [withdrawn] %s now" % (TAG, TAG), out)
+        self.assertIn("sync removes 1.2.3 from source.json and lists it in apps/%s/retracted.json" % BID, out)
         self.assertIn("to publish it again: gh workflow run stage.yml -R xuniv/alt -f tag=%s" % TAG, out)
         self.assertTrue(self.log_text().endswith(" %s unpublished\n" % TAG))
 
-    def test_unpublishing_a_draft_changes_nothing_but_runs_the_catalog(self):
+    def test_unpublishing_a_pending_draft_marks_it_withdrawn(self):
+        # a draft that was never listed: sync writes no tombstone, so the mark is what keeps
+        # scheduled stage runs from publishing it
         self.set_rules(self.listing(self.rel(11, draft=True)))
-        code, out, _ = self.run_alt("retract", BID, "1.2.3", "--unpublish")
-        self.assertEqual(code, 0)
-        self.assertIn("release %s is already a draft" % TAG, out)
+        code, out, err = self.run_alt("retract", BID, "1.2.3", "--unpublish")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [["api", "--method", "PATCH", "repos/xuniv/alt/releases/11", "--input", "-"],
+                                         self.CATALOG])
+        self.assertEqual(json.loads(self.call("api", "--method", "PATCH")["stdin"]),
+                         {"draft": True, "name": "[withdrawn] " + TAG, "tag_name": TAG})
+        self.assertIn("draft release %s is a draft titled [withdrawn] %s now" % (TAG, TAG), out)
+        self.assertIn("dispatched catalog.yml on main\n", out)
+        self.assertNotIn("lists it in", out)
+        self.assertIn("main has no record of 1.2.3 (source.json does not list it), so sync adds no entry for it to "
+                      "apps/%s/retracted.json" % BID, err)
         self.assertNotIn("note:", out)
-        self.assertEqual(self.writes(), [self.CATALOG])
+        self.assertTrue(self.log_text().endswith(" %s draft marked withdrawn\n" % TAG))
+
+    def test_unpublishing_a_marked_or_blocked_draft_changes_nothing_but_runs_the_catalog(self):
+        for name, said in (("[withdrawn] " + TAG, "is already marked withdrawn"),
+                           ("[blocked] " + TAG, "is marked blocked by the gate; scheduled stage runs skip it")):
+            self.set_rules(self.listing(self.rel(11, draft=True, name=name)))
+            code, out, err = self.run_alt("retract", BID, "1.2.3", "--unpublish")
+            self.assertEqual(code, 0, err)
+            self.assertIn("draft release %s %s" % (TAG, said), out)
+            self.assertIn("release %s is already a draft" % TAG, out)
+        self.assertEqual(self.writes(), [self.CATALOG, self.CATALOG])
+
+    def test_a_version_already_withdrawn_is_named_as_such(self):
+        self.set_rules(retracted_rule(WITHDRAWN), self.listing(self.rel(11, draft=True)))
+        code, out, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("dispatched catalog.yml on main; 1.2.3 is already listed in apps/%s/retracted.json" % BID, out)
+        self.assertNotIn("has no record", err)
+
+    def test_an_unreadable_record_gives_a_conditional_message(self):
+        self.standard({"match": ["api", "repos/xuniv/alt/contents/apps/%s/versions/1.2.3.json?ref=main" % BID],
+                       "code": 1, "stderr": "gh: Server Error (HTTP 500)\n"})
+        code, out, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not be read: gh: Server Error (HTTP 500)", err)
+        self.assertIn("dispatched catalog.yml on main: if source.json listed 1.2.3, sync removes it and lists it in "
+                      "apps/%s/retracted.json" % BID, out)
+        self.assertNotIn("has no record", err)
+
+    def test_deleting_a_version_that_was_never_listed_says_builders_are_not_kept_away(self):
+        self.set_rules(self.listing(self.rel(11, draft=True, name="[blocked] " + TAG)))
+        code, out, err = self.run_alt("retract", BID, "1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("draft release %s deleted" % TAG, out)
+        self.assertNotIn("lists it in", out)
+        self.assertIn("poll.yml, build.yml and the pre-push hook are not kept from building it again", err)
+
+    def test_the_note_follows_what_source_json_lists(self):
+        # prereleases are listed only with includePrereleases, like in source.json
+        releases = (self.rel(1, "io.example.demo-v1.2.0"), self.rel(2, "io.example.demo-v1.3.0"),
+                    self.rel(3, "io.example.demo-v2.0.0-beta.1", prerelease=True),
+                    self.rel(4, "io.example.demo-v1.4.0", prerelease=True))  # flagged by the release only
+
+        def note(version, app):
+            self.app_json(app)
+            self.set_rules(self.listing(*releases))
+            code, out, err = self.run_alt("retract", BID, version)
+            self.assertEqual(code, 0, err)
+            return [line for line in out.splitlines() if line.startswith("note:")]
+
+        self.assertEqual(note("1.3.0", {"name": "Demo"}), [
+            "note: 1.3.0 was the newest listed version: clients that installed it are offered 1.2.0 as an update. "
+            "If users installed it, also publish a fixed higher version."])
+        self.assertEqual(note("2.0.0-beta.1", {"name": "Demo"}), [])  # never listed
+        self.assertEqual(note("1.4.0", {"name": "Demo", "includePrereleases": False}), [])
+        self.assertEqual(note("1.3.0", {"name": "Demo", "includePrereleases": True}), [])
+        self.assertEqual(len(note("2.0.0-beta.1", {"name": "Demo", "includePrereleases": True})), 1)
+        self.assertEqual(note("1.3.0", {"name": "Demo", "hidden": True}), [])
 
     def test_a_higher_version_means_no_note(self):
         self.set_rules(self.listing(self.rel(11), self.rel(16, "io.example.demo-v1.10.0"),
@@ -788,8 +904,8 @@ class RetractTests(OperatorCase):
         self.assertNotIn("deleted", out.replace("--method DELETE", ""))
         code, out, _ = self.run_alt("--dry-run", "retract", BID, "1.2.3", "--unpublish")
         self.assertEqual(code, 0)
-        self.assertIn("+ gh api --method PATCH repos/xuniv/alt/releases/11 --input -  # draft=true, tag_name=%s\n"
-                      % TAG, out)
+        self.assertIn("+ gh api --method PATCH repos/xuniv/alt/releases/11 --input -  # draft=true, name=[withdrawn] "
+                      "%s, tag_name=%s\n" % (TAG, TAG), out)
         self.assertEqual(self.writes(), [])
         self.assertEqual(self.log_text(), "")
 

@@ -8,7 +8,8 @@ pre-push hook. Every GitHub request goes through the ``gh`` client as an argumen
 
 Withdrawn versions are listed in ``apps/<bid>/retracted.json`` on ``main``, a file that only the
 catalog sync writes. ``build`` refuses such a version unless ``--force`` is given; ``publish`` and
-``mirror`` only warn.
+``mirror`` only warn (with ``--defer``, scheduled stage runs skip the draft of a withdrawn version, so
+it waits for staging by tag).
 
 Every command except ``hook uninstall`` first checks that the local denylist exists and that ``gh`` is
 logged in as ``ALT_OWNER`` (default ``xuniv``) with access to ``ALT_REPO`` (default ``xuniv/alt``);
@@ -53,10 +54,13 @@ from altsource import cli as altcli  # noqa: E402
 from altsource.gh import GitHub  # noqa: E402
 from altsource.stage import (  # noqa: E402
     APP_JSON_MAX_BYTES,
+    BLOCKED_MARK,
     NOTES_PATH,
+    WITHDRAWN_MARK,
     Toolkit,
     check_app_json_text,
     parse_semver,
+    semver_prerelease,
     text_findings,
     validate_app_json,
 )
@@ -385,6 +389,32 @@ def retracted_path(bid: str) -> str:
     return "apps/%s/%s" % (bid, RETRACTED_FILE)
 
 
+def record_path(bid: str, version: str) -> str:
+    return "apps/%s/versions/%s.json" % (bid, version)
+
+
+def record_on_main(ctx: Ctx, bid: str, version: str) -> Optional[bool]:
+    """Whether main has the version record of ``version`` (sync listed it); None when that is unknown.
+
+    Sync writes a tombstone only for a version whose record it drops.
+    """
+    path = record_path(bid, version)
+    proc = ctx.gh(["api", _contents_path(ctx, path)], check=False)
+    if proc.returncode != 0:
+        if b"HTTP 404" in (proc.stderr or b""):
+            return False
+        ctx.warn("%s on %s could not be read: %s" % (path, MAIN_BRANCH, _last_line(proc.stderr)))
+        return None
+    try:
+        info = json.loads((proc.stdout or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        info = None
+    if not isinstance(info, dict) or info.get("type") != "file":
+        ctx.warn("%s on %s: unexpected response" % (path, MAIN_BRANCH))
+        return None
+    return True
+
+
 def read_retracted(ctx: Ctx, bid: str) -> Dict[str, Dict[str, Any]]:
     """The withdrawn versions of ``bid`` from ``apps/<bid>/retracted.json`` on main; {} without the file."""
     path = retracted_path(bid)
@@ -465,20 +495,39 @@ def check_build_withdrawn(ctx: Ctx, bid: str, ref: str, force: bool) -> None:
              "again, sync removes it from %s" % (version, bid, describe_retraction(entry), retracted_path(bid)))
 
 
-def warn_if_withdrawn(ctx: Ctx, tag: str) -> None:
-    """publish and mirror are explicit operator actions: a withdrawn version only gives a warning."""
+def check_withdrawn(ctx: Ctx, tag: str, *, defer: bool) -> bool:
+    """Warn when the version of a freshly staged draft was withdrawn; True when scheduled stage runs
+    skip the draft.
+
+    publish and mirror are explicit operator actions: a withdrawn version only gives a warning, and
+    stage.yml dispatched with the tag publishes it. Scheduled runs skip drafts of withdrawn versions,
+    so with ``defer`` a version also counts while main still has its record: stage created a draft,
+    so no published release uses the tag, and the next sync lists the version in retracted.json.
+    """
     try:
-        bid, version = ctx.deps.parse_tag(tag)
+        bid, version = (str(x) for x in ctx.deps.parse_tag(tag))
     except Exception:
-        return
+        return False
     try:
-        entry = read_retracted(ctx, str(bid)).get(str(version))
+        entry = read_retracted(ctx, bid).get(version)
     except OpError as exc:
         ctx.warn("withdrawn versions not checked: %s" % exc)
-        return
+        return False
     if entry is not None:
-        ctx.warn("version %s of %s was withdrawn (%s); publishing it again makes it available, and sync "
-                 "then removes it from %s" % (version, bid, describe_retraction(entry), retracted_path(str(bid))))
+        if defer:
+            ctx.warn("version %s of %s was withdrawn (%s, see %s); scheduled stage runs skip its drafts"
+                     % (version, bid, describe_retraction(entry), retracted_path(bid)))
+        else:
+            ctx.warn("version %s of %s was withdrawn (%s); publishing it again makes it available, and sync "
+                     "then removes it from %s" % (version, bid, describe_retraction(entry), retracted_path(bid)))
+        return True
+    # a dry run does not look at the releases, so a record may simply belong to a published release
+    if defer and not ctx.dry_run and record_on_main(ctx, bid, version):
+        ctx.warn("version %s of %s is still listed on %s, but no published release uses its tag: the next "
+                 "catalog run lists it in %s as withdrawn, and scheduled stage runs then skip its drafts"
+                 % (version, bid, MAIN_BRANCH, retracted_path(bid)))
+        return True
+    return False
 
 
 def source_url(repo: str) -> str:
@@ -531,13 +580,17 @@ def publish_ipa(ctx: Ctx, ipa: str, *, semver: Optional[str], notes_file: Option
     if values.get("noop") == "true":
         ctx.print("%s is already published with this IPA; nothing to do" % tag)
         return EXIT_OK
-    warn_if_withdrawn(ctx, tag)
+    withdrawn = check_withdrawn(ctx, tag, defer=defer)
     if ctx.dry_run:
         ctx.plan("gh api --method POST repos/%s/releases --input -  # draft %s" % (repo, tag))
         ctx.plan("gh api --method POST https://uploads.github.com/repos/%s/releases/<id>/assets?name=%s"
                  % (repo, urllib.parse.quote(values.get("asset", ""), safe="")))
     if defer:
-        ctx.print("draft %s waits for the next scheduled stage run" % tag)
+        if withdrawn:
+            ctx.print("draft %s stays a draft until it is staged by tag: gh workflow run stage.yml -R %s -f tag=%s"
+                      % (tag, repo, tag))
+        else:
+            ctx.print("draft %s waits for the next scheduled stage run" % tag)
         return EXIT_OK
     proc = ctx.gh(["workflow", "run", "stage.yml", "-R", repo, "-f", "tag=" + tag], write=True)
     if not ctx.dry_run:
@@ -712,17 +765,37 @@ def tag_exists(ctx: Ctx, tag: str) -> bool:
 
 
 def newest_note(ctx: Ctx, releases: Sequence[Mapping[str, Any]], bid: str, version: str) -> Optional[str]:
-    """What clients see when the withdrawn version was the newest published one, else None."""
+    """What clients see when the withdrawn version was the newest listed one, else None.
+
+    Like source.json, a prerelease (by the release flag or the semver) only counts when the app.json of
+    this checkout sets ``includePrereleases``; a version that was not listed, or a hidden app, gets no note.
+    """
+    try:
+        app = load_json_file(app_json_path(ctx, bid), "app.json")
+    except OpError:
+        app = None
+    app = app if isinstance(app, dict) else {}
+    if app.get("hidden", False) is not False:
+        return None
+    include_pre = app.get("includePrereleases") is True
+    listed = False
     others = []
     for rel in releases:
         if rel.get("draft"):
             continue
         try:
             other_bid, other = ctx.deps.parse_tag(str(rel.get("tag_name") or ""))
+            prerelease = bool(rel.get("prerelease")) or semver_prerelease(ctx.deps, str(other))
         except Exception:
             continue
-        if other_bid == bid and str(other) != version:
+        if str(other_bid) != bid or (prerelease and not include_pre):
+            continue
+        if str(other) == version:
+            listed = True
+        else:
             others.append(str(other))
+    if not listed:
+        return None
     try:
         mine = parse_semver(ctx.deps, version)
         keyed = sorted(((parse_semver(ctx.deps, v), v) for v in others), key=lambda item: item[0])
@@ -731,8 +804,8 @@ def newest_note(ctx: Ctx, releases: Sequence[Mapping[str, Any]], bid: str, versi
     if keyed and mine < keyed[-1][0]:
         return None
     if not keyed:
-        return "no other published version of %s remains, so the app leaves source.json" % bid
-    return ("%s was the newest published version: clients that installed it are offered %s as an update. "
+        return "no other listed version of %s remains, so the app leaves source.json" % bid
+    return ("%s was the newest listed version: clients that installed it are offered %s as an update. "
             "If users installed it, also publish a fixed higher version." % (version, keyed[-1][1]))
 
 
@@ -752,7 +825,10 @@ def cmd_retract(args: argparse.Namespace, ctx: Ctx) -> int:
     """Withdraw a version: delete its release (or turn it into a draft), then run the catalog on main.
 
     Sync drops the version from source.json and records it in apps/<bid>/retracted.json, which keeps
-    poll.yml, build.yml and ``alt build`` from building it again. Nothing is committed from here.
+    poll.yml, build.yml and ``alt build`` from building it again. Sync writes that entry only for a
+    version it listed (main has its record); the output says so when it did not. ``--unpublish`` also
+    titles the drafts ``[withdrawn] <tag>``, which scheduled stage runs skip whether or not sync has
+    run. Nothing is committed from here.
     """
     bid = check_bid(args.bid)
     version = check_version(args.version)
@@ -774,21 +850,44 @@ def cmd_retract(args: argparse.Namespace, ctx: Ctx) -> int:
     if not matching and not delete_tag:
         raise OpError("no release uses tag %s%s" % (tag, " and the tag does not exist" if args.delete_tag else ""))
     note = newest_note(ctx, releases, bid, version) if published else None
+    listed = record_on_main(ctx, bid, version)
+    tombstoned = False
+    if listed is False:
+        try:
+            tombstoned = version in read_retracted(ctx, bid)
+        except OpError as exc:
+            ctx.warn("withdrawn versions not checked: %s" % exc)
 
     done = []
     if args.unpublish:
-        for rel in published:
-            rid = _release_id(rel)
-            path = "repos/%s/releases/%d" % (repo, rid)
+        title = WITHDRAWN_MARK + tag
+        marked = 0
+        for rel in published + drafts:
+            name = str(rel.get("name") or "")
+            if rel.get("draft") and name.startswith(BLOCKED_MARK):
+                ctx.print("draft release %s is marked blocked by the gate; scheduled stage runs skip it" % tag)
+                continue
+            if rel.get("draft") and name.startswith(WITHDRAWN_MARK):
+                ctx.print("draft release %s is already marked withdrawn" % tag)
+                continue
+            path = "repos/%s/releases/%d" % (repo, _release_id(rel))
+            # the mark keeps scheduled stage runs from publishing it before sync lists the version;
             # restating the tag keeps GitHub from detaching the draft from it
+            body = {"draft": True, "name": title, "tag_name": tag}
             ctx.gh(["api", "--method", "PATCH", path, "--input", "-"], write=True,
-                   input=json.dumps({"draft": True, "tag_name": tag}).encode("utf-8"),
-                   display="gh api --method PATCH %s --input -  # draft=true, tag_name=%s" % (path, tag))
+                   input=json.dumps(body, sort_keys=True).encode("utf-8"),
+                   display="gh api --method PATCH %s --input -  # draft=true, name=%s, tag_name=%s"
+                           % (path, title, tag))
+            if rel.get("draft"):
+                marked += 1
             if not ctx.dry_run:
-                ctx.print("release %s is a draft now" % tag)
+                ctx.print("%s %s is a draft titled %s now" % (
+                    "draft release" if rel.get("draft") else "release", tag, title))
         if published:
             done.append("unpublished")
-        else:
+        if marked:
+            done.append("draft marked withdrawn")
+        if not published and not marked:
             ctx.print("release %s is already a draft" % tag)
     else:
         for rel in published + drafts:
@@ -809,8 +908,21 @@ def cmd_retract(args: argparse.Namespace, ctx: Ctx) -> int:
     # the release event starts a catalog run as well; this one does not depend on its delivery
     ctx.gh(["workflow", "run", "catalog.yml", "-R", repo, "--ref", MAIN_BRANCH], write=True)
     if not ctx.dry_run:
-        ctx.print("dispatched catalog.yml on %s: sync removes %s from source.json and lists it in %s"
-                  % (MAIN_BRANCH, version, retracted_path(bid)))
+        if listed:
+            ctx.print("dispatched catalog.yml on %s: sync removes %s from source.json and lists it in %s"
+                      % (MAIN_BRANCH, version, retracted_path(bid)))
+        elif tombstoned:
+            ctx.print("dispatched catalog.yml on %s; %s is already listed in %s"
+                      % (MAIN_BRANCH, version, retracted_path(bid)))
+        elif listed is None:
+            ctx.print("dispatched catalog.yml on %s: if source.json listed %s, sync removes it and lists it in %s"
+                      % (MAIN_BRANCH, version, retracted_path(bid)))
+        else:
+            ctx.print("dispatched catalog.yml on %s" % MAIN_BRANCH)
+    if listed is False and not tombstoned:
+        ctx.warn("%s has no record of %s (source.json does not list it), so sync adds no entry for it to %s: "
+                 "poll.yml, build.yml and the pre-push hook are not kept from building it again"
+                 % (MAIN_BRANCH, version, retracted_path(bid)))
     ctx.print("source: %s" % source_url(repo))
     if note:
         ctx.print("note: %s" % note)
@@ -1626,7 +1738,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("ipa", metavar="IPA")
     p.add_argument("--semver", metavar="V", help="version for the tag (default: CFBundleShortVersionString)")
     p.add_argument("--notes-file", metavar="F", help="release notes (scanned with the denylist)")
-    p.add_argument("--defer", action="store_true", help="leave the draft for the next scheduled stage run")
+    p.add_argument("--defer", action="store_true",
+                   help="leave the draft for the next scheduled stage run (a withdrawn version's draft waits for "
+                        "staging by tag)")
     p.set_defaults(func=cmd_publish)
 
     p = sub.add_parser("mirror", parents=[common], help="publish the IPA of a private release")
@@ -1656,7 +1770,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="withdraw a version: delete its release (or unpublish it) and run the catalog")
     p.add_argument("bid", metavar="BID")
     p.add_argument("version", metavar="VERSION")
-    p.add_argument("--unpublish", action="store_true", help="turn the release into a draft instead of deleting it")
+    p.add_argument("--unpublish", action="store_true",
+                   help="turn the release into a draft titled [withdrawn] <tag> instead of deleting it")
     p.add_argument("--delete-tag", action="store_true", help="also delete the git tag (not with --unpublish)")
     p.add_argument("--reason", metavar="TEXT", help="note for the local log %s; never sent to GitHub" % RETRACT_LOG)
     p.set_defaults(func=cmd_retract)

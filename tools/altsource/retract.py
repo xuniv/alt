@@ -11,11 +11,11 @@ version here, so that builders do not bring it back by themselves::
       }
     }
 
-``reason`` is ``deleted`` (no release uses the tag any more) or ``unpublished`` (the release is a
-draft again). The file is derived: only sync writes it, with sorted keys, and sync removes an entry
-(and the file once it is empty) when a release for that version is published again. Tombstones
-never change ``source.json``; they are a signal for builders, which refuse a withdrawn version
-unless forced.
+``reason`` is ``deleted`` (the listed release is gone, even if another draft uses the tag) or
+``unpublished`` (the listed release is a draft again). The file is derived: only sync writes it,
+with sorted keys, and sync removes an entry (and the file once it is empty) when a release for that
+version is published again. Tombstones never change ``source.json``; they are a signal for
+builders, which refuse a withdrawn version unless forced.
 
 :func:`load` and :func:`is_retracted` read the file strictly: a missing file means "nothing
 withdrawn", a malformed one raises :class:`RetractError` so callers fail instead of building a
