@@ -1,4 +1,5 @@
-"""Tests for the operator command line ``bin/alt`` and its pre-push hook template.
+"""Tests for the operator command line ``bin/alt``, its pre-push hook template and the build step of
+``build.yml`` that runs a private build command.
 
 ``gh``, ``ssh-keygen`` and ``age`` are fake programs on PATH that log their arguments and input; the IPA
 tooling and the release API used by the stage pipeline are the in-memory fakes of ``tests.test_sync``.
@@ -476,6 +477,32 @@ class BuildTests(OperatorCase):
             self.assertEqual(self.run_alt("build", bid, ref)[0], 1, (bid, ref))
         self.assertEqual(self.calls(), [])
 
+    def test_inputs_follow_the_rules_of_build_yml(self):
+        # build.yml refuses these inputs, but only after the run (and its public title) exists
+        long_bid = "io.example." + "a" * 145
+        for bid, ref in ((BID, "v1.2.3+5"), (BID, "v" + "1" * 128), (BID, ".v1"), (BID, "v1/.x"),
+                         (BID, "v1//2"), (BID, "v1."), (long_bid, "v1.2.3")):
+            code, _, err = self.run_alt("build", bid, ref)
+            self.assertEqual(code, 1, (bid, ref))
+            self.assertIn("invalid", err)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(len(long_bid), 156)
+        self.assertEqual(self.run_alt("build", long_bid[:-1], "v" + "1" * 127)[0], 0)
+
+    def test_run_title_is_gated_with_the_local_denylist(self):
+        for ref in ("v1.2.3-LEAKY-HOST-0", "release/leakyuser0", "a/Users/devname1/v1"):
+            code, out, err = self.run_alt("build", BID, ref)
+            self.assertEqual(code, 2, ref)
+            self.assertIn("gate rejected: run title", err)
+            for word in ("leaky", "LEAKY", "devname1"):
+                self.assertNotIn(word, out + err)
+        self.assertEqual(self.calls(), [])  # refused before any gh call, also the read-only ones
+        os.unlink(self.denylist)
+        code, _, err = self.run_alt("build", BID, "v1.2.3")
+        self.assertEqual(code, 1)
+        self.assertIn("local denylist not found", err)
+        self.assertEqual(self.calls(), [])
+
 
 class IngestTests(OperatorCase):
     URL = "https://downloads.example.invalid/files/Demo.ipa?x=1"
@@ -544,7 +571,9 @@ class RegisterTests(OperatorCase):
     def rules(self, keys=(), created=None, *extra):
         created = created if created is not None else {"id": 77, "title": "alt-build", "read_only": True}
         self.set_rules(*extra, {"match": ["api", "repos/%s/keys?per_page=100" % PRIVATE], "stdout": list(keys)},
-                       {"match": ["api", "--method", "POST", "repos/%s/keys" % PRIVATE], "stdout": created})
+                       {"match": ["api", "--method", "POST", "repos/%s/keys" % PRIVATE], "stdout": created},
+                       {"match": ["api", POLICIES_PATH + "?per_page=100"],
+                        "stdout": {"total_count": 0, "branch_policies": []}})
 
     def keygen(self):
         path = os.path.join(self.state, "ssh-keygen.json")
@@ -607,6 +636,50 @@ class RegisterTests(OperatorCase):
         self.assertEqual(writes[-2:], [["secret", "delete", "ALT_KEY_" + ALIAS, "-R", "xuniv/alt"],
                                        ["secret", "delete", "ALT_APP_" + ALIAS, "-R", "xuniv/alt"]])
         self.assertIn("old repository secret ALT_APP_%s deleted" % ALIAS, out)
+
+    def test_other_deployment_policies_are_removed(self):
+        listing = {"match": ["api", POLICIES_PATH + "?per_page=100"], "stdout": {"total_count": 3, "branch_policies": [
+            {"id": 1, "name": "*", "type": "branch"}, {"id": 2, "name": "v*", "type": "tag"},
+            {"id": 3, "name": "main", "type": "branch"}]}}
+        self.rules((), None, listing)
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID)
+        self.assertEqual(code, 0, err)
+        policy_writes = [w for w in self.writes() if any(POLICIES_PATH in a for a in w)]
+        self.assertEqual(policy_writes, [["api", "--method", "DELETE", POLICIES_PATH + "/1"],
+                                         ["api", "--method", "DELETE", POLICIES_PATH + "/2"]])
+        self.assertIn("deployment tag policy v* removed from environment %s" % ENV, out)
+        self.assertIn("environment %s allows deployments from main only" % ENV, out)
+
+    def test_a_wildcard_policy_is_replaced_by_main(self):
+        self.rules((), None, {"match": ["api", POLICIES_PATH + "?per_page=100"],
+                              "stdout": {"total_count": 1, "branch_policies": [{"id": 9, "name": "*", "type": "branch"}]}})
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes()[:3], [
+            ["api", "--method", "PUT", ENV_PATH, "--input", "-"],
+            ["api", "--method", "DELETE", POLICIES_PATH + "/9"],
+            ["api", "--method", "POST", POLICIES_PATH, "-f", "name=main", "-f", "type=branch"]])
+
+    def test_dry_run_prints_the_policy_changes(self):
+        self.rules((), None, {"match": ["api", ENV_PATH], "stdout": {"name": ENV}},
+                   {"match": ["api", POLICIES_PATH + "?per_page=100"],
+                    "stdout": {"total_count": 1, "branch_policies": [{"id": 9, "name": "*", "type": "branch"}]}})
+        code, out, err = self.run_alt("--dry-run", "register", PRIVATE, "--bid", BID)
+        self.assertEqual(code, 0, err)
+        self.assertIn("+ gh api --method DELETE %s/9\n" % POLICIES_PATH, out)
+        self.assertIn("+ gh api --method POST %s -f name=main -f type=branch\n" % POLICIES_PATH, out)
+        self.assertEqual(self.writes(), [])
+
+    def test_unverifiable_policies_stop_the_registration(self):
+        for listing in ({"total_count": 101, "branch_policies": [{"id": 1, "name": "main", "type": "branch"}]},
+                        {"total_count": 1, "branch_policies": [{"name": "*", "type": "branch"}]},
+                        {"message": "unexpected"}):
+            self.rules((), None, {"match": ["api", POLICIES_PATH + "?per_page=100"], "stdout": listing})
+            code, _, err = self.run_alt("register", PRIVATE, "--bid", BID)
+            self.assertEqual(code, 1, listing)
+            self.assertIn("environment %s" % ENV, err)
+        self.assertFalse(any(a[:2] == ["secret", "set"] for a in self.argvs()))
+        self.assertFalse(any("repos/%s/keys" % PRIVATE in a for w in self.writes() for a in w))
 
     def test_existing_key_needs_rotate(self):
         self.rules(keys=[{"id": 5, "title": "alt-build"}])
@@ -902,6 +975,34 @@ class HookTests(OperatorCase):
         self.assertEqual(self.run_alt("hook", "install", self.work, "--bid", "a'b")[0], 1)
         self.assertEqual(self.read(self.hook), "#!/bin/sh\nexit 0\n")
 
+    def test_install_applies_the_build_rules_to_the_bundle_identifier(self):
+        code, out, err = self.run_alt("hook", "install", self.work, "--bid", "io.leaky-host-0.demo")
+        self.assertEqual(code, 2)
+        self.assertIn("gate rejected: bundle identifier", err)
+        self.assertNotIn("leaky", out + err)
+        self.assertEqual(self.run_alt("hook", "install", self.work, "--bid", "io.example." + "a" * 145)[0], 1)
+        self.assertFalse(os.path.lexists(self.hook))
+
+    def test_tags_that_build_yml_refuses_start_no_build(self):
+        self.install()
+        tags = ["v1.2.3+5", "v" + "1" * 128, "v1..2", "v1/.x", "v1.", "v1.lock", "v1//2", "v1\\2", "v1$x"]
+        lines = ["refs/tags/%s %s refs/tags/%s %s" % (t, self.sha, t, ZERO) for t in tags]
+        proc, _ = self.run_hook(lines, env=dict(self.env, ALT_HOOK_TIMEOUT="0"))
+        self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (0, b"", b""))
+        self.assertEqual(self.log_text().count("not a valid build ref; no build started"), len(tags))
+        self.assertNotIn("pushed", self.log_text())
+        self.assertNotIn("not on the remote", self.log_text())
+        self.assertEqual(self.builds(), [])
+
+    def test_a_tag_with_a_denylist_term_starts_no_build(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.assertEqual(self.install()[0], 0)
+        installed = len(self.argvs())
+        self.git("tag", "v1.2.3-leaky-host-0")
+        self.git("push", "-q", "origin", "v1.2.3-leaky-host-0")
+        self.assertTrue(self.wait_for(lambda: "gate rejected: run title" in self.log_text()), self.log_text())
+        self.assertEqual(self.argvs()[installed:], [])  # refused before gh was asked anything
+
     def test_install_needs_the_denylist_and_dry_run_writes_nothing(self):
         os.unlink(self.denylist)
         self.assertEqual(self.install()[0], 1)
@@ -1058,10 +1159,14 @@ class StatusDiagDoctorTests(OperatorCase):
         self.assertIn("empty", self.run_alt("diag", "123")[2])
 
     def doctor_rules(self, secrets=("ALT_DENYLIST", "ALT_PAYLOAD_IDENTITY"), env_secrets=("ALT_KEY", "ALT_APP"),
-                     pages_code=0, state="active", branch_policy=True):
+                     pages_code=0, state="active", branch_policy=True, policies=None):
         workflows = [{"path": ".github/workflows/%s" % w, "state": state if w == "build.yml" else "active"}
                      for w in ("catalog.yml", "stage.yml", "build.yml", "ingest.yml", "poll.yml", "ci.yml")]
-        policy = {"protected_branches": False, "custom_branch_policies": True} if branch_policy else None
+        if branch_policy is True:
+            policy = {"protected_branches": False, "custom_branch_policies": True}
+        else:
+            policy = branch_policy or None
+        policies = [{"id": 1, "name": "main", "type": "branch"}] if policies is None else policies
         self.set_rules({"match": ["api", "repos/xuniv/alt/actions/permissions"], "stdout": {"enabled": True}},
                        {"match": ["api", "repos/xuniv/alt/actions/permissions/workflow"],
                         "stdout": {"default_workflow_permissions": "read"}},
@@ -1069,7 +1174,7 @@ class StatusDiagDoctorTests(OperatorCase):
                         "stdout": {"total_count": 6, "workflows": workflows}},
                        {"match": ["api", ENV_PATH], "stdout": {"name": ENV, "deployment_branch_policy": policy}},
                        {"match": ["api", POLICIES_PATH + "?per_page=100"],
-                        "stdout": {"total_count": 1, "branch_policies": [{"name": "main", "type": "branch"}]}},
+                        "stdout": {"total_count": len(policies), "branch_policies": policies}},
                        {"match": ["secret", "list", "--env", ENV], "stdout": [{"name": n} for n in env_secrets]},
                        {"match": ["secret", "list"], "stdout": [{"name": n} for n in secrets]},
                        {"match": ["variable", "list"],
@@ -1111,6 +1216,26 @@ class StatusDiagDoctorTests(OperatorCase):
         code, out, _ = self.run_alt("doctor")
         self.assertEqual(code, 1)
         self.assertIn("FAIL  environment %s: every branch may use its secrets; allow main only" % ENV, out)
+        self.assertEqual(self.writes(), [])
+
+    def test_doctor_wants_main_as_the_only_deployment_policy(self):
+        os.chmod(self.denylist, 0o600)
+        self.app_json({"privateBuild": {"enabled": True}})
+        main = {"id": 1, "name": "main", "type": "branch"}
+        cases = [
+            ({}, [main, {"id": 2, "name": "*", "type": "branch"}],
+             "deployment policies besides main: 1 (0 for tags); run alt register to remove them"),
+            ({}, [main, {"id": 3, "name": "v*", "type": "tag"}], "deployment policies besides main: 1 (1 for tags)"),
+            ({}, [{"id": 4, "name": "main", "type": "tag"}], "main is not an allowed branch"),
+            ({}, [], "main is not an allowed branch"),
+            ({"branch_policy": {"protected_branches": True, "custom_branch_policies": False}}, [main],
+             "not limited to selected branches"),
+        ]
+        for options, policies, message in cases:
+            self.doctor_rules(policies=policies, **options)
+            code, out, _ = self.run_alt("doctor")
+            self.assertEqual(code, 1, (policies, out))
+            self.assertIn("FAIL  environment %s: %s" % (ENV, message), out)
         self.assertEqual(self.writes(), [])
 
     def test_doctor_stops_remote_checks_on_the_wrong_login(self):
@@ -1161,6 +1286,140 @@ class CommandLineTests(OperatorCase):
     def read_file(path):
         with open(path, encoding="utf-8") as fh:
             return fh.read()
+
+
+BUILD_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "build.yml")
+FILE_COMMANDS = ("GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY")
+
+
+def step_script(path, name):
+    """The ``run: |`` block of the step called ``name`` (the workflow is read as text; no YAML parser)."""
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    start = [i for i, line in enumerate(lines) if line.strip() == "- name: %s" % name]
+    if len(start) != 1:
+        raise AssertionError("expected one step named %r" % name)
+    key_indent = len(lines[start[0]]) - len(lines[start[0]].lstrip()) + 2
+    run = None
+    for i in range(start[0] + 1, len(lines)):
+        indent = len(lines[i]) - len(lines[i].lstrip())
+        if lines[i].strip() and indent < key_indent:
+            break
+        if indent == key_indent and lines[i].strip() == "run: |":
+            run = i
+            break
+    if run is None:
+        raise AssertionError("step %r has no literal run block" % name)
+    body = []
+    for line in lines[run + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= key_indent:
+            break
+        body.append(line)
+    indent = min(len(line) - len(line.lstrip()) for line in body if line.strip())
+    return "\n".join(line[indent:] for line in body).rstrip() + "\n"
+
+
+def bash_programs():
+    """bash from PATH and, on macOS, the system bash 3.2 that the step must also run under."""
+    found = []
+    for candidate in (shutil.which("bash"), "/bin/bash"):
+        if candidate and os.path.isfile(candidate) and os.path.realpath(candidate) not in found:
+            found.append(os.path.realpath(candidate))
+    return found
+
+
+@unittest.skipUnless(bash_programs() and shutil.which("python3"), "needs bash and python3")
+class BuildStepTests(unittest.TestCase):
+    """build.yml's "Build" step: the private command sees only an allowlisted environment."""
+
+    SECRET = "sentinel-runtime-token-0"
+    COMMAND = "\n".join([
+        'echo "private-build-output" >> "$GITHUB_STEP_SUMMARY"',
+        'echo "name=private-build-output" >> "$GITHUB_OUTPUT"',
+        'echo "PRIVATE_BUILD=1" >> "$GITHUB_ENV"',
+        'echo "/private/build/bin" >> "$GITHUB_PATH"',
+        'echo "state=private-build-output" >> "$GITHUB_STATE"',
+        'echo "::warning::private-build-annotation"',
+        'echo "tokens:${ACTIONS_RUNTIME_TOKEN-}${GITHUB_TOKEN-}${ACTIONS_ID_TOKEN_REQUEST_TOKEN-}${ALT_APP_CONFIG-}"',
+        'env > "$ALT_OUT/env.txt"',
+        'pwd -P > "$ALT_OUT/pwd.txt"',
+    ])
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = os.path.realpath(self._tmp.name)
+        self.script = step_script(BUILD_WORKFLOW, "Build")
+        self.temp = os.path.join(self.dir, "runner-temp")
+        for sub in ("alt-build", "diag", "src", "_runner_file_commands"):
+            os.makedirs(os.path.join(self.temp, sub))
+        self.files = {}
+        for key in FILE_COMMANDS:
+            self.files[key] = os.path.join(self.temp, "_runner_file_commands", key.lower())
+            open(self.files[key], "w").close()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_step(self, bash, command):
+        with open(os.path.join(self.temp, "alt-build", "config.json"), "w", encoding="utf-8") as fh:
+            json.dump({"runner": "macos-latest", "command": command, "ipa_glob": "**/*.ipa",
+                       "env": json.dumps({"SCHEME": "Demo", "LANG": "en_GB.UTF-8"})}, fh)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.dir, "TMPDIR": self.dir,
+               "LC_ALL": "C", "RUNNER_TEMP": self.temp, "VERSION": "1.2.3", "GITHUB_ACTIONS": "true",
+               "GITHUB_TOKEN": self.SECRET, "ACTIONS_RUNTIME_TOKEN": self.SECRET,
+               "ACTIONS_RUNTIME_URL": "https://runtime.invalid/", "ACTIONS_RESULTS_URL": "https://results.invalid/",
+               "ACTIONS_ID_TOKEN_REQUEST_TOKEN": self.SECRET,
+               "ACTIONS_ID_TOKEN_REQUEST_URL": "https://token.invalid/", "ALT_APP_CONFIG": self.SECRET,
+               "RUNNER_OS": "macOS", "GITHUB_REPOSITORY": "xuniv/alt", "GITHUB_WORKSPACE": self.dir}
+        env.update(self.files)
+        return subprocess.run([bash, "--noprofile", "--norc", "-eo", "pipefail", "-c", self.script], cwd=self.dir,
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True)
+
+    def read(self, *parts):
+        with open(os.path.join(self.temp, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_command_cannot_reach_the_job_or_its_tokens(self):
+        for bash in bash_programs():
+            with self.subTest(bash=bash):
+                proc = self.run_step(bash, self.COMMAND)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertRegex(proc.stdout.decode(), r"^build finished, exit 0, \d+ minutes\n$")
+                self.assertEqual(proc.stderr, b"")
+                for key, path in self.files.items():
+                    self.assertEqual(os.path.getsize(path), 0, key)  # nothing reached the job
+                log = self.read("diag", "build.log")
+                self.assertIn("private-build-annotation", log)  # only in the private log
+                self.assertIn("tokens:\n", log)
+                for folder, _, names in os.walk(self.dir):
+                    for name in names:
+                        with open(os.path.join(folder, name), "rb") as fh:
+                            self.assertNotIn(self.SECRET.encode(), fh.read(), os.path.join(folder, name))
+                env = dict(line.split("=", 1) for line in self.read("out", "env.txt").splitlines() if "=" in line)
+                allowed = {"PATH", "HOME", "TMPDIR", "LC_ALL", "LANG", "TERM", "CI", "VERSION", "ALT_OUT", "SCHEME",
+                           "PWD", "OLDPWD", "SHLVL", "_"} | set(FILE_COMMANDS)
+                self.assertLessEqual(set(env), allowed)
+                self.assertNotIn("GITHUB_ACTIONS", env)
+                self.assertEqual({k: env[k] for k in ("TERM", "CI", "VERSION", "SCHEME", "LANG", "LC_ALL", "HOME")},
+                                 {"TERM": "dumb", "CI": "true", "VERSION": "1.2.3", "SCHEME": "Demo",
+                                  "LANG": "en_GB.UTF-8", "LC_ALL": "C", "HOME": self.dir})
+                self.assertEqual(env["ALT_OUT"], os.path.join(self.temp, "out"))
+                for key in FILE_COMMANDS:
+                    self.assertNotEqual(env[key], self.files[key])
+                    self.assertFalse(os.path.exists(env[key]), key)  # the throwaway files are gone
+                self.assertEqual(self.read("out", "pwd.txt").strip(), os.path.join(self.temp, "src"))
+                self.assertFalse(os.path.exists(os.path.join(self.temp, "alt-build", "env.list")))
+
+    def test_a_failing_command_fails_the_step_quietly(self):
+        for bash in bash_programs():
+            with self.subTest(bash=bash):
+                proc = self.run_step(bash, 'echo "private-build-output"\nexit 3')
+                self.assertEqual(proc.returncode, 1)
+                self.assertRegex(proc.stdout.decode(), r"^build failed, exit 3, \d+ minutes\n$")
+                self.assertEqual(proc.stderr, b"")
+                self.assertIn("private-build-output", self.read("diag", "build.log"))
+                proc = self.run_step(bash, "false | true\necho reached")  # pipefail applies to the command
+                self.assertRegex(proc.stdout.decode(), r"^build failed, exit 1, ")
 
 
 if __name__ == "__main__":

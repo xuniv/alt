@@ -10,8 +10,11 @@ catalog regeneration (`sync`):
 | 3 | an IPA at an https URL | `repository_dispatch`, `workflow_dispatch`, `bin/alt ingest` | `ingest.yml` |
 
 Every route ends in `catalog.yml`, which runs `sync` and deploys Pages when `sync` committed a change.
-A release published directly on GitHub, without any of the three routes, is gated by `sync` after
-publication (see [Publishing a release directly](#publishing-a-release-directly)).
+
+Only these three routes protect an IPA before it is public: each of them runs the gate first and keeps
+the IPA in a draft release until the gate has passed. A release published directly on GitHub, without
+any of them, is public at once. It is accepted, but `sync` gates it only after publication and can
+only remediate it after the fact (see [Publishing a release directly](#publishing-a-release-directly)).
 
 ## Tags and versions
 
@@ -80,6 +83,7 @@ ASCII/UTF-8, UTF-16LE and UTF-16BE.
 | `swiftsourceinfo` | `*.swiftsourceinfo` files and `*.swiftmodule/` directories |
 | `itunes-metadata` | an `iTunesMetadata.plist` file (App Store exports keep the purchaser's account in it). Normalization drops the one at the archive root, so this only stops a directly published IPA or one inside the bundle |
 | `xcent` | `*.xcent` entitlement files such as `archived-expanded-entitlements.xcent` (they carry the team identifier) |
+| `ci-workspace-path` | warning only: paths under the runner workspaces `/Users/runner/work/` and `/home/runner/work/`. The directories below them can name a repository; route 2 checks private sources out under the generic `/Users/runner/work/_temp/src`, but compiler prefix maps keep such paths out altogether (see [Build settings](#build-settings-altjson)) |
 | `localization-non-en` | warning only: `.lproj` folders other than `Base`, `English` and `en` (including `en-GB` and the like) |
 
 The gate also rejects:
@@ -165,12 +169,17 @@ bin/alt mirror owner/private-repo v1.4.0 [--semver V] [--notes-file notes.md] [-
 ### Publishing a release directly
 
 Publishing a release by other means also works: through the web UI, or with
-`gh release create io.example.demo-v1.4.0 Demo.ipa`. The release event starts `catalog.yml` on the
-tag, which hands over to a run on `main`, and `sync` gates the IPA after the fact. It takes the
-release down if the IPA fails. Keep in mind:
+`gh release create io.example.demo-v1.4.0 Demo.ipa`. This is accepted, but it is never protected
+before publication. Only the routes that go through a draft protect an IPA beforehand:
+`bin/alt publish`, `bin/alt mirror` and `stage.yml` (route 1), `build.yml` (route 2) and
+`ingest.yml` (route 3). A directly published release is remediated after the fact: the release event
+starts `catalog.yml` on the tag, which hands over to a run on `main`, and `sync` gates the IPA then.
+It takes the release down if the IPA fails, and replaces an IPA that passes but is not normalized.
+Keep in mind:
 
-- The IPA is public from the moment the release is published until that sync, so prefer the staged
-  route.
+- The IPA, its file name, the release title and the notes are public from the moment the release is
+  published until that sync, and anyone may have downloaded them by then. Taking the release down
+  does not undo that, so use a route that stages a draft for anything that has not been checked.
 - If the IPA passes the gate but normalizing it changes its bytes (junk entries such as `__MACOSX/`
   or `.DS_Store`, the `BuildMachineOSBuild` key, timestamps), `sync` replaces it. The normalized file
   is inspected and scanned like stage does. If the IPA cannot be normalized or the result fails, the
@@ -211,14 +220,17 @@ IPA and publishes it. To register an app, see
    - Read `.alt.json` at the tag and validate the merged settings. The private repository name is
      masked in the log.
 3. **build** (the selected macOS runner, environment `alt-<ALIAS>`):
-   - Fetch the private repository with its tags, delete the key and check out the resolved commit. If
+   - Fetch the private repository with its tags into `$RUNNER_TEMP/src` (`/Users/runner/work/_temp/src`
+     on hosted runners), delete the key and check out the resolved commit. The path is the same for
+     every app, so source paths that end up in the binaries never name the private repository. If
      the tag moved since the resolve job, the build fails. (The runner withholds a job output that
      happens to contain a masked value; the build then uses the tag's current commit, with a warning.)
    - Resolve and validate the settings again from the checkout; the runner must still match.
    - Select Xcode and install the `setup` tools.
-   - Run `command` with `bash -eo pipefail` in the checkout, with no input. Its output goes to a log
-     file, never to the job log, which shows only "build finished" or "build failed", the exit code
-     and the duration. The `env` entries are set for this step only.
+   - Run `command` with `bash -eo pipefail` in the checkout, with no input and under `env -i`: it gets
+     only the environment listed [below](#the-build-environment), never the job's token or the
+     runner's own variables. Its output goes to a log file, never to the job log, which shows only
+     "build finished" or "build failed", the exit code and the duration.
    - Find the IPA with `ipa_glob`, first in `ALT_OUT`, then in the checkout; symbolic links are
      ignored and exactly one file must match. Normalize it and check that its bundle id and version
      match; there is no gate on this runner.
@@ -240,21 +252,34 @@ run on the macOS runner as the same user as every later step of that job, and co
 checkout, the tools or files between steps. So that job holds no denylist and no payload identity, and
 nothing it checks is relied on: the gate that decides publication runs on a fresh ubuntu runner. Each
 secret is referenced by a fixed name, so the macOS runner receives only the app's own `ALT_KEY` and
-`ALT_APP`. The encryption of the payload protects against an IPA that leaks by accident; a build
-command that is itself malicious has network access and is not contained by it.
+`ALT_APP`. The encryption of the payload and the cleared environment of the build command protect
+against a build that leaks by accident; a build command that is itself malicious has network access,
+runs as the runner user, can find the runner's files and is not contained by them.
 
 `<ALIAS>` is the bundle id in upper case with every character other than a letter or digit replaced by
 `_` (`io.example.demo` becomes `IO_EXAMPLE_DEMO`, and its environment is `alt-IO_EXAMPLE_DEMO`). Print
 it with `PYTHONPATH=tools python3 -m altsource alias io.example.demo`. Two bundle ids that differ only
 in punctuation share an alias, so do not register both.
 
-The build command gets these environment variables:
+### The build environment
+
+The build command runs under `env -i` and gets these environment variables and no others:
 
 | Variable | Value |
 |---|---|
+| `PATH`, `HOME`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `DEVELOPER_DIR`, `LANG`, `LC_*` | the runner's values, where set; `LANG` is `en_US.UTF-8` when the runner sets none |
+| `TERM` | `dumb` |
+| `CI` | `true` |
 | `VERSION` | the semver from the tag (`1.4.0`, or `1.4.0-beta.1`) |
 | `ALT_OUT` | an empty scratch directory outside the checkout |
-| the `env` entries | from the build settings |
+| `GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE`, `GITHUB_STEP_SUMMARY` | empty throwaway files, deleted after the build |
+| the `env` entries | from the build settings; they may also set `LANG`, `LC_*` and `TERM` |
+
+So the command sees no `GITHUB_TOKEN`, no `ACTIONS_*` runtime or OIDC token, no `RUNNER_*` and no
+`GITHUB_ACTIONS` variable. A script written for GitHub Actions still runs, but what it writes to the
+step summary, outputs, environment or path files never reaches the job, and the workflow commands it
+prints (`::warning::` and the like) only reach the private log. Tools that need other variables (for
+example `JAVA_HOME` or `GOFLAGS`) get them from the `env` entries or set them in the command.
 
 ### Which tags are built
 
@@ -304,6 +329,23 @@ The command must produce an unsigned IPA that passes the gate:
 - Keep dSYMs and other debug files out of `Payload/`.
 - Keep home directory paths out of the binaries (for Go, build with `-trimpath`). Paths under the
   runner's own home directory are fine.
+- Keep build paths out of the binaries as well. Swift `#filePath`, C `__FILE__`, assertion messages
+  and debug information can embed the absolute source path, here `/Users/runner/work/_temp/src/...`
+  (gate warning `ci-workspace-path`). Map the checkout to `.` with the compilers' prefix maps and strip
+  the executables. With `xcodebuild`, pass the settings on its command line in the build script, for
+  example:
+
+  ```sh
+  xcodebuild -scheme "$SCHEME" -configuration Release -sdk iphoneos \
+    CODE_SIGNING_ALLOWED=NO DEPLOYMENT_POSTPROCESSING=YES STRIP_INSTALLED_PRODUCT=YES \
+    OTHER_SWIFT_FLAGS="\$(inherited) -file-prefix-map $PWD=." \
+    OTHER_CFLAGS="\$(inherited) -ffile-prefix-map=$PWD=."
+  ```
+
+  Use `-debug-prefix-map` instead of `-file-prefix-map` with a Swift compiler that lacks the latter.
+  Keep the `command` in `.alt.json` short (`"command": "scripts/build-unsigned-ipa.sh"`) and pass
+  values such as the scheme through `env`. Check the result with `altsource scan`: the
+  `ci-workspace-path` warning counts what is left.
 - Set `CFBundleShortVersionString` to the core of `VERSION` (`1.4.0` for `1.4.0-beta.1`).
 - Give every tag its own `CFBundleVersion`. Clients identify a version by the pair
   (`CFBundleShortVersionString`, `CFBundleVersion`). The catalog keeps only the higher semver of two
@@ -315,14 +357,23 @@ Workflow runs of a public repository can be read by any signed-in user. A build 
 `build <bundleId> <ref>` (`ref` is the private tag), the commit id the tag points at, the runner label,
 the Xcode version, the `setup` tools, the version, the gate's rule ids and counts, and the timing.
 The private repository name, every line of `command`, the `env` values and a custom `ipa_glob` are
-masked. They never become job outputs. Error messages in CI name no keys from
-the private settings.
+masked. They never become job outputs. Error messages in CI name no keys from the private settings.
+
+The run title is public from the moment the build is dispatched, before any job has checked the
+inputs, and it is not masked. So the tools that dispatch `build.yml` check the title first:
+`bin/alt build` (and through it the pre-push hook) refuses a bundle id or ref that `build.yml` would
+reject (a ref may use letters, digits, `.`, `_`, `/` and `-`, at most 128 characters), and a title
+with a denylist term or a home path, checked with the local denylist. `poll.yml` does the same with
+`ALT_DENYLIST`. A build started by hand (`gh workflow run build.yml`) is not checked before it shows
+up.
 
 ### Triggers
 
 - **On demand:** `bin/alt build io.example.demo v1.4.0 [--no-publish]` starts `build.yml` with
   `app`, `ref` and `publish`. With `--no-publish`, the build and the gate run, but no release is
-  created (the encrypted payload artifact is deleted as usual).
+  created (the encrypted payload artifact is deleted as usual). It first checks the run title (see
+  [What the public can see](#what-the-public-can-see)); a title with a denylist term or a home path is
+  refused with exit code 2, before any request to GitHub.
 - **On push, from your machine (the normal way to build new tags):**
   `bin/alt hook install <path-to-private-clone> --bid io.example.demo [--tag-glob 'v*']` installs a
   pre-push hook in that clone (default glob `v*`).
@@ -333,6 +384,9 @@ the private settings.
     10 minutes, then runs `bin/alt build <bid> <tag>`. A rejected push (for example a tag that already
     exists on the remote at another commit) therefore starts no build. The push itself is never
     delayed and the hook prints nothing.
+  - A tag that `build.yml` would refuse as its ref starts no job; the hook log gets a line for it.
+    `bin/alt build` then refuses a tag whose run title has a denylist term or a home path. Every
+    built tag becomes part of a public run title, so give release tags plain names.
   - The background job needs what every `bin/alt` command needs: `gh` logged in as `ALT_OWNER` and the
     local denylist. Its output, including any failure, goes only to `~/.cache/xuniv-alt/hook.log`.
   - The tag must also match `privateBuild.tagPattern`, or the build fails in its resolve job.
@@ -345,8 +399,9 @@ the private settings.
   with `git ls-remote` and keeps those that match `tagPattern`. It then starts `build.yml` for each
   version that has no published release yet and no `build <bundleId> <ref>` run in the last 30 days
   (its read-only token cannot see drafts). At most two builds start per app and run, newest first.
-  With `dry_run` it only counts them. `poll.yml` has no schedule; new tags are built through the
-  pre-push hook.
+  Tags that `build.yml` would refuse, or whose run title contains a denylist term or a home path, are
+  only counted as refused. With `dry_run` it only counts them. `poll.yml` has no schedule; new tags
+  are built through the pre-push hook.
 
 A tag whose build failed is not retried by `poll.yml` for 30 days. Start it again with `bin/alt build`
 once the cause is fixed.

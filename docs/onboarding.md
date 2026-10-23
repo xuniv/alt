@@ -87,7 +87,9 @@ bin/alt doctor
   and `ALT_PAYLOAD_RECIPIENT` are set (and warns about per-app repository secrets of an earlier
   version, `ALT_KEY_<ALIAS>` and `ALT_APP_<ALIAS>`, which no workflow reads any more);
 - for every app whose `app.json` in your checkout enables `privateBuild`, that its environment
-  `alt-<ALIAS>` exists, lets only `main` use its secrets, and holds `ALT_KEY` and `ALT_APP`;
+  `alt-<ALIAS>` exists, lets only `main` use its secrets (selected branches only, with exactly one
+  deployment policy: the branch `main`; any other branch or tag policy is reported), and holds
+  `ALT_KEY` and `ALT_APP`;
 - that Pages is built by GitHub Actions;
 - that `ssh-keygen`, `age`, `age-keygen`, `git` and the log identity are available locally (warnings
   only).
@@ -144,7 +146,8 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
 
    This:
    - creates or updates the GitHub environment `alt-IO_EXAMPLE_DEMO` and lets only the `main` branch
-     use it;
+     use it: its deployment policies become exactly one branch policy `main`, and every other branch
+     or tag policy (for example `*` from an earlier setup) is deleted;
    - creates an ed25519 key pair in a temporary directory;
    - adds the public key to the private repository as a **read-only** deploy key titled `alt-build`;
    - stores the private key as the environment secret `ALT_KEY`;
@@ -182,8 +185,10 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
    bin/alt build io.example.demo v1.4.0
    ```
 
-   If the build fails, `bin/alt diag RUN_ID` shows its log (see
-   [operations.md](operations.md#a-private-build-failed)).
+   The run title `build io.example.demo v1.4.0` is public from the moment of the dispatch, so
+   `bin/alt build` first refuses a tag that `build.yml` would reject, and one whose title contains a
+   denylist term or a home path (exit code 2). If the build fails, `bin/alt diag RUN_ID` shows its
+   log (see [operations.md](operations.md#a-private-build-failed)).
 
 6. **Build new tags automatically.** Install the pre-push hook in your clone of the private
    repository:
