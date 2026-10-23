@@ -8,8 +8,15 @@ A record whose release, IPA asset and app.json asset are unchanged is reused wit
 scanning the IPA again. After the denylist or the gate rules change, run with ``rescan=True``
 (``sync --rescan``) once so every published IPA is checked against them.
 
-The name of a published IPA asset is public text like the release notes: a release whose IPA asset
-name contains a denylist term or a home path is taken down.
+The tag, the name of a published IPA asset and the facts listed from the IPA (app name, versions,
+privacy keys and descriptions, entitlement keys, all in decoded form) are public text like the
+release notes: a release whose tag, asset name or listed facts contain a denylist term or a path
+rule hit is taken down. Leaky release notes and titles are cleared or reset, and leaky asset labels
+(GitHub shows a label in place of the file name) are cleared, also for records reused from an
+earlier run. As a final guard every string of every record and of the generated ``source.json`` is
+checked before anything is committed: a record that fails takes its release down, and a failure in
+text from curated files (``app.json``, ``source.base.json``) aborts the sync. Reports name rules and
+counts, never the matched text.
 
 A published IPA that passes the gate but is not in normalized form (it was uploaded directly rather
 than through ``stage``) is replaced by its normalized form: the normalized file is inspected and
@@ -44,6 +51,7 @@ from .stage import (
     APP_JSON_MAX_BYTES,
     ARCHIVE_ERRORS,
     BLOCKED_MARK,
+    PATH_RULES,
     SEED_KEYS,
     Toolkit,
     blocking,
@@ -52,10 +60,13 @@ from .stage import (
     errors_of,
     field,
     finding_dicts,
+    info_findings,
     is_ipa_asset,
     parse_semver,
     rule_of,
     semver_prerelease,
+    tag_findings,
+    value_findings,
     _verify_upload,
     app_name,
     ipa_asset_name,
@@ -65,14 +76,17 @@ from .stage import (
 SCHEMA_VERSION = 1
 NOTES_LIMIT = 4000
 SEED_ASSET = "app.json"
-OPT_IN_RULES = frozenset({"home-path"})  # findings that app.json ``allowHomePaths`` turns into warnings
+OPT_IN_RULES = PATH_RULES  # findings that app.json ``allowHomePaths`` turns into warnings
 NOTES_PATH = "<release-notes>"
 TITLE_PATH = "<release-title>"
 ASSET_NAME_PATH = "<asset-name>"
+LABEL_PATH = "<asset-label>"
+RECORD_PATH = "<catalog-record>"
 LIST_ATTEMPTS = 2  # listings that decide whether a failed replacement can be undone
 RECORD_RE = re.compile(r"^apps/[^/]+/versions/[^/]+\.json$")
 _WARNING_PREFIX = re.compile(r"^warning:\s*", re.IGNORECASE)
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
+_PLAIN_KEY = re.compile(r"^[A-Za-z]{1,40}$")
 
 
 class SyncError(Exception):
@@ -294,7 +308,10 @@ class _Run:
     def policy_for(self, bid: str, seed: Optional[Dict[str, Any]] = None) -> Any:
         """Gate policy for ``bid``: the committed app.json decides; a new app uses the release's app.json."""
         path = os.path.join(self.root, "apps", bid, "app.json")
-        if os.path.exists(path):
+        planned = self.desired.get("apps/%s/app.json" % bid)  # written for a new app by this run
+        if planned is not None:
+            app = json.loads(planned.decode("utf-8"))
+        elif os.path.exists(path):
             app = _read_json(path)
         else:
             app = seed  # validated by read_seed; stage attaches the opt-in it was given
@@ -331,6 +348,52 @@ class _Run:
             self.block(tag, "%s; remediation failed (%s)" % (what, type(exc).__name__))
             return
         self.block(tag, "%s; %s" % (what, action))
+
+    @staticmethod
+    def relaxed(policy: Any) -> bool:
+        """Whether path-rule hits in text taken from the IPA are warnings (the home-path opt-in)."""
+        return bool(getattr(policy, "allow_home_paths", False))
+
+    def scrub_labels(self, rel: Dict[str, Any], tag: str) -> bool:
+        """Clear leaky asset labels; GitHub shows a label in place of the file name.
+
+        Returns False when a label could not be cleared and the release was taken down instead.
+        """
+        for asset in rel.get("assets") or []:
+            label = asset.get("label") if isinstance(asset, dict) else None
+            if not isinstance(label, str) or not label:
+                continue
+            rules = _rules(_text_hits(self.deps, label, self.denylist, LABEL_PATH))
+            if not rules:
+                continue
+            if self.dry_run:
+                self.block(tag, "%s: asset label blocked (%s); would be cleared" % (tag, ", ".join(rules)))
+                continue
+            try:
+                self.gh.update_asset(int(asset["id"]), label="")
+            except Exception as exc:
+                self.error("%s: clearing an asset label failed (%s)" % (tag, type(exc).__name__))
+                self.remediate(rel, tag, rules, subject="asset label ")
+                return False
+            asset["label"] = ""
+            self.block(tag, "%s: asset label blocked (%s); cleared" % (tag, ", ".join(rules)))
+        return True
+
+    def admit(self, path: str, record: Dict[str, Any], rel: Dict[str, Any], tag: str, policy: Any) -> bool:
+        """List ``record`` unless one of its strings (or its path) fails the leak check.
+
+        Records reused from earlier runs were made under earlier rules; a failing record takes its
+        release down like a failing IPA.
+        """
+        findings = value_findings(self.deps, [path, record], self.denylist, RECORD_PATH,
+                                  relaxed=self.relaxed(policy))
+        rules = _rules(findings)
+        if rules:
+            self.records.pop(path, None)
+            self.remediate(rel, tag, rules, subject="catalog record ")
+            return False
+        self.records[path] = record
+        return True
 
     def scrub_text(self, rel: Dict[str, Any], tag: str, bid: str, semver: str) -> str:
         """Clear leaky release notes and reset a leaky release title. Returns the notes to publish."""
@@ -399,23 +462,30 @@ class _Run:
         updated["downloadURL"] = asset.get("browser_download_url") or record.get("downloadURL")
         return updated
 
-    def keep(self, path: str, prev: Optional[Tuple[str, Dict[str, Any]]], rel_id: int,
-             asset_id: Optional[int] = None) -> None:
+    def keep(self, path: str, prev: Optional[Tuple[str, Dict[str, Any]]], rel: Dict[str, Any], tag: str,
+             policy: Any, asset_id: Optional[int] = None) -> None:
         if prev is None:
             return
         record = prev[1]
-        if record.get("releaseId") != rel_id:
+        if record.get("releaseId") != int(rel["id"]):
             return
         if asset_id is not None and record.get("assetId") != asset_id:
             return
-        self.records[path] = record
+        self.admit(path, record, rel, tag, policy)
 
     def process(self, rel, tag, bid, semver, existing) -> None:
         path = "apps/%s/versions/%s.json" % (bid, semver)
         prev = existing.get(tag)
         rel_id = int(rel["id"])
+        rules = _rules(tag_findings(self.deps, tag, self.denylist))
+        if rules:  # the tag names the release everywhere; messages and the draft title use its id
+            self.remediate(rel, "release %d" % rel_id, rules, subject="tag ")
+            return
+        policy = self.policy_for(bid)
         # release notes and title are public even when the assets are unusable
         notes = release_notes(self.scrub_text(rel, tag, bid, semver), semver)
+        if not self.scrub_labels(rel, tag):
+            return
 
         uploaded = [a for a in rel.get("assets") or [] if a.get("state") == "uploaded"]
         ipas = [a for a in uploaded if is_ipa_asset(a)]
@@ -426,7 +496,7 @@ class _Run:
             return
         if not ipas:
             self.warn("%s: no uploaded .ipa asset; skipped" % tag)
-            self.keep(path, prev, rel_id)
+            self.keep(path, prev, rel, tag, policy)
             return
         asset = ipas[0]
         # the file name is part of the download URL in the release, the records and source.json
@@ -445,7 +515,7 @@ class _Run:
             record = prev[1]
             if (record.get("releaseId") == rel_id and record.get("assetId") == asset.get("id")
                     and record.get("assetDigest") == digest and record.get("appJsonAssetId") == seed_id):
-                self.records[path] = self.refresh_record(record, rel, asset, semver, notes)
+                self.admit(path, self.refresh_record(record, rel, asset, semver, notes), rel, tag, policy)
                 return
 
         if seeds:
@@ -453,16 +523,17 @@ class _Run:
                 seed, rules = self.read_seed(seeds[0])
             except Exception as exc:
                 self.error("%s: app.json download failed (%s); skipped" % (tag, type(exc).__name__))
-                self.keep(path, prev, rel_id, int(asset["id"]))
+                self.keep(path, prev, rel, tag, policy, int(asset["id"]))
                 return
             if seed is None:
                 self.remediate(rel, tag, rules)
                 return
+            policy = self.policy_for(bid, seed)
         try:
             ipa = self.download(int(asset["id"]), digest)
         except Exception as exc:
             self.error("%s: download failed (%s); skipped" % (tag, type(exc).__name__))
-            self.keep(path, prev, rel_id, int(asset["id"]))
+            self.keep(path, prev, rel, tag, policy, int(asset["id"]))
             return
         try:
             info = self.deps.inspect_ipa(ipa)
@@ -471,7 +542,7 @@ class _Run:
             return
         except OSError as exc:  # local trouble (disk, permissions), not a verdict on the release
             self.error("%s: IPA could not be read (%s); skipped" % (tag, type(exc).__name__))
-            self.keep(path, prev, rel_id, int(asset["id"]))
+            self.keep(path, prev, rel, tag, policy, int(asset["id"]))
             return
         problems = []
         if str(field(info, "bundle_id", "")) != bid:
@@ -481,8 +552,12 @@ class _Run:
         if problems:
             self.remediate(rel, tag, problems)
             return
+        # the listed facts are decoded text (property list entities, for example): check them as shown
+        rules = _rules(info_findings(self.deps, info, bid, self.denylist, relaxed=self.relaxed(policy)))
+        if rules:
+            self.remediate(rel, tag, rules, subject="listed metadata ")
+            return
         if self.scan_published:
-            policy = self.policy_for(bid, seed)
             try:
                 result = self.deps.scan_ipa(ipa, denylist=self.denylist, policy=policy, info=info)
             except self.gate_errors as exc:
@@ -492,7 +567,7 @@ class _Run:
                 return
             except OSError as exc:
                 self.error("%s: IPA could not be scanned (%s); skipped" % (tag, type(exc).__name__))
-                self.keep(path, prev, rel_id, int(asset["id"]))
+                self.keep(path, prev, rel, tag, policy, int(asset["id"]))
                 return
             findings = finding_dicts(field(result, "findings", []))
             blocks = blocking(findings)
@@ -502,7 +577,7 @@ class _Run:
             try:
                 outcome = self.normalize_published(rel, asset, tag, bid, semver, ipa, info, policy)
             except _Skipped:
-                self.keep(path, prev, rel_id, int(asset["id"]))
+                self.keep(path, prev, rel, tag, policy, int(asset["id"]))
                 return
             if outcome is None:
                 return
@@ -510,7 +585,7 @@ class _Run:
         record = self.build_record(rel, asset, tag, bid, semver, info, notes)
         if seed_id is not None:
             record["appJsonAssetId"] = seed_id
-        self.records[path] = record
+        self.admit(path, record, rel, tag, policy)
 
     # -- normalization of directly published IPAs ----------------------------------------------
 
@@ -562,14 +637,20 @@ class _Run:
                 or str(field(normalized, "short_version", "")) != str(field(info, "short_version", ""))):
             rules.append("normalize-mismatch")
         rules += [f["rule"] for f in blocking(finding_dicts(field(result, "findings", [])))]
+        rules += _rules(info_findings(self.deps, normalized, bid, self.denylist, relaxed=self.relaxed(policy)))
         if rules or not field(result, "ok", True):
             self.remediate(rel, tag, rules)
+            return None
+        name = ipa_asset_name(app_name(normalized, bid), bid, semver)  # the name stage would give it
+        rules = _rules(_text_hits(self.deps, name, self.denylist, ASSET_NAME_PATH)
+                       + _text_hits(self.deps, _upload_name(name, int(asset["id"])), self.denylist, ASSET_NAME_PATH))
+        if rules:  # checked before the release is touched: both names become public
+            self.remediate(rel, tag, rules, subject="asset name ")
             return None
         if self.dry_run:
             self.warn("%s: IPA is not in normalized form; would be replaced and published again" % tag)
             return rel, asset, info
 
-        name = ipa_asset_name(app_name(normalized, bid), bid, semver)  # the name stage would give it
         replaced = self.replace_ipa(rel, asset, tag, out, want, name)
         if replaced is None:
             return None
@@ -827,6 +908,33 @@ def _rules(findings: Sequence[Dict[str, Any]]) -> List[str]:
     return sorted({f["rule"] for f in blocking(findings)})
 
 
+def source_leaks(run: "_Run", source: Any) -> List[str]:
+    """Counts-only problems for strings of the generated source that fail the leak check.
+
+    Each app is checked with its own policy (the home-path opt-in), everything else strictly. A
+    location names the app by position and the key only when the key is plain and clean itself.
+    """
+    if not isinstance(source, dict):
+        return []
+    apps = source.get("apps") if isinstance(source.get("apps"), list) else []
+    groups: List[Tuple[str, Any, bool]] = [("source", {k: v for k, v in source.items() if k != "apps"}, False)]
+    for index, app in enumerate(apps):
+        bid = app.get("bundleIdentifier") if isinstance(app, dict) else None
+        relaxed = isinstance(bid, str) and "/" not in bid and run.relaxed(run.policy_for(bid))
+        groups.append(("apps[%d]" % index, app, relaxed))
+    problems = []
+    for where, obj, relaxed in groups:
+        for key, value in (obj.items() if isinstance(obj, dict) else [("", obj)]):
+            found = blocking(value_findings(run.deps, [key, value], run.denylist, where, relaxed=relaxed))
+            if not found:
+                continue
+            plain = (isinstance(key, str) and _PLAIN_KEY.match(key) is not None
+                     and not _text_hits(run.deps, key, run.denylist, where))
+            problems.append("source.json %s%s: %s" % (where, "." + key if plain else "", ", ".join(
+                "%s (%d)" % (f["rule"], f["count"]) for f in found)))
+    return problems
+
+
 def _generate(root: str, desired: Mapping[str, bytes], deps: Any, pages_base: Optional[str]) -> Any:
     """Run the generator on a staging copy that already contains the planned files."""
     with tempfile.TemporaryDirectory(prefix="alt-gen-") as staging:
@@ -926,7 +1034,8 @@ def sync(
                 except run.tag_errors:
                     continue
                 if tag in seen_tags:
-                    run.warn("%s: more than one published release; extra ignored" % tag)
+                    shown = "release %d" % int(rel["id"]) if _rules(tag_findings(deps, tag, denylist)) else tag
+                    run.warn("%s: more than one published release; extra ignored" % shown)
                     continue
                 seen_tags.add(tag)
                 published.append((rel, tag, str(bid), str(semver)))
@@ -948,6 +1057,10 @@ def sync(
                     run.warn(_WARNING_PREFIX.sub("", message, count=1))  # warn() adds the prefix
             if fatal:
                 raise SyncAborted("generated source.json failed validation; nothing changed", fatal)
+            # records passed already, so what remains comes from curated files: nothing is committed
+            leaked = source_leaks(run, source)
+            if leaked:
+                raise SyncAborted("generated source.json failed the leak check; nothing changed", leaked)
             run.desired["source.json"] = dumps_json(source)
 
             tree = git.tree_blobs()

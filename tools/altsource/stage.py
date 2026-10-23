@@ -1,7 +1,14 @@
 """Pre-publication gate shared by every route: inspect, normalize, scan, then draft and publish.
 
-Nothing is sent to GitHub before the gate has passed. The inspection, normalization, scanning and
-tag helpers are resolved lazily through :class:`Toolkit`, so callers and tests can inject their own.
+Nothing is sent to GitHub before the gate has passed. Besides the IPA bytes, the gate checks every
+text that becomes public in decoded form: the release tag, title, target, notes and asset file name,
+the app.json keys and values, and the facts the catalog lists from the inspection (app name, bundle
+identifier, versions, privacy keys and descriptions, entitlement keys). Escapes in JSON or XML
+entities in a property list therefore cannot hide a denylist term. Labels of reused assets are
+cleared, because GitHub shows a label in place of the file name.
+
+The inspection, normalization, scanning and tag helpers are resolved lazily through
+:class:`Toolkit`, so callers and tests can inject their own.
 """
 
 from __future__ import annotations
@@ -29,7 +36,14 @@ BLOCKED_MARK = "[blocked] "
 ARCHIVE_ERRORS: Tuple[type, ...] = (zipfile.BadZipFile, zlib.error, EOFError, UnicodeDecodeError,
                                     NotImplementedError)
 NOTES_PATH = "<release-notes>"
+TAG_PATH = "<release-tag>"
+TITLE_PATH = "<release-title>"
+TARGET_PATH = "<release-target>"
+ASSET_NAME_PATH = "<asset-name>"
 ASSET_VERIFY_ATTEMPTS = 5
+# path rules that the home-path opt-in (app.json ``allowHomePaths``) turns into warnings for text
+# taken from the IPA; text written for a release (tag, title, notes, asset name) always blocks
+PATH_RULES = frozenset({"home-path", "ci-workspace-path"})
 
 # name -> (module inside the package, attribute)
 _BINDINGS: Dict[str, Tuple[str, str]] = {
@@ -221,6 +235,62 @@ def text_findings(deps: Any, text: str, denylist: Sequence[str], where: str) -> 
     return [{"rule": r, "severity": "block", "count": n, "paths": [where]} for r, n in sorted(counts.items())]
 
 
+def value_strings(value: Any) -> List[str]:
+    """Every string in a JSON-like value: dictionary keys and string leaves, in document order."""
+    out: List[str] = []
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            for key, child in reversed(list(item.items())):
+                stack.append(child)
+                stack.append(key)
+        elif isinstance(item, (list, tuple)):
+            stack.extend(reversed(item))
+    return out
+
+
+def value_findings(deps: Any, value: Any, denylist: Sequence[str], where: str, *,
+                   relaxed: bool = False) -> List[Dict[str, Any]]:
+    """Findings (one per rule, counts only) for every decoded string in ``value``.
+
+    ``relaxed`` (the home-path opt-in) makes the path rules warnings.
+    """
+    counts: Dict[str, int] = {}
+    for text in value_strings(value):
+        for f in text_findings(deps, text, denylist, where):
+            counts[f["rule"]] = counts.get(f["rule"], 0) + f["count"]
+    return [{"rule": r, "severity": "warn" if relaxed and r in PATH_RULES else "block", "count": n,
+             "paths": [where]} for r, n in sorted(counts.items())]
+
+
+def info_texts(info: Any, bid: str) -> List[Tuple[str, Any]]:
+    """(label, value) of every inspection fact that the catalog makes public."""
+    privacy = field(info, "privacy", None)
+    return [
+        ("<app-name>", app_name(info, bid)),
+        ("<bundle-id>", str(field(info, "bundle_id", "") or "")),
+        ("<version>", [str(field(info, key, "") or "") for key in ("short_version", "build_version", "min_os")]),
+        ("<privacy>", dict(privacy) if isinstance(privacy, dict) else {}),
+        ("<entitlements>", [str(e) for e in field(info, "entitlements", None) or []]),
+    ]
+
+
+def info_findings(deps: Any, info: Any, bid: str, denylist: Sequence[str], *,
+                  relaxed: bool = False) -> List[Dict[str, Any]]:
+    """Findings for the decoded inspection facts that become public (see :func:`info_texts`)."""
+    out: List[Dict[str, Any]] = []
+    for where, value in info_texts(info, bid):
+        out += value_findings(deps, value, denylist, where, relaxed=relaxed)
+    return out
+
+
+def tag_findings(deps: Any, tag: str, denylist: Sequence[str]) -> List[Dict[str, Any]]:
+    return text_findings(deps, tag, denylist, TAG_PATH)
+
+
 def is_ipa_asset(asset: Dict[str, Any]) -> bool:
     return str(asset.get("name", "")).lower().endswith(".ipa")
 
@@ -305,6 +375,9 @@ def check_app_json_text(deps: Any, raw: bytes, denylist: Sequence[str]) -> Tuple
     if validate_app_json(obj):
         return None, [single_finding("app-json-invalid", "app.json")]
     findings = text_findings(deps, text, denylist, "app.json")
+    # the decoded keys and values are what the catalog shows; JSON escapes do not hide a term
+    raw_rules = {f["rule"] for f in findings}
+    findings += [f for f in value_findings(deps, obj, denylist, "app.json") if f["rule"] not in raw_rules]
     return (None if findings else obj), findings
 
 
@@ -317,6 +390,7 @@ class _Gated:
     semver: str
     prerelease: bool
     name: str
+    title: str
     path: str
     sha256: str
     size: int
@@ -327,7 +401,7 @@ class _Gated:
 
 
 def _gate(ipa_path: str, tmp: str, *, expected_bid: Optional[str], semver: Optional[str], notes: str,
-          denylist: Sequence[str], policy: Any, deps: Any, app_json: Optional[str]) -> _Gated:
+          denylist: Sequence[str], policy: Any, deps: Any, app_json: Optional[str], target: str = "") -> _Gated:
     ipa_errors = errors_of(deps, "IpaError") + ARCHIVE_ERRORS
     tag_errors = errors_of(deps, "TagError") + (ValueError,)
     gate_errors = errors_of(deps, "GateError")
@@ -377,12 +451,20 @@ def _gate(ipa_path: str, tmp: str, *, expected_bid: Optional[str], semver: Optio
         raise GateRejected("normalization changed the app identity", [single_finding("normalize-mismatch")])
 
     name = app_name(info2, bid)
+    asset_name = ipa_asset_name(name, bid, semver)
+    title = "%s %s" % (name, semver)
+    relaxed = bool(getattr(policy, "allow_home_paths", False))
     try:
         result = deps.scan_ipa(normalized, denylist=list(denylist), policy=policy, info=info2)
         findings = finding_dicts(field(result, "findings", []))
         ok = bool(field(result, "ok", not blocking(findings)))
+        # every text that GitHub or the catalog shows, as it will be shown
+        findings += tag_findings(deps, tag, denylist)
+        findings += text_findings(deps, title, denylist, TITLE_PATH)
+        findings += text_findings(deps, asset_name, denylist, ASSET_NAME_PATH)
+        findings += text_findings(deps, target, denylist, TARGET_PATH)
         findings += text_findings(deps, notes, denylist, NOTES_PATH)
-        findings += text_findings(deps, name, denylist, "<app-name>")
+        findings += info_findings(deps, info2, bid, denylist, relaxed=relaxed)
     except gate_errors as exc:
         raise StageError("gate unavailable (%s)" % rule_of(exc, "gate-error")) from None
     except ipa_errors as exc:  # the scanner reads every entry; inspection does not
@@ -423,11 +505,12 @@ def _gate(ipa_path: str, tmp: str, *, expected_bid: Optional[str], semver: Optio
         semver=semver,
         prerelease=semver_prerelease(deps, semver),
         name=name,
+        title=title,
         path=normalized,
         sha256=digest,
         size=os.path.getsize(normalized),
         changed=sha256_file(ipa_path) != digest,
-        asset_name=ipa_asset_name(name, bid, semver),
+        asset_name=asset_name,
         warnings=[f for f in findings if f.get("severity") == "warn"],
         extra_assets=extra,
     )
@@ -510,7 +593,7 @@ def _release(gated: _Gated, *, gh: Any, existing: Optional[Dict[str, Any]], note
              target: str, sleep: Callable[[float], None]) -> StageResult:
     rel = existing if existing is not None else gh.get_release_by_tag(gated.tag)
     want = "sha256:" + gated.sha256
-    title = "%s %s" % (gated.name, gated.semver)
+    title = gated.title
 
     if rel is not None and not rel.get("draft"):
         for asset in rel.get("assets") or []:
@@ -558,8 +641,14 @@ def _release(gated: _Gated, *, gh: Any, existing: Optional[Dict[str, Any]], note
             if any(_same_name(asset.get("name"), n) for n in taken):
                 gh.update_asset(asset["id"], name=_set_aside_name(asset))
                 renamed.append((int(asset["id"]), str(asset.get("name"))))
-        if ipa is not None and not _same_name(ipa.get("name"), gated.asset_name):
-            gh.update_asset(ipa["id"], name=gated.asset_name)  # the permanent download URL uses it
+        for kept in keep.values():
+            changes: Dict[str, Any] = {}
+            if kept is ipa and not _same_name(kept.get("name"), gated.asset_name):
+                changes["name"] = gated.asset_name  # the permanent download URL uses it
+            if kept.get("label"):
+                changes["label"] = ""  # shown in place of the file name, and never checked
+            if changes:
+                gh.update_asset(kept["id"], **changes)
         ipa_id = ipa.get("id") if ipa is not None else None
         for path, name, content_type in uploads:
             response = gh.upload_asset(release_id, path, name, content_type)
@@ -578,6 +667,8 @@ def _release(gated: _Gated, *, gh: Any, existing: Optional[Dict[str, Any]], note
     if len([a for a in remaining if is_ipa_asset(a)]) != 1 or any(
             not is_ipa_asset(a) and str(a.get("name", "")).lower() not in allowed for a in remaining):
         raise StageError("%s carries unexpected assets; not published" % gated.tag)
+    if any(a.get("label") for a in remaining):
+        raise StageError("%s carries asset labels; not published" % gated.tag)
     if not created:
         gh.update_release(release_id, name=title, body=notes, prerelease=gated.prerelease,
                           target_commitish=target, tag_name=gated.tag)
@@ -616,7 +707,7 @@ def stage(
     notes = (notes or "").strip()
     with tempfile.TemporaryDirectory(prefix="alt-stage-") as tmp:
         gated = _gate(ipa_path, tmp, expected_bid=expected_bid, semver=semver, notes=notes,
-                      denylist=denylist, policy=policy, deps=deps, app_json=app_json)
+                      denylist=denylist, policy=policy, deps=deps, app_json=app_json, target=target)
         if dry_run:
             return _result(gated)
         gh = gh if gh is not None else _default_gh()
@@ -644,7 +735,12 @@ def stage_existing_draft(
         bid, semver = deps.parse_tag(tag)
     except errors_of(deps, "TagError") + (ValueError,):
         raise StageError("tag does not match the grammar") from None
+    leaky_tag = blocking(tag_findings(deps, tag, denylist))
     rel = gh.get_release_by_tag(tag)
+    if leaky_tag:  # neither a message nor a title may repeat the tag
+        if rel is not None and rel.get("draft") and not dry_run:
+            mark_blocked(gh, rel, "release %d" % int(rel["id"]))
+        raise GateRejected("release tag rejected", leaky_tag)
     if rel is None:
         raise StageError("no release uses tag %s" % tag)
     assets = gh.list_assets(int(rel["id"]))
@@ -674,7 +770,10 @@ def stage_existing_draft(
 
 
 def mark_blocked(gh: Any, rel: Dict[str, Any], tag: str) -> None:
-    """Retitle a blocked draft so scheduled runs skip it; staging it by tag clears the mark."""
+    """Retitle a blocked draft so scheduled runs skip it; staging it by tag clears the mark.
+
+    ``tag`` is the text after the mark: the tag, or a neutral label when the tag itself is rejected.
+    """
     if str(rel.get("name") or "").startswith(BLOCKED_MARK):
         return
     try:

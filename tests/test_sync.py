@@ -1120,6 +1120,145 @@ class SyncTests(SyncCase):
         self.assertEqual(self.gh.mutations(), [])
 
 
+class PublicTextTests(SyncCase):
+    """Tags, asset labels, listed IPA facts and committed text are public and checked as shown."""
+
+    TAG = "io.example.demo-v1.2.3"
+
+    def clean_scan(self):
+        # the byte scan misses encoded text (JSON escapes, property list entities); simulate that
+        self.deps.scan_ipa = lambda path, **kw: types.SimpleNamespace(ok=True, findings=[])
+
+    def everything_said(self, result):
+        return json.dumps(result.to_dict()) + "\n".join(self.log) + json.dumps(
+            [c for c in self.gh.calls if c[0] != "commit_files"], default=str)
+
+    def test_leaky_tag_is_taken_down_under_a_neutral_title(self):
+        tag = "io.example.demo-v1.2.3-leaky-host-0"
+        rel = self.gh.add_release(tag)
+        self.gh.add_asset(rel, "Demo-1.2.3.ipa", ipa_bytes())
+        result = self.run_sync()
+        label = "release %d" % rel["id"]
+        self.assertEqual(result.blocked, [label])
+        self.assertEqual(result.errors, [label + ": tag blocked (denylist); unpublished"])
+        self.assertEqual((self.gh.releases[rel["id"]]["draft"], self.gh.releases[rel["id"]]["name"]),
+                         (True, "[blocked] " + label))
+        self.assertEqual([c[0] for c in self.gh.mutations()], ["unpublish", "commit_files"])
+        self.assertEqual(result.versions, 0)
+        for _, additions, _ in self.gh.commits:
+            self.assertFalse(any("leaky-host-0" in path for path in additions))
+        self.assertNotIn("leaky-host-0", "\n".join(self.log + result.errors + result.warnings))
+
+    def test_leaky_asset_label_is_cleared_also_for_reused_records(self):
+        rel, asset = self.publish(self.TAG, ipa_bytes())
+        self.run_sync()
+        self.git.refresh("main")
+        self.gh.releases[rel["id"]]["assets"][0]["label"] = "Built on leaky-host-0"
+        self.gh.calls.clear()
+        result = self.run_sync()
+        self.assertNotIn("download_asset", [c[0] for c in self.gh.calls])  # the record was reused
+        self.assertEqual([c for c in self.gh.mutations()], [("update_asset", asset["id"], {"label": ""})])
+        self.assertEqual(self.gh.releases[rel["id"]]["assets"][0]["label"], "")
+        self.assertEqual(result.blocked, [self.TAG])
+        self.assertEqual(result.errors, [self.TAG + ": asset label blocked (denylist); cleared"])
+        self.assertEqual((result.versions, self.gh.releases[rel["id"]]["draft"]), (1, False))
+        self.assertNotIn("leaky-host-0", "\n".join(self.log + result.errors))
+
+    def test_clean_labels_are_left_alone(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes())
+        self.gh.releases[rel["id"]]["assets"][0]["label"] = "Demo for iPhone"
+        result = self.run_sync()
+        self.assertEqual((result.blocked, result.errors), ([], []))
+        self.assertNotIn("update_asset", [c[0] for c in self.gh.calls])
+
+    def test_label_that_cannot_be_cleared_takes_the_release_down(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes())
+        self.gh.releases[rel["id"]]["assets"][0]["label"] = "leakyuser0"
+
+        def refuse(asset_id, **fields):
+            raise ghmod.GhError("PATCH asset failed (HTTP 502)", status=502)
+
+        self.gh.update_asset = refuse
+        result = self.run_sync()
+        self.assertEqual(result.blocked, [self.TAG])
+        self.assertIn(self.TAG + ": asset label blocked (denylist); unpublished", result.errors)
+        self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+        self.assertEqual(result.versions, 0)
+
+    def test_dry_run_reports_leaky_labels(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes())
+        self.gh.releases[rel["id"]]["assets"][0]["label"] = "leakyuser0"
+        result = self.run_sync(dry_run=True)
+        self.assertEqual(self.gh.mutations(), [])
+        self.assertEqual(result.errors, [self.TAG + ": asset label blocked (denylist); would be cleared"])
+
+    def test_listed_ipa_facts_are_checked_decoded(self):
+        self.clean_scan()
+        cases = (("privacy", {"NSCameraUsageDescription": "Sent to leaky-host-0."}),
+                 ("entitlements", ["com.leaky-host-0.key"]), ("build_version", "leakyuser0"))
+        for key, value in cases:
+            with self.subTest(key=key):
+                self.gh.releases.clear()
+                rel, _ = self.publish(self.TAG, ipa_bytes(**{key: value}))
+                result = self.run_sync(commit=False)
+                self.assertEqual(result.blocked, [self.TAG])
+                self.assertEqual(result.errors, [self.TAG + ": listed metadata blocked (denylist); unpublished"])
+                self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+                self.assertEqual(result.versions, 0)
+
+    def test_listed_home_paths_follow_the_opt_in(self):
+        self.clean_scan()
+        privacy = {"NSCameraUsageDescription": "Reads /Users/leakyuser3/x"}
+        rel, _ = self.publish(self.TAG, ipa_bytes(privacy=privacy))
+        result = self.run_sync(denylist=["unrelated-word"], commit=False)
+        self.assertEqual(result.errors, [self.TAG + ": listed metadata blocked (home-path); unpublished"])
+        self.gh.releases[rel["id"]]["draft"] = False
+        self.git.seed({"apps/io.example.demo/app.json": b'{"allowHomePaths": true}\n'})
+        result = self.run_sync(denylist=["unrelated-word"])
+        self.assertEqual((result.blocked, result.errors, result.versions), ([], [], 1))
+
+    def test_reused_record_is_checked_again(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes())
+        self.run_sync()
+        self.git.refresh("main")
+        path = os.path.join(self.root, "apps", "io.example.demo", "versions", "1.2.3.json")
+        record = load_json(path)
+        record["privacy"] = {"NSCameraUsageDescription": "Sent to leaky-host-0."}  # written by an older run
+        with open(path, "wb") as fh:
+            fh.write(syncmod.dumps_json(record))
+        self.gh.calls.clear()
+        result = self.run_sync()
+        self.assertNotIn("download_asset", [c[0] for c in self.gh.calls])
+        self.assertEqual(result.errors, [self.TAG + ": catalog record blocked (denylist); unpublished"])
+        self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+        _, additions, deletions = self.gh.commits[-1]
+        self.assertEqual(deletions, ["apps/io.example.demo/versions/1.2.3.json"])
+        self.assertNotIn(b"leaky-host-0", b"".join(additions.values()))
+
+    def test_curated_text_that_fails_the_check_aborts_the_sync(self):
+        self.git.seed({"apps/io.example.demo/app.json": b'{"name": "leaky\\u002dhost-0 tools"}\n'})
+        self.publish(self.TAG, ipa_bytes())
+        with self.assertRaises(syncmod.SyncAborted) as ctx:
+            self.run_sync()
+        self.assertEqual(str(ctx.exception), "generated source.json failed the leak check; nothing changed")
+        self.assertEqual(ctx.exception.details, ["source.json apps[0].name: denylist (1)"])
+        self.assertEqual([c[0] for c in self.gh.mutations()], [])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "source.json")))
+        self.assertNotIn("leaky-host-0", "\n".join(self.log))
+
+    def test_source_leak_locations_never_repeat_a_leaky_key(self):
+        run = types.SimpleNamespace(deps=self.deps, denylist=DENY, relaxed=lambda p: False,
+                                    policy_for=lambda bid: None)
+        source = {"name": "alt", "news": [{"title": "leakyuser0"}],
+                  "apps": [{"bundleIdentifier": "io.example.demo",
+                            "appPermissions": {"privacy": {"NSleakyuser0UsageDescription": "x"}}},
+                           {"bundleIdentifier": "io.example.other", "leakyuser0": "x"}]}
+        self.assertEqual(syncmod.source_leaks(run, source), [
+            "source.json source.news: denylist (1)",
+            "source.json apps[0].appPermissions: denylist (1)",
+            "source.json apps[1]: denylist (1)"])
+
+
 class ScannerErrorTests(SyncCase):
     def scanner_raising(self, exc, bad_payload="unreadable"):
         real = self.deps.scan_ipa
@@ -1298,6 +1437,14 @@ class NormalizePublishedTests(SyncCase):
         result = self.run_sync(scan_published=False)
         self.assertEqual([c[0] for c in self.gh.mutations()], ["commit_files"])
         self.assertEqual(self.record()["assetId"], asset["id"])
+        self.assertEqual(result.normalized, [])
+
+    def test_new_asset_names_are_checked_before_the_release_is_touched(self):
+        rel, old = self.publish_raw()
+        result = self.run_sync(denylist=["app-1.2.3"])  # only the canonical name "Demo-App-1.2.3.ipa" hits
+        self.assertEqual(result.errors, [self.TAG + ": asset name blocked (denylist); unpublished"])
+        self.assertEqual([c[0] for c in self.gh.mutations()], ["unpublish", "commit_files"])
+        self.assertEqual([a["id"] for a in self.gh.releases[rel["id"]]["assets"]], [old["id"]])
         self.assertEqual(result.normalized, [])
 
     def test_ipa_that_cannot_be_normalized_is_taken_down(self):
@@ -1668,6 +1815,80 @@ class RealNormalizeTests(unittest.TestCase):
         self.assertTrue(any("blocked (home-path); unpublished" in e for e in result.errors))
         self.assertTrue(self.gh.releases[rel["id"]]["draft"])
         self.assertEqual([a["id"] for a in self.gh.releases[rel["id"]]["assets"]], [old["id"]])
+
+
+class RealDecodedMetadataTests(unittest.TestCase):
+    """Directly published releases whose public text is hidden from the byte scan by encoding."""
+
+    TAG = "io.example.demo-v1.2.3"
+
+    def setUp(self):
+        from altsource import stage as stagemod
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.git = FakeGit(self.root)
+        self.git.seed({"source.base.json": syncmod.dumps_json(BASE)})
+        self.gh = FakeGitHub(self.git)
+        self.deps = stagemod.Toolkit()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def publish(self, **entries_kw):
+        from altsource import normalize as normmod
+        from tests import helpers
+
+        raw = helpers.build_ipa(helpers.app_entries(**entries_kw), os.path.join(self.root, "raw.ipa"))
+        normalized = os.path.join(self.root, "normalized.ipa")
+        normmod.normalize_ipa(raw, normalized)
+        rel = self.gh.add_release(self.TAG)
+        self.gh.add_asset(rel, "Demo-1.2.3.ipa", read_bytes(normalized))
+        return rel
+
+    def run_sync(self):
+        return syncmod.sync(self.root, gh=self.gh, git=self.git, deps=self.deps, denylist=["leaky-host-0"],
+                            log=lambda m: None, environ={}, sleep=lambda s: None)
+
+    def assert_taken_down(self, rel, result):
+        self.assertEqual(result.blocked, [self.TAG])
+        self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+        self.assertEqual(result.versions, 0)
+        for _, additions, _ in self.gh.commits:
+            self.assertNotIn(b"leaky-host-0", b"".join(additions.values()))
+
+    def test_json_escaped_app_json_asset(self):
+        rel = self.publish()
+        self.gh.add_asset(rel, "app.json", b'{"developerName":"leaky\\u002dhost-0"}')
+        result = self.run_sync()
+        self.assert_taken_down(rel, result)
+        self.assertEqual(result.errors, [self.TAG + ": blocked (denylist); unpublished"])
+
+    def test_plist_entity_in_privacy_text(self):
+        from tests import helpers
+
+        plist = helpers.info_plist(extra={"NSCameraUsageDescription": "leaky-host-0"})
+        rel = self.publish(plist=plist.replace(b"leaky-host-0", b"leaky&#45;host-0"))
+        result = self.run_sync()
+        self.assert_taken_down(rel, result)
+        self.assertEqual(result.errors, [self.TAG + ": listed metadata blocked (denylist); unpublished"])
+
+    def test_der_only_team_id(self):
+        from tests import helpers
+
+        exe = helpers.macho(signature=helpers.code_signature(der={"com.apple.developer.team-identifier": "LEAKTEAM00"}))
+        rel = self.publish(exe=exe)
+        result = self.run_sync()
+        self.assert_taken_down(rel, result)
+        self.assertEqual(result.errors, [self.TAG + ": blocked (signed); unpublished"])
+
+    def test_curated_app_json_with_escapes_aborts(self):
+        self.git.seed({"apps/io.example.demo/app.json": b'{"developerName":"leaky\\u002dhost-0"}\n'})
+        self.publish()
+        with self.assertRaises(syncmod.SyncAborted) as ctx:
+            self.run_sync()
+        self.assertEqual(ctx.exception.details, ["source.json apps[0].developerName: denylist (1)"])
+        self.assertEqual(self.gh.commits, [])
 
 
 class SyncHelperTests(unittest.TestCase):
