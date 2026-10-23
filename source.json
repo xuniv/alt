@@ -65,6 +65,17 @@
       "category": "developer",
       "versions": [
         {
+          "version": "0.0.5",
+          "buildVersion": "4",
+          "marketingVersion": "0.0.5",
+          "date": "2026-10-23T13:24:48Z",
+          "localizedDescription": "Version 0.0.5",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.5/Selftest-0.0.5.ipa",
+          "size": 20949,
+          "sha256": "1302ac521037dc12ed45b1f46a1423c48ecb5353394d63edaaf84f4a09676d30",
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "0.0.3",
           "buildVersion": "003",
           "marketingVersion": "0.0.3",
@@ -104,11 +115,11 @@
           "NSCameraUsageDescription": "Declared to exercise source permission generation."
         }
       },
-      "version": "0.0.3",
-      "versionDate": "2026-10-23T12:28:06Z",
-      "versionDescription": "Self-test of the staged release route.",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.3/Selftest-0.0.3.ipa",
-      "size": 20950
+      "version": "0.0.5",
+      "versionDate": "2026-10-23T13:24:48Z",
+      "versionDescription": "Version 0.0.5",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.5/Selftest-0.0.5.ipa",
+      "size": 20949
     }
   ]
 }
