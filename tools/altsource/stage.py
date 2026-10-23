@@ -580,9 +580,15 @@ def _release(gated: _Gated, *, gh: Any, existing: Optional[Dict[str, Any]], note
         raise StageError("%s carries unexpected assets; not published" % gated.tag)
     if not created:
         gh.update_release(release_id, name=title, body=notes, prerelease=gated.prerelease,
-                          target_commitish=target)
+                          target_commitish=target, tag_name=gated.tag)
     if publish:
-        gh.publish(release_id, prerelease=gated.prerelease, make_latest="false")
+        published = gh.publish(release_id, prerelease=gated.prerelease, make_latest="false")
+        got = published.get("tag_name") if isinstance(published, dict) else None
+        if got is not None and got != gated.tag:
+            fixed = gh.update_release(release_id, tag_name=gated.tag)
+            got = fixed.get("tag_name") if isinstance(fixed, dict) else None
+            if got is not None and got != gated.tag:
+                raise StageError("%s was published under a different tag" % gated.tag)
     return _result(gated, release_id=release_id, asset=asset, published=publish)
 
 

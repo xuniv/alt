@@ -313,6 +313,12 @@ class GitHub:
         })
 
     def update_release(self, release_id: int, **fields: Any) -> Dict[str, Any]:
+        # A PATCH without tag_name, sent with a workflow token, can detach a draft from its tag:
+        # GitHub then publishes it under an "untagged-..." tag. Always restate the tag.
+        if "tag_name" not in fields:
+            tag = str(self.get_release(release_id).get("tag_name") or "")
+            if tag and not tag.startswith("untagged-"):
+                fields["tag_name"] = tag
         return self.api("PATCH", self._repo_path("releases/%d" % int(release_id)), json_body=fields)
 
     def upload_asset(self, release_id: int, path: str, name: str,

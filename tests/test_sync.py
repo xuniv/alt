@@ -1831,6 +1831,23 @@ class GhClientTests(unittest.TestCase):
         self.assertEqual(body, {"tag_name": "io.example.demo-v1.0.0", "target_commitish": "main",
                                 "name": "Demo 1.0.0", "body": "notes", "draft": True, "prerelease": False})
 
+    def test_release_patch_restates_the_tag(self):
+        client, runner = self.client(ok({"id": 7, "tag_name": "io.example.demo-v1.0.0", "draft": True}),
+                                     ok({"id": 7, "tag_name": "io.example.demo-v1.0.0", "draft": False}))
+        client.publish(7, prerelease=False)
+        self.assertEqual(runner.calls[0]["args"][2], "GET")
+        body = json.loads(runner.calls[1]["input"])
+        self.assertEqual(body, {"draft": False, "prerelease": False, "make_latest": "false",
+                                "tag_name": "io.example.demo-v1.0.0"})
+
+    def test_release_patch_keeps_an_explicit_tag_and_skips_placeholder_tags(self):
+        client, runner = self.client(ok({"id": 7}))
+        client.update_release(7, name="x", tag_name="io.example.demo-v1.0.0")
+        self.assertEqual(len(runner.calls), 1)
+        client, runner = self.client(ok({"id": 7, "tag_name": "untagged-0123abcd"}), ok({"id": 7}))
+        client.update_release(7, draft=True)
+        self.assertEqual(json.loads(runner.calls[1]["input"]), {"draft": True})
+
     def test_list_releases_paginates_and_dedupes(self):
         page1 = [{"id": i, "tag_name": "t%d" % i, "draft": False} for i in range(100)]
         page2 = [{"id": 99, "tag_name": "t99", "draft": False}, {"id": 100, "tag_name": "t100", "draft": True}]
@@ -1896,14 +1913,18 @@ class GhClientTests(unittest.TestCase):
         self.assertEqual(json.loads(call["input"]), {"name": "Demo-1.0.0.ipa"})
 
     def test_publish_and_unpublish_payloads(self):
-        client, runner = self.client(ok({}), ok({}), ok({}))
+        tagged = {"id": 5, "tag_name": "x-v1.0.0"}
+        client, runner = self.client(ok(tagged), ok({}), ok(tagged), ok({}), ok(tagged), ok({}))
         client.publish(5, prerelease=True)
         client.unpublish(5)
         client.unpublish(5, name="[blocked] x-v1.0.0")
-        self.assertEqual(json.loads(runner.calls[0]["input"]), {"draft": False, "prerelease": True, "make_latest": "false"})
-        self.assertEqual(json.loads(runner.calls[1]["input"]), {"draft": True})
-        self.assertEqual(json.loads(runner.calls[2]["input"]), {"draft": True, "name": "[blocked] x-v1.0.0"})
-        self.assertEqual(runner.calls[0]["args"][2], "PATCH")
+        patches = [c for c in runner.calls if c["args"][2] == "PATCH"]
+        self.assertEqual(len(patches), 3)
+        self.assertEqual(json.loads(patches[0]["input"]),
+                         {"draft": False, "prerelease": True, "make_latest": "false", "tag_name": "x-v1.0.0"})
+        self.assertEqual(json.loads(patches[1]["input"]), {"draft": True, "tag_name": "x-v1.0.0"})
+        self.assertEqual(json.loads(patches[2]["input"]),
+                         {"draft": True, "name": "[blocked] x-v1.0.0", "tag_name": "x-v1.0.0"})
 
     def test_commit_files_builds_create_commit_on_branch(self):
         client, runner = self.client(ok({"data": {"createCommitOnBranch": {"commit": {"oid": "abc"}}}}))
