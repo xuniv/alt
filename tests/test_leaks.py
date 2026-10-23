@@ -168,7 +168,9 @@ class HomePathTests(GateCase):
     BLOCKED = ["/Users/%s/Projects/app/main.swift" % USER, "/Users/%s\\x" % USER, "/Users/user0/x",
                "/Users/username-x/x"]
     WARNED = ["/home/%s/go/pkg/mod/x" % USER, "C:\\Users\\%s\\src\\x" % USER, "c:\\Users\\%s\\" % USER]
-    BENIGN = ["/Users/runner/work/x", "/Users/Shared/x", "/home/builder/x", "/home/runner/x",
+    BENIGN = ["/Users/runner/x", "/home/runner/workspace/x", "/Users/runner/work/_temp/src/x",
+              "/home/runner/work/_actions/x", "/Users/runner/work/_tool/x", "/Users/Shared/x",
+              "/home/builder/x", "/home/runner/x",
               "C:\\Users\\runneradmin\\x", "/Users/", "/Users//x", ":\\Users\\%s\\" % USER,
               "1:\\Users\\%s\\" % USER, "/users/%s/" % USER, "/Users/%s" % ("x" * 65 + "/"),
               "/Users/RUNNER/x", "/Users/user/x", "/Users/YourName/Documents", "/Users/your_name/x",
@@ -228,13 +230,43 @@ class HomePathTests(GateCase):
         self.assertTrue(policy.allow_home_paths)
         self.assertFalse(policy.allow_empty_denylist)
 
+    def test_runner_workspace_paths_warn_in_every_encoding(self):
+        # a runner home is allowed, but the build path below its workspace names the repository
+        for codec in ENCODINGS:
+            for prefix in ("/Users/runner/work/", "/home/runner/work/"):
+                with self.subTest(codec=codec, prefix=prefix):
+                    text = prefix + "private-project-0/private-project-0/Source.swift"
+                    data = b"\x07" + text.encode(codec) + b"\x00" + (prefix + "x").encode(codec)
+                    result = self.scan([entry(APP + "Demo.bin", data)])
+                    self.assertTrue(result.ok)
+                    self.assertEqual([(f["rule"], f["severity"], f["count"], f["paths"]) for f in result.findings],
+                                     [("ci-workspace-path", "warn", 2, [APP + "Demo.bin"])])
+                    self.assertNoMatchedBytes(result, "private-project-0")
+        policy = leaks.GatePolicy(allow_home_paths=True)
+        result = self.scan([entry(APP + "a.txt", "/Users/runner/work/x/x/a.swift " + self.BLOCKED[0])], policy=policy)
+        self.assertEqual([(f["rule"], f["severity"]) for f in result.findings],
+                         [("ci-workspace-path", "warn"), ("home-path", "warn")])
+        result = self.scan([entry(APP + "a.txt", "/Users/runner/work/x/x/a.swift " + WORD)])
+        self.assertEqual([(f["rule"], f["severity"]) for f in result.findings],
+                         [("ci-workspace-path", "warn"), ("denylist", "block")])
+
+    def test_runner_workspace_path_in_text(self):
+        self.assertEqual(leaks.scan_text("built in /home/runner/work/x/x", []), ["ci-workspace-path"])
+        self.assertEqual(leaks.scan_text("/Users/runner/work/x/ and " + WORD, DENY), ["ci-workspace-path", "denylist"])
+        self.assertEqual(leaks.scan_text("/Users/runner/x and /home/runner/workspace", DENY), [])
+        self.assertEqual(leaks.scan_text("/Users/runner/work/_temp/src/a.swift", DENY), [])
+        self.assertEqual(leaks.scan_text("/Users/runner/work/_temporary/a.swift", DENY), ["ci-workspace-path"])
+        self.assertEqual(leaks.scan_bytes("/Users/runner/work/x".encode("utf-16-be"), DENY), ["ci-workspace-path"])
+
 
 class StreamingTests(GateCase):
     PLANTS = [("/Users/%s/" % USER).encode(), ("C:\\Users\\%s\\" % USER).encode(),
               ("/home/%s/x" % USER).encode("utf-16-le"), ("/Users/%s/" % USER).encode("utf-16-be"),
               ("X:\\Users\\%s\\" % USER).encode("utf-16-le"), ("X:\\Users\\%s\\" % USER).encode("utf-16-be"),
               WORD.upper().encode(), WORD.encode("utf-16-be"), WORD.encode("utf-16-le"),
-              b"/Users/runner/", b"/Users/Shared/"]
+              b"/Users/runner/", b"/Users/Shared/", b"/Users/runner/work/", "/home/runner/work/".encode("utf-16-le"),
+              "/Users/runner/work/".encode("utf-16-be"), "/Users/runner/work/_temp/".encode("utf-16-le"),
+              b"/home/runner/work/_tool/"]
 
     def test_chunked_scan_equals_whole_scan(self):
         matcher = leaks.Matcher([WORD])
@@ -264,14 +296,14 @@ class StreamingTests(GateCase):
 
     def test_match_straddling_the_read_boundary(self):
         for codec in ENCODINGS:
-            for plant in (WORD, "/Users/%s/" % USER):
+            for plant in (WORD, "/Users/%s/" % USER, "/home/runner/work/"):
                 for shift in (1, 3, 9):
                     with self.subTest(codec=codec, plant=plant, shift=shift):
                         raw = plant.encode(codec)
                         cut = leaks.CHUNK - shift
                         data = noise(cut, 5) + raw + noise(4096, 6)
                         result = self.scan([entry(APP + "big.bin", data, compress=zipfile.ZIP_STORED)])
-                        rule = "denylist" if plant == WORD else "home-path"
+                        rule = {WORD: "denylist", "/home/runner/work/": "ci-workspace-path"}.get(plant, "home-path")
                         self.assertEqual(self.rules(result)[rule]["count"], 1)
 
     def test_drive_letter_in_previous_read(self):

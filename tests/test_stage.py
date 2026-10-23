@@ -13,6 +13,7 @@ import zipfile
 
 from altsource import stage as stagemod
 from altsource.gh import GhError
+from tests import helpers as h
 from tests.test_sync import FakeGitHub, FakeToolkit, ipa_bytes, write_ipa
 
 DENY = ["leaky-host-0", "leakyuser0"]
@@ -77,7 +78,35 @@ class GateTests(StageCase):
     def test_notes_and_app_name_are_scanned(self):
         self.assert_rejected("denylist", self.ipa(), notes="built on leaky-host-0")
         exc = self.assert_rejected("denylist", self.ipa(name="leakyuser0 tools"))
-        self.assertIn("<app-name>", exc.findings[-1]["paths"])
+        self.assertIn("<app-name>", [p for f in exc.findings for p in f["paths"]])
+
+    def test_tag_title_and_asset_name_are_scanned_before_any_github_call(self):
+        exc = self.assert_rejected("denylist", self.ipa(), semver="1.2.3-leaky-host-0")
+        self.assertEqual([(f["rule"], f["paths"]) for f in exc.findings],
+                         [("denylist", ["<release-tag>"]), ("denylist", ["<release-title>"]),
+                          ("denylist", ["<asset-name>"])])
+        self.assertNotIn("leaky-host-0", str(exc) + json.dumps(exc.findings))
+        exc = self.assert_rejected("denylist", self.ipa(), target="leaky-host-0-branch")
+        self.assertEqual([f["paths"] for f in exc.findings], [["<release-target>"]])
+
+    def test_listed_ipa_facts_are_scanned_decoded(self):
+        cases = {"<privacy>": {"privacy": {"NSCameraUsageDescription": "Sent to leaky-host-0."}},
+                 "<entitlements>": {"entitlements": ["com.leaky-host-0.key"]},
+                 "<version>": {"build_version": "7-leaky-host-0"},
+                 "<bundle-id>": {"bundle_id": "io.leaky-host-0.demo"}}
+        for where, fields in cases.items():
+            with self.subTest(where=where):
+                exc = self.assert_rejected("denylist", self.ipa(**fields))
+                self.assertIn([where], [f["paths"] for f in exc.findings])
+        privacy = {"NSCameraUsageDescription": "Reads /Users/leakyuser3/x"}
+        self.assert_rejected("home-path", self.ipa(privacy=privacy), denylist=["unrelated-word"])
+        # the home-path opt-in applies to text taken from the IPA as it does to the IPA itself
+        result = self.stage(self.ipa(privacy=privacy), denylist=["unrelated-word"],
+                            policy=self.deps.GatePolicy(allow_home_paths=True))
+        self.assertIn(("home-path", "warn", ["<privacy>"]), [(w["rule"], w["severity"], w["paths"])
+                                                            for w in result.warnings])
+        uploads = [c[2] for c in self.gh.calls if c[0] == "upload_asset"]
+        self.assertEqual(uploads, ["Demo-App-1.2.3.ipa", "app.json"])  # the opt-in travels with the release
 
     def test_bundle_id_mismatch(self):
         self.assert_rejected("bundle-id-mismatch", self.ipa(), expected_bid="io.example.other")
@@ -243,6 +272,36 @@ class ReleaseTests(StageCase):
         self.assertEqual(self.gh.calls, [])
 
 
+class AppJsonDecodingTests(StageCase):
+    def seed(self, raw):
+        path = os.path.join(self.dir, "app.json")
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        return path
+
+    def test_json_escapes_do_not_hide_terms(self):
+        for raw in (b'{"developerName":"leaky\\u002dhost-0"}', b'{"subtitle":"\\u006ceaky-host-0"}',
+                    b'{"screenshots":["https://example.invalid/leaky\\u002dhost-0.png"]}'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(stagemod.GateRejected) as ctx:
+                    self.stage(self.ipa(), app_json=self.seed(raw))
+                self.assertEqual([(f["rule"], f["paths"]) for f in ctx.exception.findings],
+                                 [("denylist", ["app.json"])])
+        self.assertEqual(self.gh.calls, [])
+
+    def test_check_app_json_text_reports_each_rule_once(self):
+        obj, findings = stagemod.check_app_json_text(self.deps, b'{"subtitle":"leaky-host-0 leaky\\u002dhost-0"}',
+                                                     DENY)
+        self.assertIsNone(obj)
+        self.assertEqual([f["rule"] for f in findings], ["denylist"])
+        obj, findings = stagemod.check_app_json_text(self.deps, b'{"subtitle":"Plain \\u0041pp"}', DENY)
+        self.assertEqual((obj, findings), ({"subtitle": "Plain App"}, []))
+
+    def test_value_strings(self):
+        self.assertEqual(stagemod.value_strings({"a": ["b", {"c": "d", 1: "e"}], "f": 2, "g": None}),
+                         ["a", "b", "c", "d", "e", "f", "g"])
+
+
 class RouteThreeTests(unittest.TestCase):
     """A new third-party app staged with the home-path opt-in survives the sync that follows."""
 
@@ -304,6 +363,50 @@ class StageDraftTests(StageCase):
         self.assertIn(("update_asset", original["id"], {"name": "Demo-App-1.2.3.ipa"}), self.gh.calls)
         self.assertNotIn("upload_asset", [c[0] for c in self.gh.calls])
         self.assertTrue(self.gh.releases[rel["id"]]["assets"][0]["browser_download_url"])
+
+    def test_labels_of_reused_assets_are_cleared(self):
+        # GitHub shows a label in place of the file name; the gate never sees it
+        rel, original = self.draft(self.normalized())
+        original_state = self.gh.releases[rel["id"]]["assets"][0]
+        original_state["label"] = "Built on leaky-host-0"
+        seed = self.gh.add_asset(rel, "app.json", json.dumps({"subtitle": "Seed"}).encode())
+        self.gh.releases[rel["id"]]["assets"][1]["label"] = "Settings"
+        result = stagemod.stage_existing_draft(TAG, denylist=DENY, gh=self.gh, deps=self.deps,
+                                               sleep=lambda s: None)
+        self.assertTrue(result.published)
+        self.assertIn(("update_asset", original["id"], {"name": "Demo-App-1.2.3.ipa", "label": ""}), self.gh.calls)
+        self.assertIn(("update_asset", seed["id"], {"label": ""}), self.gh.calls)
+        self.assertEqual([a.get("label") for a in self.gh.releases[rel["id"]]["assets"]], ["", ""])
+        updates = [i for i, c in enumerate(self.gh.calls) if c[0] == "update_asset"]
+        publish = [i for i, c in enumerate(self.gh.calls) if c[0] == "publish"]
+        self.assertLess(max(updates), publish[0])
+
+    def test_assets_that_keep_a_label_are_not_published(self):
+        rel, original = self.draft(self.normalized())
+        self.gh.releases[rel["id"]]["assets"][0]["label"] = "Kept"
+        update = self.gh.update_asset
+
+        def ignore_label(asset_id, **fields):
+            fields.pop("label", None)
+            return update(asset_id, **fields)
+
+        self.gh.update_asset = ignore_label
+        with self.assertRaises(stagemod.StageError):
+            stagemod.stage_existing_draft(TAG, denylist=DENY, gh=self.gh, deps=self.deps, sleep=lambda s: None)
+        self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+
+    def test_leaky_draft_tag_is_rejected_under_a_neutral_mark(self):
+        tag = "io.example.demo-v1.2.3-leaky-host-0"
+        rel = self.gh.add_release(tag, draft=True)
+        self.gh.add_asset(rel, "upload.ipa", ipa_bytes())
+        with self.assertRaises(stagemod.GateRejected) as ctx:
+            stagemod.stage_existing_draft(tag, denylist=DENY, gh=self.gh, deps=self.deps)
+        self.assertEqual([(f["rule"], f["paths"]) for f in ctx.exception.findings],
+                         [("denylist", ["<release-tag>"])])
+        self.assertNotIn("leaky-host-0", str(ctx.exception))
+        self.assertEqual(self.gh.mutations(),
+                         [("update_release", rel["id"], {"name": "[blocked] release %d" % rel["id"]})])
+        self.assertEqual(stagemod.draft_tags(self.gh, self.deps), ([], [tag]))
 
     def test_failed_upload_keeps_the_original_draft_asset(self):
         rel = self.gh.add_release(TAG, draft=True, body="Notes.")
@@ -575,6 +678,74 @@ class RealModulesTests(unittest.TestCase):
             with self.assertRaises(stagemod.GateRejected) as ctx:
                 stagemod.stage(path, denylist=DENY, dry_run=True)
             self.assertEqual([f["rule"] for f in ctx.exception.findings], ["xcent"])
+
+    def test_real_gate_rejects_json_escaped_app_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = h.minimal_ipa(os.path.join(tmp, "in.ipa"))
+            seed = os.path.join(tmp, "app.json")
+            with open(seed, "wb") as fh:
+                fh.write(b'{"developerName":"leaky\\u002dhost-0"}')
+            gh = FakeGitHub()
+            with self.assertRaises(stagemod.GateRejected) as ctx:
+                stagemod.stage(path, app_json=seed, denylist=DENY, gh=gh, sleep=lambda s: None)
+            self.assertEqual([(f["rule"], f["paths"]) for f in ctx.exception.findings], [("denylist", ["app.json"])])
+            self.assertEqual(gh.calls, [])
+
+    def test_real_gate_rejects_plist_entities_in_privacy_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = h.info_plist(extra={"NSCameraUsageDescription": "leaky-host-0"})
+            plist = plist.replace(b"leaky-host-0", b"leaky&#45;host-0")
+            path = h.build_ipa(h.app_entries(plist=plist), os.path.join(tmp, "in.ipa"))
+            gh = FakeGitHub()
+            with self.assertRaises(stagemod.GateRejected) as ctx:
+                stagemod.stage(path, denylist=DENY, gh=gh, sleep=lambda s: None)
+            self.assertEqual([(f["rule"], f["paths"]) for f in ctx.exception.findings], [("denylist", ["<privacy>"])])
+            self.assertEqual(gh.calls, [])
+
+    def test_real_draft_asset_label_is_cleared(self):
+        from altsource import normalize as normmod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = h.minimal_ipa(os.path.join(tmp, "in.ipa"))
+            normalized = os.path.join(tmp, "normalized.ipa")
+            normmod.normalize_ipa(path, normalized)
+            gh = FakeGitHub()
+            rel = gh.add_release(TAG, draft=True)
+            with open(normalized, "rb") as fh:
+                asset = gh.add_asset(rel, "Demo-1.2.3.ipa", fh.read())
+            asset["label"] = "Built on leaky-host-0"
+            result = stagemod.stage_existing_draft(TAG, denylist=DENY, gh=gh, sleep=lambda s: None)
+            [published] = gh.releases[rel["id"]]["assets"]
+            self.assertTrue(result.published)
+            self.assertEqual((published["id"], published["label"]), (asset["id"], ""))
+
+    def test_real_gate_rejects_a_semver_with_a_denylist_term(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = h.minimal_ipa(os.path.join(tmp, "in.ipa"))
+            gh = FakeGitHub()
+            with self.assertRaises(stagemod.GateRejected) as ctx:
+                stagemod.stage(path, semver="1.2.3-leaky-host-0", denylist=DENY, gh=gh, sleep=lambda s: None)
+            self.assertEqual({p for f in ctx.exception.findings for p in f["paths"]},
+                             {"<release-tag>", "<release-title>", "<asset-name>"})
+            self.assertEqual(gh.calls, [])
+
+    def test_real_gate_blocks_a_team_id_in_der_only_entitlements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = h.macho(signature=h.code_signature(der={"com.apple.developer.team-identifier": "LEAKTEAM00"}))
+            path = h.build_ipa(h.app_entries(exe=exe), os.path.join(tmp, "in.ipa"))
+            with self.assertRaises(stagemod.GateRejected) as ctx:
+                stagemod.stage(path, denylist=DENY, dry_run=True)
+            self.assertEqual([f["rule"] for f in ctx.exception.findings], ["signed"])
+
+    def test_real_gate_warns_about_runner_workspace_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            private_path = b"/Users/runner/work/private-project-0/private-project-0/Source.swift\0"
+            path = h.build_ipa(h.app_entries(exe=h.macho(body=private_path)), os.path.join(tmp, "in.ipa"))
+            result = stagemod.stage(path, denylist=DENY, gh=FakeGitHub(), sleep=lambda s: None)
+            self.assertTrue(result.published)
+            self.assertEqual([(w["rule"], w["severity"], w["count"]) for w in result.warnings],
+                             [("ci-workspace-path", "warn", 1)])
+            self.assertNotIn("private-project-0", json.dumps(result.to_dict()))
 
     def test_real_gate_home_path_severities(self):
         with tempfile.TemporaryDirectory() as tmp:

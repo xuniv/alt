@@ -42,7 +42,8 @@ ipa-executable-missing      ``CFBundleExecutable`` absent, unsafe, or naming a m
 ipa-executable-invalid      the bundle executable is not a Mach-O image
 macho-invalid               a member with Mach-O magic cannot be parsed
 macho-signature-invalid     malformed ``LC_CODE_SIGNATURE`` data
-macho-entitlements-invalid  entitlement blob that is not a plist dictionary
+macho-entitlements-invalid  entitlement blob (XML plist or DER) that cannot be decoded as a
+                            dictionary
 ==========================  ========================================================================
 
 Paths in :class:`IpaInfo` are archive-relative; directories carry no trailing slash.
@@ -480,6 +481,7 @@ def _privacy(infos: List[Dict[str, Any]], fallback: str) -> Dict[str, str]:
 
 
 def _team_ids(machos: Dict[str, Any]) -> List[str]:
+    """Team ids from the CodeDirectories and from the XML and DER entitlements of every slice."""
     teams: Set[str] = set()
     for m in machos.values():
         teams.update(m.team_ids)
@@ -605,18 +607,22 @@ def _inspect(ar: _Archive) -> IpaInfo:
                 machos[path] = machomod.parse_macho(buf)
             except machomod.MachOError as exc:
                 raise IpaError(exc.rule, exc.detail, path=path) from None
+        if machos[path].entitlement_errors:  # facts that cannot be read cannot be shown to be clean
+            raise IpaError("macho-entitlements-invalid", "undecodable DER entitlements", path=path)
 
     main_exe = _executable(ar, app, main, machos)
     plugin_exes = [_executable(ar, bundle, info, machos) for bundle, info in plugins]
     for bundle, info in others:
         _executable(ar, bundle, info, machos)
 
-    main_ents = machos[main_exe].entitlements or {}
-    entitlements = {k for k in main_ents if isinstance(k, str)}
+    # the union of the XML and DER keys of every slice: a key in either form is a key of the app
+    main_ents = machos[main_exe].all_entitlements
+    entitlements = {k for ents in main_ents for k in ents if isinstance(k, str)}
     for path in plugin_exes:
-        entitlements.update(k for k in (machos[path].entitlements or {}) if isinstance(k, str))
+        entitlements.update(k for ents in machos[path].all_entitlements for k in ents if isinstance(k, str))
     entitlements -= IGNORED_ENTITLEMENTS
-    if main_ents.get("get-task-allow") is False:
+    task_allow = [ents["get-task-allow"] for ents in main_ents if "get-task-allow" in ents]
+    if task_allow and all(value is False for value in task_allow):
         entitlements.discard("get-task-allow")
 
     name = _display_name(main)
