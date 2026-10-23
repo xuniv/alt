@@ -1,9 +1,0 @@
-{
-  "name": "Selftest",
-  "subtitle": "Pipeline self-test",
-  "localizedDescription": "A minimal app used to verify the build, gate and catalog pipeline.",
-  "category": "developer",
-  "privateBuild": {
-    "enabled": true
-  }
-}
