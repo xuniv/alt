@@ -4,6 +4,9 @@
 #   workflow_dispatch  input tag (string, optional): one draft release tag, <bundle id>-v<semver>.
 #                      Empty stages every pending draft whose tag follows the grammar.
 #   schedule           17 1,7,13,19 * * * (UTC): stages every pending draft.
+#   Without a tag, drafts of a withdrawn version (listed in apps/<bid>/retracted.json on main) are
+#   skipped and counted, so a version unpublished by hand or with bin/alt retract --unpublish does
+#   not come back by itself. Staging such a draft by tag publishes it, with a warning.
 #
 # For each draft, the single .ipa asset is downloaded, normalized and run through the gate; on success
 # the normalized IPA replaces the upload and the release is published. A draft the gate rejects is

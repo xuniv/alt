@@ -60,7 +60,7 @@ Local files used only by `bin/alt` (never by CI):
 | Workflow | Triggers | Job summary |
 |---|---|---|
 | `catalog.yml` | release published, edited, unpublished, deleted, released, prereleased (relayed to `main` as `repository_dispatch` type `catalog`); push to `main` touching `apps/**/app.json`, `apps/**/icon.png`, `source.base.json` or `site/**`; daily at 04:43 UTC; manual (optional `rescan`); called by the other workflows | `sync --exit-zero`; deploy Pages when sync committed a change, and on every push or manual run; then a `report` job fails the run when sync blocked releases or hit errors |
-| `stage.yml` | manual (optional `tag`); scheduled windows | gate and publish pending drafts; `catalog.yml` when something was published; then a `report` job fails the run when a draft was rejected or failed |
+| `stage.yml` | manual (optional `tag`); scheduled windows | gate and publish pending drafts (without `tag`: not those of a [withdrawn version](#withdraw-a-version)); `catalog.yml` when something was published; then a `report` job fails the run when a draft was rejected or failed |
 | `build.yml` | manual (`app`, `ref`, `publish`, `notes`, `force`); started by `bin/alt build`, the pre-push hook and `poll.yml` | route 2 build, gate, publish, then `catalog.yml`; refuses a [withdrawn version](#withdraw-a-version) in its first job unless `force` is true |
 | `ingest.yml` | `repository_dispatch` type `ingest`; manual (`url`, `sha256`, `semver`, `notes`, `bundle_id`, `allow_home_paths`) | route 3 fetch, gate, publish, then `catalog.yml` |
 | `poll.yml` | manual only (optional `app`, `dry_run`); no schedule | start `build.yml` for new private tags; withdrawn versions are skipped |
@@ -106,11 +106,11 @@ Run with `PYTHONPATH=tools` from the repository root.
 | `inspect IPA [--json]` | print IPA facts |
 | `normalize IN OUT` | re-pack an IPA deterministically |
 | `scan IPA [--allow-home-paths]` | run the leak scan only |
-| `stage IPA [--bid B] [--semver V] [--notes-file F] [--app-json F] [--no-publish] [--dry-run] [--allow-home-paths]` | gate, draft and publish |
-| `stage-draft TAG` or `stage-draft --all`, with `[--notes-file F] [--no-publish] [--dry-run] [--allow-home-paths] [--exit-zero]` | gate and publish existing drafts |
-| `sync [--no-commit] [--dry-run] [--rescan] [--exit-zero]` | regenerate and commit the catalog |
+| `stage IPA [--bid B] [--semver V] [--notes-file F] [--app-json F] [--no-publish] [--dry-run] [--allow-home-paths]` | gate, draft and publish; warns when the version is withdrawn |
+| `stage-draft TAG` or `stage-draft --all`, with `[--notes-file F] [--no-publish] [--dry-run] [--allow-home-paths] [--exit-zero]` | gate and publish existing drafts. `--all` skips drafts titled `[blocked] ...` and drafts of a withdrawn version, and names a draft as `release <id>:` in its messages until the gate passed its tag; `TAG` stages a withdrawn version with a warning |
+| `sync [--no-commit] [--dry-run] [--rescan] [--exit-zero]` | regenerate and commit the catalog and `retracted.json`; prints `retracted=N restored=N` (tombstones added and removed) |
 | `generate [--check]` | write `source.json`, or check that it is up to date |
-| `validate` | validate `source.json` and every `app.json` |
+| `validate` | validate `source.json`, every `app.json` and every `retracted.json` |
 | `fetch URL OUT [--sha256 H]` | guarded https download |
 | `parse-tag TAG` | split a tag into bundle id and semver |
 | `alias BID` | print the alias that names the app's environment |
@@ -118,7 +118,8 @@ Run with `PYTHONPATH=tools` from the repository root.
 | `retracted --bid B [--version V]` | exit `0` when `apps/<B>/retracted.json` lists the version (without `--version`: any version), `4` when not |
 
 - Commands that scan take `--denylist-file F` (default: `ALT_DENYLIST`).
-- `sync`, `generate`, `validate`, `resolve-build` and `retracted` take `--root DIR`.
+- `sync`, `generate`, `validate`, `resolve-build` and `retracted` take `--root DIR`, and so do `stage` and
+  `stage-draft`, which read `apps/<bid>/retracted.json` below it (default: the current directory).
 - Exit codes: `0` success, `2` gate rejected or release blocked, `3` conflict, `4` not withdrawn
   (`retracted` only), `1` anything else (for `retracted`, a `retracted.json` that is not valid).
 - With `--exit-zero`, `sync` and `stage-draft` exit `0` and report the counts only as outputs.
@@ -128,8 +129,8 @@ Outputs, written to `$GITHUB_OUTPUT` when it is set:
 | Command | Outputs |
 |---|---|
 | `stage`, `stage-draft TAG` | `tag`, `release_id`, `asset`, `sha256`, `size`, `published`, `noop` |
-| `stage-draft` | `staged` (with `--all`), `rejected`, `failed` |
-| `sync` | `changed`, `commit`, `blocked`, `errors` |
+| `stage-draft` | `staged` and `withdrawn` (with `--all`), `rejected`, `failed` |
+| `sync` | `changed`, `commit`, `blocked`, `errors`, `retracted` |
 | `fetch` | `sha256`, `size` |
 | `parse-tag` | `bid`, `semver`, `prerelease`, `alias` |
 | `resolve-build` | `runner`, `xcode`, `setup`, `version`, `tag`; `command`, `env` and `ipa_glob` go only to `--json-out` |
@@ -196,14 +197,14 @@ What happens next:
    first job, which holds no secret, unless `force` is true. `bin/alt build` refuses it unless
    `--force`. The pre-push hook never passes `--force`, so pushing the tag again builds nothing. A tag
    of a new version builds as usual.
-4. Publishing it on purpose still works: `bin/alt publish`, `bin/alt mirror`, `stage.yml` and
-   `ingest.yml` only warn about a withdrawn version.
+4. Publishing it on purpose still works: `bin/alt publish`, `bin/alt mirror`, `stage.yml` with a tag
+   and `ingest.yml` only warn about a withdrawn version.
 
 `bin/alt status` lists the withdrawn versions of every app.
 
-A draft left by `--unpublish` is a pending draft. Scheduled `stage.yml` runs stage every pending
-draft and only warn about a withdrawn version, which publishes it again and ends the withdrawal.
-Delete the release when the version has to stay away.
+A draft left by `--unpublish` (or by unpublishing in the GitHub UI) stays a draft. `stage.yml` runs
+without a tag, scheduled or manual, skip drafts of a withdrawn version and only count them. A draft
+is skipped once sync has listed its version, which the catalog run started by the withdrawal does.
 
 ### Publish a withdrawn version again
 
@@ -315,7 +316,9 @@ Every case below except the last is an error, so the catalog run fails.
   **`the release's assets could not be listed; left as a draft`:** the release is a draft and drops
   out of the catalog. If it carries exactly one `.ipa`, the next scheduled `stage.yml` run publishes
   it; to do it now, stage it by tag (`gh workflow run stage.yml -R xuniv/alt -f tag=<tag>`). Stage
-  gates and normalizes that IPA again.
+  gates and normalizes that IPA again. If the catalog run failed before it committed, the next one
+  takes the draft for a withdrawal and lists the version in `retracted.json` (`bin/alt status` shows
+  it); scheduled runs then skip the draft, so stage it by tag.
 - **A draft with two IPAs** (for example `Demo.ipa` and `Demo-1.4.0.normalized-<id>.ipa` after a
   cancelled run or a listing that failed): `stage-draft` refuses it. Delete the temporary one, then
   stage the draft by tag; stage normalizes the remaining IPA again.

@@ -1775,62 +1775,6 @@ POLL_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "poll.yml")
 CATALOG_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "catalog.yml")
 TOOLS = os.path.join(ROOT, "tools")
 
-# Stand-in for "python3 -m altsource retracted --bid B --version V" (exit 0 listed, 4 not listed, else
-# an error), used only while the command is not part of tools/altsource. The package shadows the real
-# one and extends its __path__, so every other module and command is the real one.
-SHIM_INIT = "__path__.append(%r)\n"
-SHIM_MAIN = r"""
-import argparse, json, os, sys
-if sys.argv[1:2] == ["retracted"]:
-    if %(broken)r:
-        sys.exit(1)
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command")
-    parser.add_argument("--bid", required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--root", default=".")
-    args = parser.parse_args()
-    path = os.path.join(args.root, "apps", args.bid, "retracted.json")
-    if not os.path.exists(path):
-        sys.exit(4)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except ValueError:
-        sys.exit(1)
-    versions = data.get("versions") if isinstance(data, dict) else None
-    if data.get("schemaVersion") != 1 or not isinstance(versions, dict):
-        sys.exit(1)
-    sys.exit(0 if args.version in versions else 4)
-from altsource.cli import main
-sys.exit(main())
-"""
-_RETRACTED_CLI = []
-
-
-def retracted_cli_available():
-    """Whether tools/altsource already provides the retracted command."""
-    if not _RETRACTED_CLI:
-        with tempfile.TemporaryDirectory() as tmp:
-            proc = subprocess.run([sys.executable, "-m", "altsource", "retracted", "--help"], cwd=tmp,
-                                  env=dict(os.environ, PYTHONPATH=TOOLS), capture_output=True)
-        _RETRACTED_CLI.append(proc.returncode == 0)
-    return _RETRACTED_CLI[0]
-
-
-def altsource_path(folder, broken=False):
-    """PYTHONPATH for the workflow scripts: the real tools, or the stand-in above in front of them
-    when the retracted command is missing (always with ``broken``, whose command fails)."""
-    if retracted_cli_available() and not broken:
-        return TOOLS
-    package = os.path.join(folder, "altsource")
-    os.makedirs(package, exist_ok=True)
-    with open(os.path.join(package, "__init__.py"), "w", encoding="utf-8") as fh:
-        fh.write(SHIM_INIT % os.path.join(TOOLS, "altsource"))
-    with open(os.path.join(package, "__main__.py"), "w", encoding="utf-8") as fh:
-        fh.write(SHIM_MAIN % {"broken": broken})
-    return folder + os.pathsep + TOOLS
-
 
 def heredoc(script, opener):
     """The body of the here-document that starts on the line ``opener`` and ends at ``PY``."""
@@ -1851,17 +1795,20 @@ class WithdrawnWorkflowCase(OperatorCase):
             v: {"date": "2026-10-22T07:13:00Z", "reason": "deleted"} for v in versions}}, indent=2, sort_keys=True)
         self.write(os.path.join(self.root, "apps", bid, "retracted.json"), text + "\n")
 
+    def damage(self, bid=BID):
+        """A tombstone file that altsource.retract refuses to read."""
+        self.write(os.path.join(self.root, "apps", bid, "retracted.json"), '{"schemaVersion": 1, "versions": [')
+
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("python3"), "needs bash and python3")
 class BuildFirstJobTests(WithdrawnWorkflowCase):
     """build.yml's app job refuses a withdrawn version unless force is set, before any secret is used."""
 
-    def run_check(self, ref="v1.2.3", force="false", broken=False):
+    def run_check(self, ref="v1.2.3", force="false"):
         script = step_script(BUILD_WORKFLOW, "Check the version", job="app")
         temp = self.mkdir("runner-temp")
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.home, "RUNNER_TEMP": temp,
-               "PYTHONPATH": altsource_path(self.mkdir("shim"), broken=broken), "APP": BID, "REF": ref,
-               "FORCE": force, "GITHUB_ACTIONS": "true"}
+               "PYTHONPATH": TOOLS, "APP": BID, "REF": ref, "FORCE": force, "GITHUB_ACTIONS": "true"}
         proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=self.root,
                               env=env, stdin=subprocess.DEVNULL, capture_output=True)
         return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
@@ -1895,10 +1842,11 @@ class BuildFirstJobTests(WithdrawnWorkflowCase):
         self.assertIn("::error::ref does not match privateBuild.tagPattern", out)
 
     def test_an_unreadable_file_fails_closed(self):
-        self.retract("1.2.3")
-        code, out, _ = self.run_check(ref="v1.2.4", broken=True)
+        self.damage()
+        code, out, err = self.run_check(ref="v1.2.4")
         self.assertEqual(code, 1)
         self.assertIn("::error::apps/%s/retracted.json could not be checked (exit 1)" % BID, out)
+        self.assertIn("retracted.json is not valid", err)
 
     def test_validate_inputs_wants_a_boolean_force(self):
         script = step_script(BUILD_WORKFLOW, "Validate inputs", job="app")
@@ -1932,7 +1880,7 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
 
     RUNS = r"^repos/xuniv/alt/actions/workflows/build\.yml/runs\?created=%3E%3D\d{4}-\d\d-\d\d&per_page=100&page=1$"
 
-    def run_poll(self, tags, dry_run="false", broken=False, released=()):
+    def run_poll(self, tags, dry_run="false", released=()):
         script = heredoc(step_script(POLL_WORKFLOW, "Find new versions"), 'python3 - "$RUNNER_TEMP/tags.txt" <<\'PY\'')
         program = self.write(os.path.join(self.dir, "poll.py"), script)
         listing = self.write(os.path.join(self.dir, "tags.txt"),
@@ -1941,7 +1889,7 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
                         "stdout": [{"id": i + 1, "tag_name": t, "draft": False} for i, t in enumerate(released)]},
                        {"pattern": [self.RUNS], "stdout": {"total_count": 0, "workflow_runs": []}})
         env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
-               "PYTHONPATH": altsource_path(self.mkdir("shim"), broken=broken), "ALT_REPO": "xuniv/alt",
+               "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt",
                "BID": BID, "DRY_RUN": dry_run, "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true"}
         proc = subprocess.run([sys.executable, program, listing], cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                               capture_output=True)
@@ -1967,8 +1915,8 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         self.assertEqual(self.dispatched(), [])
 
     def test_an_unreadable_file_dispatches_nothing(self):
-        self.retract("1.2.3")
-        code, out, _ = self.run_poll(["v1.2.4"], broken=True)
+        self.damage()
+        code, out, _ = self.run_poll(["v1.2.4"])
         self.assertEqual(code, 1)
         self.assertIn("::error::apps/<app>/retracted.json could not be checked", out)
         self.assertEqual(self.dispatched(), [])

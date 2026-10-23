@@ -164,7 +164,8 @@ release listing. Do not edit it.
   empty.
 - The file does not change `source.json`, which lists the published releases. It tells the builders
   what not to build: `poll.yml`, `build.yml` (unless its `force` input is true) and `bin/alt build`
-  (unless `--force`) skip a listed version. `bin/alt status` shows the entries of every app, and
+  (unless `--force`) skip a listed version, and `stage.yml` runs without a tag do not publish its
+  drafts. `bin/alt status` shows the entries of every app, and
   `PYTHONPATH=tools python3 -m altsource retracted --bid BID --version V` checks one version.
 - Deleting `apps/<bundleId>/` removes an app. Sync does not create the file again for an app without
   releases unless it drops one of the app's records in that run.

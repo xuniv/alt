@@ -15,7 +15,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, TextIO, Tuple
 
 from . import retract as retractmod
 from .gh import GhError, write_outputs
@@ -318,6 +318,39 @@ def draft_releases(gh: Any, deps: Any) -> Tuple[List[Tuple[str, int]], int]:
     return pending, blocked
 
 
+def withdrawn_drafts(root: str, pending: Sequence[Tuple[str, int]], deps: Any
+                     ) -> Tuple[List[Tuple[str, int]], int, List[int]]:
+    """(drafts to stage, number of withdrawn ones, ids of drafts whose tombstones cannot be read).
+
+    ``stage-draft --all`` runs on a schedule, so it never publishes a version listed in
+    ``apps/<bid>/retracted.json`` by itself; staging such a draft by tag is an explicit action that
+    goes ahead with a warning. A tombstone file that cannot be read keeps the app's drafts back.
+    """
+    keep: List[Tuple[str, int]] = []
+    withdrawn = 0
+    unreadable: List[int] = []
+    known: Dict[str, Optional[Set[str]]] = {}
+    for tag, rid in pending:
+        try:
+            bid, semver = (str(x) for x in deps.parse_tag(tag))
+        except errors_of(deps, "TagError") + (ValueError,):
+            unreadable.append(rid)
+            continue
+        if bid not in known:
+            try:
+                known[bid] = retractmod.load(root, bid)
+            except retractmod.RetractError:
+                known[bid] = None
+        versions = known[bid]
+        if versions is None:
+            unreadable.append(rid)
+        elif semver in versions:
+            withdrawn += 1
+        else:
+            keep.append((tag, rid))
+    return keep, withdrawn, unreadable
+
+
 def cmd_stage_draft(args, ctx: Context) -> int:
     if bool(args.tag) == bool(args.all):
         raise CliError("pass either TAG or --all")
@@ -326,17 +359,25 @@ def cmd_stage_draft(args, ctx: Context) -> int:
     policy = _policy(ctx, args.allow_home_paths)
     # (tag, label): a draft's tag may itself fail the gate, so messages printed before the gate passed
     # it name the draft by its release id (the tag given on the command line is not repeated)
+    worst = EXIT_OK
+    staged = []
+    rejected = failed = withdrawn = 0
     if args.tag:
         drafts = [(args.tag, "")]
     else:
         pending, blocked = draft_releases(ctx.gh, ctx.deps)
+        pending, withdrawn, unreadable = withdrawn_drafts(args.root, pending, ctx.deps)
         drafts = [(tag, "release %d: " % rid) for tag, rid in pending]
         ctx.eprint("pending drafts: %d" % len(drafts))
         if blocked:
             ctx.eprint("blocked drafts skipped: %d (stage one by tag to retry it)" % blocked)
-    worst = EXIT_OK
-    staged = []
-    rejected = failed = 0
+        if withdrawn:
+            ctx.eprint("withdrawn drafts skipped: %d (listed in retracted.json; stage one by tag to publish "
+                       "it)" % withdrawn)
+        for rid in unreadable:
+            ctx.eprint("release %d: error: the app's retracted.json is not valid; draft not staged" % rid)
+            failed += 1
+            worst = EXIT_ERROR
     for tag, label in drafts:
         try:
             result = stage_existing_draft(tag, notes=notes, denylist=denylist, policy=policy,
@@ -357,7 +398,7 @@ def cmd_stage_draft(args, ctx: Context) -> int:
                 tag, "true" if result.published else "false", "true" if result.noop else "false"))
         _warn_retracted(ctx, args.root, result)
         staged.append(tag)
-    counts: Dict[str, Any] = {"staged": len(staged)} if args.all else {}
+    counts: Dict[str, Any] = {"staged": len(staged), "withdrawn": withdrawn} if args.all else {}
     counts.update(rejected=rejected, failed=failed)
     ctx.outputs(counts)
     return EXIT_OK if args.exit_zero else worst
@@ -757,7 +798,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("stage-draft", parents=[denylist, rooted], help="gate and publish existing drafts")
     p.add_argument("tag", nargs="?")
-    p.add_argument("--all", action="store_true", help="every pending draft with a grammar tag")
+    p.add_argument("--all", action="store_true",
+                   help="every pending draft with a grammar tag, except blocked and withdrawn ones")
     p.add_argument("--notes-file", metavar="F", help="replace the draft's release notes")
     p.add_argument("--no-publish", action="store_true")
     p.add_argument("--dry-run", action="store_true")

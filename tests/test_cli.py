@@ -726,10 +726,43 @@ class RetractedStagingTests(CliCase):
     def test_stage_draft_warns_about_a_withdrawn_version(self):
         rel = self.gh.add_release("io.example.demo-v1.2.3", draft=True)
         self.gh.add_asset(rel, "a.ipa", ipa_bytes())
+        code, out, err = self.run_cli("stage-draft", "io.example.demo-v1.2.3", "--root", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("published=true\n", out)
+        self.assertIn("warning: this version was withdrawn", err)
+        self.assertFalse(self.gh.releases[rel["id"]]["draft"])
+
+    def test_stage_draft_all_skips_withdrawn_versions(self):
+        # stage.yml runs --all on a schedule: an unpublished version must not come back by itself
+        withdrawn = self.gh.add_release("io.example.demo-v1.2.3", draft=True)
+        self.gh.add_asset(withdrawn, "a.ipa", ipa_bytes())
+        other = self.gh.add_release("io.example.demo-v1.2.4", draft=True)
+        self.gh.add_asset(other, "b.ipa", ipa_bytes(short_version="1.2.4"))
         code, out, err = self.run_cli("stage-draft", "--all", "--root", self.root)
         self.assertEqual(code, 0, err)
-        self.assertIn("io.example.demo-v1.2.3 published=true", out)
-        self.assertIn("warning: this version was withdrawn", err)
+        self.assertIn("pending drafts: 1\n", err)
+        self.assertIn("withdrawn drafts skipped: 1 (listed in retracted.json; stage one by tag", err)
+        self.assertIn("io.example.demo-v1.2.4 published=true", out)
+        self.assertNotIn("1.2.3", out + err)
+        self.assertTrue(self.gh.releases[withdrawn["id"]]["draft"])
+        self.assertFalse(self.gh.releases[other["id"]]["draft"])
+        values = self.outputs()
+        self.assertEqual((values["staged"], values["withdrawn"], values["failed"]), ("1", "1", "0"))
+
+    def test_stage_draft_all_keeps_drafts_back_when_tombstones_are_unreadable(self):
+        with open(os.path.join(self.root, "apps", "io.example.demo", "retracted.json"), "wb") as fh:
+            fh.write(b"{")
+        rel = self.gh.add_release("io.example.demo-v1.2.4", draft=True)
+        self.gh.add_asset(rel, "a.ipa", ipa_bytes(short_version="1.2.4"))
+        other = self.gh.add_release("io.example.other-v1.0.0", draft=True)
+        self.gh.add_asset(other, "b.ipa", ipa_bytes(bundle_id="io.example.other", short_version="1.0.0"))
+        code, out, err = self.run_cli("stage-draft", "--all", "--root", self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("release %d: error: the app's retracted.json is not valid; draft not staged" % rel["id"], err)
+        self.assertIn("io.example.other-v1.0.0 published=true", out)
+        self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+        values = self.outputs()
+        self.assertEqual((values["staged"], values["withdrawn"], values["failed"]), ("1", "0", "1"))
 
     def test_rejected_ipa_gets_no_warning(self):
         code, _, err = self.run_cli("stage", self.ipa(payload="leaky-host-0"), "--root", self.root, gh=Untouchable())
