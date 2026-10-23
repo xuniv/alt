@@ -83,7 +83,7 @@ ASCII/UTF-8, UTF-16LE and UTF-16BE.
 | `swiftsourceinfo` | `*.swiftsourceinfo` files and `*.swiftmodule/` directories |
 | `itunes-metadata` | an `iTunesMetadata.plist` file (App Store exports keep the purchaser's account in it). Normalization drops the one at the archive root, so this only stops a directly published IPA or one inside the bundle |
 | `xcent` | `*.xcent` entitlement files such as `archived-expanded-entitlements.xcent` (they carry the team identifier) |
-| `ci-workspace-path` | warning only: paths under the runner workspaces `/Users/runner/work/` and `/home/runner/work/`. The directories below them can name a repository; route 2 checks private sources out under the generic `/Users/runner/work/_temp/src`, but compiler prefix maps keep such paths out altogether (see [Build settings](#build-settings-altjson)) |
+| `ci-workspace-path` | warning only: paths under the runner workspaces `/Users/runner/work/` and `/home/runner/work/`, whose directories can name a repository. The runner's own `_temp/`, `_actions/` and `_tool/` directories name none and are not counted, so the generic checkout of route 2 (`/Users/runner/work/_temp/src`) does not warn; compiler prefix maps keep build paths out altogether (see [Build settings](#build-settings-altjson)) |
 | `localization-non-en` | warning only: `.lproj` folders other than `Base`, `English` and `en` (including `en-GB` and the like) |
 
 The gate also rejects:
@@ -330,10 +330,12 @@ The command must produce an unsigned IPA that passes the gate:
 - Keep home directory paths out of the binaries (for Go, build with `-trimpath`). Paths under the
   runner's own home directory are fine.
 - Keep build paths out of the binaries as well. Swift `#filePath`, C `__FILE__`, assertion messages
-  and debug information can embed the absolute source path, here `/Users/runner/work/_temp/src/...`
-  (gate warning `ci-workspace-path`). Map the checkout to `.` with the compilers' prefix maps and strip
-  the executables. With `xcodebuild`, pass the settings on its command line in the build script, for
-  example:
+  and debug information can embed the absolute source path, here `/Users/runner/work/_temp/src/...`.
+  That path is generic and the gate does not count it; a build from a checkout in the runner
+  workspace itself (`/Users/runner/work/<repository>/<repository>/...`) gets the gate warning
+  `ci-workspace-path`, because the path names the repository. Map the checkout to `.` with the
+  compilers' prefix maps and strip the executables. With `xcodebuild`, pass the settings on its
+  command line in the build script, for example:
 
   ```sh
   xcodebuild -scheme "$SCHEME" -configuration Release -sdk iphoneos \
@@ -344,8 +346,9 @@ The command must produce an unsigned IPA that passes the gate:
 
   Use `-debug-prefix-map` instead of `-file-prefix-map` with a Swift compiler that lacks the latter.
   Keep the `command` in `.alt.json` short (`"command": "scripts/build-unsigned-ipa.sh"`) and pass
-  values such as the scheme through `env`. Check the result with `altsource scan`: the
-  `ci-workspace-path` warning counts what is left.
+  values such as the scheme through `env`. Check the result with `altsource scan`: the `home-path`
+  and `ci-workspace-path` rules count home and workspace paths that are left (paths below the
+  runner's own directories, such as `_temp/src`, are not counted).
 - Set `CFBundleShortVersionString` to the core of `VERSION` (`1.4.0` for `1.4.0-beta.1`).
 - Give every tag its own `CFBundleVersion`. Clients identify a version by the pair
   (`CFBundleShortVersionString`, `CFBundleVersion`). The catalog keeps only the higher semver of two

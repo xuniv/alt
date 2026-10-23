@@ -204,14 +204,27 @@ The catalog run fails, and its log lists `<tag>: blocked (<rules>)` with the act
   If a denylist term was a false positive, fix the denylist (both copies) and stage the draft by tag.
   Otherwise fix the build, publish a new version and delete the blocked draft.
 - **Deleted (immutable release):** the tag cannot be used again. Publish a new version.
-- **Left in place (immutable, `home-path` only):** set `"allowHomePaths": true` in the app's
-  `app.json` to accept it, or delete the release. This repository keeps immutable releases off, so
-  this and the deletion above only happen if that setting is changed.
+- **Left in place (immutable, `home-path` or `ci-workspace-path` only):** set
+  `"allowHomePaths": true` in the app's `app.json` to accept it, or delete the release. This
+  repository keeps immutable releases off, so this and the deletion above only happen if that
+  setting is changed.
 - **Release notes or title:** leaky notes have already been cleared and a leaky title reset to
   `<bundleId> <semver>`. Edit them on GitHub if needed; the next sync checks them again.
 - **`<tag>: asset name blocked (<rules>)`:** the IPA's file name contains a denylist term or a home
   path, so the release was unpublished. Staging the draft by tag renames the IPA to
   `<Name>-<semver>.ipa` and publishes it again once the IPA itself passes.
+- **`release <id>: tag blocked (<rules>)`:** the tag itself contains a denylist term or a home path.
+  The release was unpublished as `[blocked] release <id>`, so neither the title nor the log repeats
+  the tag. A tag cannot be renamed: delete the release and the tag, then publish under a clean tag.
+- **`<tag>: asset label blocked (<rules>); cleared`:** GitHub shows an asset label in place of the
+  file name, so the leaky label was removed and the release stays public. If clearing failed, the
+  release was unpublished instead.
+- **`<tag>: catalog record blocked (<rules>)`:** a string of the release's record under
+  `apps/<bundleId>/versions/` failed the check (also a record kept from an earlier run), and the
+  release was unpublished.
+- **`generated source.json failed the leak check; nothing changed`:** a string of the generated
+  catalog, usually from a curated `apps/<bundleId>/app.json`, failed the check. The log names the app
+  by position and, when it is clean, the key. Fix the file; nothing was committed.
 
 ### A normalization did not finish
 
