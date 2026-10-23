@@ -15,17 +15,17 @@ import json
 import os
 import re
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 from .gh import GhError, write_outputs
 from .stage import (
     ARCHIVE_ERRORS,
+    BLOCKED_MARK,
     Conflict,
     GateRejected,
     StageError,
     Toolkit,
     blocking,
-    draft_tags,
     errors_of,
     field,
     finding_dicts,
@@ -268,29 +268,60 @@ def cmd_stage(args, ctx: Context) -> int:
     return EXIT_OK
 
 
+def draft_releases(gh: Any, deps: Any) -> Tuple[List[Tuple[str, int]], int]:
+    """((tag, release id) of pending drafts, number of blocked drafts), oldest first.
+
+    Like ``stage.draft_tags``, with the release ids: messages name a draft by its id until its tag
+    passed the gate.
+    """
+    tag_errors = errors_of(deps, "TagError") + (ValueError,)
+    pending: List[Tuple[str, int]] = []
+    seen = set()
+    blocked = 0
+    for rel in sorted(gh.list_releases(), key=lambda r: int(r.get("id", 0))):
+        if not rel.get("draft"):
+            continue
+        tag = str(rel.get("tag_name") or "")
+        try:
+            deps.parse_tag(tag)
+        except tag_errors:
+            continue
+        if tag in seen:
+            continue
+        seen.add(tag)
+        if str(rel.get("name") or "").startswith(BLOCKED_MARK):
+            blocked += 1
+        else:
+            pending.append((tag, int(rel["id"])))
+    return pending, blocked
+
+
 def cmd_stage_draft(args, ctx: Context) -> int:
     if bool(args.tag) == bool(args.all):
         raise CliError("pass either TAG or --all")
     denylist = load_denylist(args.denylist_file, ctx.environ)
     notes = read_text_file(args.notes_file) if args.notes_file else None
     policy = _policy(ctx, args.allow_home_paths)
+    # (tag, label): a draft's tag may itself fail the gate, so messages printed before the gate passed
+    # it name the draft by its release id (the tag given on the command line is not repeated)
     if args.tag:
-        tags = [args.tag]
+        drafts = [(args.tag, "")]
     else:
-        tags, blocked = draft_tags(ctx.gh, ctx.deps)
-        ctx.eprint("pending drafts: %d" % len(tags))
+        pending, blocked = draft_releases(ctx.gh, ctx.deps)
+        drafts = [(tag, "release %d: " % rid) for tag, rid in pending]
+        ctx.eprint("pending drafts: %d" % len(drafts))
         if blocked:
-            ctx.eprint("blocked drafts skipped: %d (stage one by tag to retry it)" % len(blocked))
+            ctx.eprint("blocked drafts skipped: %d (stage one by tag to retry it)" % blocked)
     worst = EXIT_OK
     staged = []
     rejected = failed = 0
-    for tag in tags:
+    for tag, label in drafts:
         try:
             result = stage_existing_draft(tag, notes=notes, denylist=denylist, policy=policy,
                                           publish=not args.no_publish, dry_run=args.dry_run,
                                           gh=ctx.gh, deps=ctx.deps)
         except Exception as exc:  # one bad draft must not stop the others
-            code = report_error(ctx, exc, denylist, prefix=tag + ": ")
+            code = report_error(ctx, exc, denylist, prefix=label)
             if code == EXIT_REJECTED:
                 rejected += 1
             else:
@@ -299,7 +330,7 @@ def cmd_stage_draft(args, ctx: Context) -> int:
             continue
         if args.tag:
             _stage_outputs(ctx, result)
-        else:
+        else:  # the gate passed the tag
             ctx.print("%s published=%s noop=%s" % (
                 tag, "true" if result.published else "false", "true" if result.noop else "false"))
         staged.append(tag)

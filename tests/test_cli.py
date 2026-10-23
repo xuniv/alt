@@ -260,7 +260,8 @@ class StageCommandTests(CliCase):
         self.assertEqual(code, 2)
         self.assertIn("io.example.demo-v1.2.3 published=true noop=false", out)
         self.assertIn("io.example.third-v3.0.0 published=true noop=false", out)
-        self.assertIn("io.example.other-v1.0.0: gate rejected", err)
+        self.assertIn("release %d: gate rejected" % b["id"], err)
+        self.assertNotIn("io.example.other", err)  # the tag is not shown before the gate passed it
         values = self.outputs()
         self.assertEqual((values["staged"], values["rejected"], values["failed"]), ("2", "1", "0"))
         self.assertTrue(self.gh.releases[b["id"]]["draft"])
@@ -607,6 +608,44 @@ class ResolveBuildTests(CliCase):
         self.assertIn("does not enable privateBuild", err)
         self.assertEqual(self.run_cli("resolve-build", "--bid", "io.example.app-v2", "--ref", "v1.0.0",
                                       "--checkout", self.checkout, "--root", self.root)[0], 1)
+
+
+class StageDraftLabelTests(CliCase):
+    """A draft's tag is not printed before the gate passed it; messages use the release id."""
+
+    def test_leaky_tag_in_all_mode(self):
+        rel = self.gh.add_release("io.example.demo-v1.2.3-leaky-host-0", draft=True)
+        self.gh.add_asset(rel, "a.ipa", ipa_bytes())
+        good = self.gh.add_release("io.example.demo-v1.3.0", draft=True)
+        self.gh.add_asset(good, "b.ipa", ipa_bytes(short_version="1.3.0"))
+        code, out, err = self.run_cli("stage-draft", "--all")
+        self.assertEqual(code, 2)
+        self.assertIn("release %d: gate rejected: release tag rejected" % rel["id"], err)
+        self.assertIn("io.example.demo-v1.3.0 published=true", out)
+        self.assertNotIn("leaky-host-0", out + err)
+        self.assertEqual(self.gh.releases[rel["id"]]["name"], "[blocked] release %d" % rel["id"])
+
+    def test_failures_before_the_gate_name_the_release(self):
+        rel = self.gh.add_release("io.example.demo-v1.2.0", draft=True)  # no IPA
+        code, _, err = self.run_cli("stage-draft", "--all")
+        self.assertEqual(code, 1)
+        self.assertIn("release %d: error:" % rel["id"], err)
+
+    def test_single_tag_is_not_repeated(self):
+        self.gh.add_release("io.example.demo-v1.2.3-leaky-host-0", draft=True)
+        code, out, err = self.run_cli("stage-draft", "io.example.demo-v1.2.3-leaky-host-0")
+        self.assertEqual(code, 2)
+        self.assertTrue(err.startswith("gate rejected: release tag rejected"), err)
+        self.assertNotIn("leaky-host-0", out + err)
+
+    def test_duplicate_and_blocked_drafts(self):
+        a = self.gh.add_release("io.example.demo-v1.0.0", draft=True)
+        self.gh.add_release("io.example.demo-v1.0.0", draft=True)
+        b = self.gh.add_release("io.example.demo-v1.1.0", draft=True)
+        b["name"] = "[blocked] io.example.demo-v1.1.0"
+        self.gh.add_release("not a grammar tag", draft=True)
+        self.gh.add_release("io.example.demo-v2.0.0")  # published
+        self.assertEqual(cli.draft_releases(self.gh, self.deps), ([("io.example.demo-v1.0.0", a["id"])], 1))
 
 
 if __name__ == "__main__":
