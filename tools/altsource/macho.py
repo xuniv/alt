@@ -9,7 +9,9 @@ load commands use the slice's own order. ``buf`` arguments may be ``bytes``, ``b
 ``memoryview`` or ``mmap`` objects; nothing larger than a single blob payload is copied.
 
 Errors raise :class:`MachOError` whose ``rule`` is one of ``macho-invalid``,
-``macho-signature-invalid`` or ``macho-entitlements-invalid``.
+``macho-signature-invalid`` or ``macho-entitlements-invalid``. An undecodable XML entitlement blob
+raises; an undecodable DER blob is recorded in ``CodeSignature.der_error`` (callers that publish
+facts about entitlements must treat it as an error, see ``MachO.entitlement_errors``).
 """
 
 from __future__ import annotations
@@ -99,8 +101,8 @@ class CodeSignature:
     cms_size: int = 0  # payload bytes of the CMS blob wrapper (0 = absent or empty)
     entitlements_xml: Optional[bytes] = None  # raw payload of slot 5
     entitlements: Optional[Dict[str, Any]] = None  # parsed slot 5 (None when absent or empty)
-    der_entitlements: Optional[Dict[str, Any]] = None  # parsed slot 7 (informational)
-    der_error: Optional[str] = None
+    der_entitlements: Optional[Dict[str, Any]] = None  # parsed slot 7 (None when absent or invalid)
+    der_error: Optional[str] = None  # why a present slot-7 blob could not be decoded
 
     @property
     def adhoc(self) -> bool:
@@ -165,9 +167,24 @@ class MachO:
 
     @property
     def all_entitlements(self) -> List[Dict[str, Any]]:
-        """Parsed XML entitlements of every slice that has them."""
-        return [s.code_signature.entitlements for s in self.slices
-                if s.code_signature is not None and s.code_signature.entitlements is not None]
+        """Parsed entitlements of every slice: the XML dictionary, then the DER one, where present.
+
+        Signing tools write both forms and either can carry keys the other lacks (for example the
+        team identifier), so every fact about entitlements is taken from all of them.
+        """
+        out: List[Dict[str, Any]] = []
+        for s in self.slices:
+            cs = s.code_signature
+            if cs is None:
+                continue
+            out.extend(d for d in (cs.entitlements, cs.der_entitlements) if d is not None)
+        return out
+
+    @property
+    def entitlement_errors(self) -> List[str]:
+        """Reasons why a DER entitlement blob could not be decoded, one per affected slice."""
+        return [s.code_signature.der_error for s in self.slices
+                if s.code_signature is not None and s.code_signature.der_error]
 
     @property
     def encrypted(self) -> bool:

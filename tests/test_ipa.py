@@ -538,16 +538,49 @@ class EntitlementTests(IpaCase):
         h.add_appex(entries, "Share", exe=self.exe({"get-task-allow": False}))
         self.assertEqual(self.inspect(entries).entitlements, ["a", "get-task-allow"])
 
-    def test_der_only_means_no_entitlements(self):
+    def test_der_only_entitlements_are_listed(self):
         exe = h.macho(signature=h.code_signature(der={"com.apple.developer.nfc": True}))
-        self.assertEqual(self.inspect(h.app_entries(exe=exe)).entitlements, [])
+        self.assertEqual(self.inspect(h.app_entries(exe=exe)).entitlements, ["com.apple.developer.nfc"])
 
-    def test_fat_first_slice_with_xml(self):
+    def test_xml_and_der_keys_are_united(self):
+        exe = h.macho(signature=h.code_signature(entitlements={"a": True, "get-task-allow": False},
+                                                 der={"b": True, "get-task-allow": False}))
+        self.assertEqual(self.inspect(h.app_entries(exe=exe)).entitlements, ["a", "b"])
+        exe = h.macho(signature=h.code_signature(entitlements={"get-task-allow": False},
+                                                 der={"get-task-allow": True}))
+        self.assertEqual(self.inspect(h.app_entries(exe=exe)).entitlements, ["get-task-allow"])
+
+    def test_every_fat_slice_counts(self):
         exe = h.fat([h.macho(signature=h.code_signature()),
                      h.macho(cpusubtype=h.SUB_ARM64E, signature=h.code_signature(entitlements={"second": True})),
                      h.macho(cputype=h.CPU_X86_64, cpusubtype=3,
                              signature=h.code_signature(entitlements={"third": True}))], fat64=True)
-        self.assertEqual(self.inspect(h.app_entries(exe=exe)).entitlements, ["second"])
+        self.assertEqual(self.inspect(h.app_entries(exe=exe)).entitlements, ["second", "third"])
+
+    def test_team_ids_from_der_entitlements(self):
+        # DER-only entitlements still carry an extractable team identifier
+        exe = h.macho(signature=h.code_signature(der={"com.apple.developer.team-identifier": "LEAKTEAM00"}))
+        info = self.inspect(h.app_entries(exe=exe))
+        self.assertEqual((info.team_ids, info.entitlements), (["LEAKTEAM00"], []))
+        exe = h.fat([h.macho(signature=h.code_signature()), h.macho(
+            cpusubtype=h.SUB_ARM64E, signature=h.code_signature(der={"application-identifier": "ABCDE12345.x"}))])
+        self.assertEqual(self.inspect(h.app_entries(exe=exe)).team_ids, ["ABCDE12345"])
+        kit = h.macho(filetype=h.MH_DYLIB, signature=h.code_signature(
+            der={"com.apple.developer.team-identifier": "KITTEAM000"}))
+        entries = h.app_entries()
+        entries[APP + "/Frameworks/Kit.framework/Kit"] = kit
+        self.assertEqual(self.inspect(entries).team_ids, ["KITTEAM000"])
+
+    def test_undecodable_der_entitlements_reject(self):
+        for payload in (b"\x70\x80\x00", b"\x13\x01a", h.der_tlv(0x70, h.der_tlv(0x02, b"\x01"))):
+            with self.subTest(payload=payload):
+                exe = h.macho(signature=h.code_signature(der=payload))
+                err = self.assertRule(h.app_entries(exe=exe), "macho-entitlements-invalid")
+                self.assertEqual(err.path, APP + "/Demo")
+        entries = h.app_entries()
+        entries[APP + "/Frameworks/Kit.framework/Kit"] = h.macho(
+            filetype=h.MH_DYLIB, signature=h.code_signature(der=b"\x13\x01a"))
+        self.assertRule(entries, "macho-entitlements-invalid")
 
     def test_team_ids_from_entitlements(self):
         exe = self.exe({"application-identifier": "ABCDE12345.io.example.demo"})

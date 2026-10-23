@@ -142,10 +142,15 @@ class EntitlementTests(unittest.TestCase):
         self.assertEqual(m.entitlements, self.ENTS)
         self.assertEqual(m.all_entitlements, [self.ENTS])
 
-    def test_der_slot_is_informational(self):
+    def test_der_slot_is_decoded_and_listed(self):
         m = parse(h.macho(signature=h.code_signature(der={"get-task-allow": True})))
-        self.assertIsNone(m.entitlements)
+        self.assertIsNone(m.entitlements)  # the XML form, as ldid and AltSign read it
         self.assertEqual(m.slices[0].code_signature.der_entitlements, {"get-task-allow": True})
+        self.assertEqual(m.all_entitlements, [{"get-task-allow": True}])
+        self.assertEqual(m.entitlement_errors, [])
+        both = parse(h.fat([h.macho(signature=h.code_signature(entitlements={"a": True}, der={"b": True})),
+                            h.macho(cpusubtype=h.SUB_ARM64E, signature=h.code_signature(der={"c": True}))]))
+        self.assertEqual(both.all_entitlements, [{"a": True}, {"b": True}, {"c": True}])
 
     def test_der_decoding_both_forms(self):
         value = {"a": [1, -42, 300, True, False, "s"], "b": {"c": b"\x01\x02"}, "e": {}}
@@ -159,9 +164,12 @@ class EntitlementTests(unittest.TestCase):
         for payload in (b"\x70\x80\x00", b"\x70\x03\x02\x01", h.der_tlv(0x70, h.der_tlv(0x02, b"\x01")),
                         h.der_tlv(0x70, h.der_tlv(0x02, b"\x01") + h.der_tlv(0x30, b"")), b"\x13\x01a"):
             with self.subTest(payload=payload):
-                cs = parse(h.macho(signature=h.code_signature(der=payload))).slices[0].code_signature
+                m = parse(h.macho(signature=h.code_signature(der=payload)))
+                cs = m.slices[0].code_signature
                 self.assertIsNone(cs.der_entitlements)
                 self.assertTrue(cs.der_error)
+                self.assertEqual(m.entitlement_errors, [cs.der_error])
+                self.assertEqual(m.all_entitlements, [])
 
     def test_first_slice_with_xml_wins(self):
         a = h.macho(signature=h.code_signature(entitlements=b""))  # empty blob: skipped like ldid does

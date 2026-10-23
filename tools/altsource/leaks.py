@@ -8,7 +8,12 @@ spanning read boundaries are found) and searches the raw bytes, decoding nothing
 - ``home-path``: user home directories in the same three encodings. ``/Users/<x>/`` blocks;
   ``/home/<x>/`` and ``C:\\Users\\<x>\\`` only warn (they mostly come from third-party help text, and
   the hosted Linux runners build under ``/home/runner``). Well-known CI accounts and generic
-  placeholder names (``user``, ``yourname``, ...) are not counted.
+  placeholder names (``user``, ``yourname``, ...) are not counted;
+- ``ci-workspace-path`` (warn): the workspace of a hosted runner, ``/Users/runner/work/`` and
+  ``/home/runner/work/``. A build of a checked-out repository records paths below
+  ``<workspace>/<repository>/<repository>/``, so these hits can name a private repository; builds
+  are expected to run from a generic directory or to map their source prefix away. The runner's
+  own directories (``_temp``, ``_actions``, ``_tool``) name no repository and are not counted.
 
 Entry names, entry comments, extra fields and the archive comment are searched as well. Structural
 rules come from the entry names and from the inspection result (``ipa.inspect_ipa``): signatures,
@@ -55,6 +60,8 @@ PLACEHOLDER_ACCOUNTS = ("user", "username", "me", "you", "yourname", "your_name"
 ALLOWED_HOME_NAMES = CI_ACCOUNTS + PLACEHOLDER_ACCOUNTS  # matched case-insensitively, as a whole name
 BLOCK_HOME_PREFIXES = ("/Users/",)
 WARN_HOME_PREFIXES = ("/home/", ":\\Users\\")  # the drive letter is checked separately
+CI_WORKSPACE_PREFIXES = ("/Users/runner/work/", "/home/runner/work/")
+RUNNER_DIRS = ("_temp", "_actions", "_tool")  # below the workspace, but not a repository checkout
 ENGLISH_LPROJ = re.compile(r"^(?:en(?:[-_][A-Za-z0-9]+)*|English|Base)$")
 ZIP_COMMENT_PATH = "<zip-comment>"
 ZIP_LAYOUT_PATH = "<zip-layout>"  # bytes outside the entries of the archive
@@ -63,6 +70,7 @@ DENYLIST_ENV = "ALT_DENYLIST"
 # rule ids
 DENYLIST = "denylist"
 HOME_PATH = "home-path"
+CI_WORKSPACE_PATH = "ci-workspace-path"
 SIGNED = "signed"
 SIGNATURE_UNKNOWN = "signature-unknown"
 PROVISIONING_PROFILE = "provisioning-profile"
@@ -87,6 +95,8 @@ _APP_RE = re.compile(r"^(Payload/[^/]+\.app)/", re.IGNORECASE)
 HOME_PATH_RE = re.compile(
     r"(/Users/|/home/|[A-Za-z]:\\Users\\)(?!(?i:%s)[/\\])[A-Za-z0-9._-]{1,64}[/\\]"
     % "|".join(re.escape(name) for name in ALLOWED_HOME_NAMES))
+CI_WORKSPACE_RE = re.compile("(?:%s)(?!(?:%s)/)" % ("|".join(re.escape(p) for p in CI_WORKSPACE_PREFIXES),
+                                                    "|".join(re.escape(d) for d in RUNNER_DIRS)))
 
 
 class GateError(Exception):
@@ -217,7 +227,7 @@ def _trie_regex(literals: Sequence[bytes]) -> Optional["re.Pattern[bytes]"]:
 # -- byte matchers ---------------------------------------------------------------------------------
 
 def _home_patterns() -> List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[bytes, int], bool]], int]]:
-    """(counter key, pattern, accept, max length) for the home-path rule.
+    """(counter key, pattern, accept, max length) for the home-path and ci-workspace-path rules.
 
     Each pattern starts with a literal so the regex engine can use its fast prefix search; the drive
     letter before ``:\\Users\\`` is checked by ``accept`` instead of in the pattern.
@@ -249,6 +259,11 @@ def _home_patterns() -> List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[
             accept = _drive_letter(enc) if prefix.startswith(":") else None
             size = (len(prefix) + MAX_HOME_NAME + 1) * width
             out.append((key, re.compile(lit(prefix) + rest), accept, size))
+        # runner accounts are allowed above; their workspace directory is counted on its own
+        own = b"(?!(?:" + b"|".join(lit(d + "/") for d in RUNNER_DIRS) + b"))"
+        longest = max(len(d) + 1 for d in RUNNER_DIRS)
+        for prefix in CI_WORKSPACE_PREFIXES:
+            out.append((CI_WORKSPACE_PATH, re.compile(lit(prefix) + own), None, (len(prefix) + longest) * width))
     return out
 
 
@@ -269,7 +284,7 @@ _CONTEXT = 2  # bytes kept before the scan window for the drive letter check
 
 
 class Matcher:
-    """Counts denylist and home-path hits in byte streams; never keeps matched bytes.
+    """Counts denylist, home-path and ci-workspace-path hits in byte streams; never keeps matched bytes.
 
     Counts are keyed by rule id, except that home paths which only warn are counted under
     ``HOME_PATH_WARN``.
@@ -370,7 +385,8 @@ class _Findings:
         for key in sorted(self.counts):
             rule = HOME_PATH if key == HOME_PATH_WARN else key
             severity = BLOCK
-            if rule == LOCALIZATION_NON_EN or key == HOME_PATH_WARN or (rule == HOME_PATH and allow_home):
+            if rule in (LOCALIZATION_NON_EN, CI_WORKSPACE_PATH) or key == HOME_PATH_WARN or (
+                    rule == HOME_PATH and allow_home):
                 severity = WARN
             finding = merged.setdefault((rule, severity), {"rule": rule, "severity": severity, "count": 0,
                                                            "paths": []})
@@ -608,15 +624,17 @@ def _raw_regions(fh: Any, infos: Sequence[zipfile.ZipInfo], start_dir: int) -> L
 
 
 def scan_bytes(data: bytes, denylist: Sequence[str]) -> List[str]:
-    """Rule ids (``denylist``, ``home-path``) that hit in ``data``, whatever their severity."""
+    """Rule ids (``denylist``, ``home-path``, ``ci-workspace-path``) that hit in ``data``, whatever
+    their severity."""
     return sorted({HOME_PATH if key == HOME_PATH_WARN else key for key in Matcher(denylist).scan_bytes(data)})
 
 
 def scan_text(text: str, denylist: Sequence[str]) -> List[str]:
-    """Rule ids (``denylist``, ``home-path``) that hit in a metadata string such as release notes.
+    """Rule ids (``denylist``, ``home-path``, ``ci-workspace-path``) that hit in a metadata string
+    such as release notes.
 
     The denylist match is case-insensitive and Unicode-normalized. An empty denylist only checks
-    home paths; callers that need the fail-closed check use ``scan_ipa`` or ``load_denylist``.
+    the path rules; callers that need the fail-closed check use ``scan_ipa`` or ``load_denylist``.
     """
     text = text or ""
     rules = []
@@ -625,6 +643,9 @@ def scan_text(text: str, denylist: Sequence[str]) -> List[str]:
         if unicodedata.normalize("NFC", word).casefold() in folded:
             rules.append(DENYLIST)
             break
-    if HOME_PATH_RE.search(text) or HOME_PATH_RE.search(unicodedata.normalize("NFC", text)):
+    nfc = unicodedata.normalize("NFC", text)
+    if HOME_PATH_RE.search(text) or HOME_PATH_RE.search(nfc):
         rules.append(HOME_PATH)
+    if CI_WORKSPACE_RE.search(text) or CI_WORKSPACE_RE.search(nfc):
+        rules.append(CI_WORKSPACE_PATH)
     return sorted(rules)
