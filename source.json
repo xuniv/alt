@@ -3,10 +3,46 @@
   "identifier": "io.github.xuniv.alt",
   "subtitle": "Unsigned builds for sideloading",
   "description": "Unsigned IPA builds published as GitHub Releases. Add this source to AltStore, SideStore or Feather; the store re-signs each app on install.",
-  "iconURL": "https://xuniv.github.io/alt/apps/io.github.xuniv.alt.selftest/icon.png",
+  "iconURL": "https://xuniv.github.io/alt/apps/io.github.nukebrowser/icon.png",
   "website": "https://github.com/xuniv/alt",
   "tintColor": "5B6CFF",
   "apps": [
+    {
+      "name": "NukeBrowser",
+      "bundleIdentifier": "io.github.nukebrowser",
+      "developerName": "xuniv",
+      "subtitle": "Photos-style browser for remote media",
+      "localizedDescription": "A media browser for remote file servers. It opens WebDAV remotes, HTTP directory indexes and rclone remotes that hold tens of thousands of images and videos in nested folders: instant thumbnails from a persisted index, pinch-to-resize columns, a full-screen viewer, slideshow, and a metadata panel for AI-generated images. Read-only: it never uploads, renames or deletes anything on a remote. Requires iOS 27.",
+      "iconURL": "https://xuniv.github.io/alt/apps/io.github.nukebrowser/icon.png",
+      "tintColor": "5B6CFF",
+      "category": "photo-video",
+      "versions": [
+        {
+          "version": "0.2.1",
+          "buildVersion": "724",
+          "marketingVersion": "0.2.1",
+          "date": "2026-10-23T12:47:26Z",
+          "localizedDescription": "Version 0.2.1",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.1/NukeBrowser-0.2.1.ipa",
+          "size": 26988547,
+          "sha256": "38a6dd3dea95afa84f6d0ff6cc7ff2452a312c67bba61346529a257928baff29",
+          "minOSVersion": "27.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSFaceIDUsageDescription": "NukeBrowser uses Face ID to unlock the app.",
+          "NSLocalNetworkUsageDescription": "NukeBrowser connects to WebDAV servers on your local network.",
+          "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
+        }
+      },
+      "version": "0.2.1",
+      "versionDate": "2026-10-23T12:47:26Z",
+      "versionDescription": "Version 0.2.1",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.1/NukeBrowser-0.2.1.ipa",
+      "size": 26988547
+    },
     {
       "name": "Selftest",
       "bundleIdentifier": "io.github.xuniv.alt.selftest",
