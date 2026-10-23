@@ -10,16 +10,23 @@ spanning read boundaries are found) and searches the raw bytes, decoding nothing
   the hosted Linux runners build under ``/home/runner``). Well-known CI accounts and generic
   placeholder names (``user``, ``yourname``, ...) are not counted;
 - ``ci-workspace-path`` (warn): the workspace of a hosted runner, ``/Users/runner/work/`` and
-  ``/home/runner/work/``. A build of a checked-out repository records paths below
-  ``<workspace>/<repository>/<repository>/``, so these hits can name a private repository; builds
-  are expected to run from a generic directory or to map their source prefix away. The runner's
-  own directories (``_temp``, ``_actions``, ``_tool``) name no repository and are not counted.
+  ``/home/runner/work/``, and Xcode's build folder on the macOS runners,
+  ``/Users/runner/Library/Developer/Xcode/DerivedData/``. A build of a checked-out repository
+  records paths below ``<workspace>/<repository>/<repository>/``, and Xcode builds below
+  ``DerivedData/<project>-<hash>/`` (Swift package resource accessors embed that products path), so
+  these hits can name a private repository or project; builds are expected to run from a generic
+  directory or to map their source prefix away. The runner's own directories (``_temp``,
+  ``_actions``, ``_tool``) and the caches that Xcode shares between projects
+  (``ModuleCache.noindex`` and the like) name neither and are not counted.
 
 Entry names, entry comments, extra fields and the archive comment are searched as well. Structural
 rules come from the entry names and from the inspection result (``ipa.inspect_ipa``): signatures,
 provisioning profiles, ``_CodeSignature`` directories, entitlement files (``*.xcent``, which carry the
-team identifier), ``iTunesMetadata.plist`` (the purchaser's account), debug symbols, VCS and Xcode
-user data, Swift module sources and non-English localizations.
+team identifier), ``iTunesMetadata.plist`` (the purchaser's account), FairPlay-encrypted Mach-O
+images (``encrypted-binary``: an ``LC_ENCRYPTION_INFO`` command with a non-zero ``cryptid`` in any
+slice; such an image was downloaded from Apple's stores and never decrypted, and it cannot run
+when sideloaded), debug symbols, VCS and Xcode user data, Swift module sources and non-English
+localizations.
 
 Results carry rule ids, severities, counts and up to five in-IPA paths per rule. Matched bytes are
 never stored, returned or printed.
@@ -62,6 +69,12 @@ BLOCK_HOME_PREFIXES = ("/Users/",)
 WARN_HOME_PREFIXES = ("/home/", ":\\Users\\")  # the drive letter is checked separately
 CI_WORKSPACE_PREFIXES = ("/Users/runner/work/", "/home/runner/work/")
 RUNNER_DIRS = ("_temp", "_actions", "_tool")  # below the workspace, but not a repository checkout
+CI_DERIVED_DATA_PREFIXES = ("/Users/runner/Library/Developer/Xcode/DerivedData/",)
+# below DerivedData, but shared by every project rather than named after one
+DERIVED_DATA_SHARED = ("ModuleCache.noindex", "SymbolCache.noindex", "CompilationCache.noindex",
+                       "SDKStatCaches.noindex")
+# (prefixes, directories below them that are not counted) of the ci-workspace-path rule
+CI_PATH_RULES = ((CI_WORKSPACE_PREFIXES, RUNNER_DIRS), (CI_DERIVED_DATA_PREFIXES, DERIVED_DATA_SHARED))
 ENGLISH_LPROJ = re.compile(r"^(?:en(?:[-_][A-Za-z0-9]+)*|English|Base)$")
 ZIP_COMMENT_PATH = "<zip-comment>"
 ZIP_LAYOUT_PATH = "<zip-layout>"  # bytes outside the entries of the archive
@@ -81,6 +94,7 @@ XCUSERDATA = "xcuserdata"
 SWIFTSOURCEINFO = "swiftsourceinfo"
 ITUNES_METADATA = "itunes-metadata"
 XCENT = "xcent"
+ENCRYPTED_BINARY = "encrypted-binary"
 LOCALIZATION_NON_EN = "localization-non-en"
 # counter key of the home paths that only warn; reported as rule ``home-path`` with severity warn
 HOME_PATH_WARN = "home-path:warn"
@@ -95,8 +109,9 @@ _APP_RE = re.compile(r"^(Payload/[^/]+\.app)/", re.IGNORECASE)
 HOME_PATH_RE = re.compile(
     r"(/Users/|/home/|[A-Za-z]:\\Users\\)(?!(?i:%s)[/\\])[A-Za-z0-9._-]{1,64}[/\\]"
     % "|".join(re.escape(name) for name in ALLOWED_HOME_NAMES))
-CI_WORKSPACE_RE = re.compile("(?:%s)(?!(?:%s)/)" % ("|".join(re.escape(p) for p in CI_WORKSPACE_PREFIXES),
-                                                    "|".join(re.escape(d) for d in RUNNER_DIRS)))
+CI_WORKSPACE_RE = re.compile("|".join(
+    "(?:%s)(?!(?:%s)/)" % ("|".join(re.escape(p) for p in prefixes), "|".join(re.escape(d) for d in dirs))
+    for prefixes, dirs in CI_PATH_RULES))
 
 
 class GateError(Exception):
@@ -259,11 +274,13 @@ def _home_patterns() -> List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[
             accept = _drive_letter(enc) if prefix.startswith(":") else None
             size = (len(prefix) + MAX_HOME_NAME + 1) * width
             out.append((key, re.compile(lit(prefix) + rest), accept, size))
-        # runner accounts are allowed above; their workspace directory is counted on its own
-        own = b"(?!(?:" + b"|".join(lit(d + "/") for d in RUNNER_DIRS) + b"))"
-        longest = max(len(d) + 1 for d in RUNNER_DIRS)
-        for prefix in CI_WORKSPACE_PREFIXES:
-            out.append((CI_WORKSPACE_PATH, re.compile(lit(prefix) + own), None, (len(prefix) + longest) * width))
+        # runner accounts are allowed above; their workspace and build folders are counted on their own
+        for prefixes, dirs in CI_PATH_RULES:
+            own = b"(?!(?:" + b"|".join(lit(d + "/") for d in dirs) + b"))"
+            longest = max(len(d) + 1 for d in dirs)
+            for prefix in prefixes:
+                size = (len(prefix) + longest) * width
+                out.append((CI_WORKSPACE_PATH, re.compile(lit(prefix) + own), None, size))
     return out
 
 
@@ -479,7 +496,8 @@ def _structural(findings: _Findings, names: Sequence[Tuple[str, bool]], info: An
             findings.add(rule, 1, name)
     for rule, key in ((PROVISIONING_PROFILE, "provisioning_profiles"),
                       (CODE_SIGNATURE_DIR, "code_signature_dirs"),
-                      (DSYM, "dsym_like")):
+                      (DSYM, "dsym_like"),
+                      (ENCRYPTED_BINARY, "encrypted_macho_files")):
         for path in _str_list(_get(info, key)):
             if path not in findings.paths.get(rule, []):
                 findings.add(rule, 1, path)

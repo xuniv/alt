@@ -502,6 +502,17 @@ class SignatureTests(IpaCase):
         info = self.inspect(self.entries_with(h.macho(cryptid=1)))
         self.assertEqual(info.encrypted_macho_files, [APP + "/Demo"])
 
+    def test_one_encrypted_slice_marks_the_whole_file(self):
+        clear = h.macho(cryptid=0)
+        armv7 = h.macho(cputype=h.CPU_ARM, cpusubtype=h.SUB_ARMV7, bits=32, cryptid=0)
+        entries = self.entries_with(h.fat([clear, h.macho(cputype=h.CPU_ARM, cpusubtype=h.SUB_ARMV7, bits=32,
+                                                         cryptid=1)]))
+        entries[APP + "/Frameworks/Kit.framework/Kit"] = h.fat([clear, armv7])
+        entries[APP + "/Frameworks/Enc.framework/Enc"] = h.macho(filetype=h.MH_DYLIB, cryptid=3)
+        info = self.inspect(entries)
+        self.assertEqual(info.encrypted_macho_files, [APP + "/Demo", APP + "/Frameworks/Enc.framework/Enc"])
+        self.assertEqual(self.inspect(self.entries_with(h.fat([clear, armv7]))).encrypted_macho_files, [])
+
     def test_large_mach_o_is_spooled(self):
         exe = h.macho(signature=h.code_signature(team_id="ABCDE12345"), body=b"\x00" * 4096)
         with mock.patch.object(ipa, "_IN_MEMORY", 1024):

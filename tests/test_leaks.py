@@ -250,6 +250,36 @@ class HomePathTests(GateCase):
         self.assertEqual([(f["rule"], f["severity"]) for f in result.findings],
                          [("ci-workspace-path", "warn"), ("denylist", "block")])
 
+    def test_xcode_build_folder_of_the_runner_warns_in_every_encoding(self):
+        prefix = "/Users/runner/Library/Developer/Xcode/DerivedData/"
+        for codec in ENCODINGS:
+            with self.subTest(codec=codec):
+                text = prefix + "Private-Project-0-abcdefgh/Build/Products/Release-iphoneos/Kit_Kit.bundle"
+                data = b"\x07" + text.encode(codec) + b"\x00" + (prefix + "x").encode(codec)
+                result = self.scan([entry(APP + "Demo.bin", data)])
+                self.assertTrue(result.ok)
+                self.assertEqual([(f["rule"], f["severity"], f["count"], f["paths"]) for f in result.findings],
+                                 [("ci-workspace-path", "warn", 2, [APP + "Demo.bin"])])
+                self.assertNoMatchedBytes(result, "private-project-0")
+        # the caches Xcode shares between projects name none; other runner directories are not counted
+        shared = " ".join(prefix + d + "/x" for d in leaks.DERIVED_DATA_SHARED)
+        others = "/Users/runner/Library/Developer/Xcode/Archives/x /Users/runner/Library/Caches/x"
+        result = self.scan([entry(APP + "a.txt", shared + " " + others)])
+        self.assertEqual(result.findings, [])
+        policy = leaks.GatePolicy(allow_home_paths=True)  # stays a warning under the opt-in
+        result = self.scan([entry(APP + "a.txt", prefix + "P-1/x " + WORD)], policy=policy)
+        self.assertEqual([(f["rule"], f["severity"]) for f in result.findings],
+                         [("ci-workspace-path", "warn"), ("denylist", "block")])
+
+    def test_xcode_build_folder_in_text(self):
+        prefix = "/Users/runner/Library/Developer/Xcode/DerivedData/"
+        self.assertEqual(leaks.scan_text(prefix + "P-abc/SourcePackages/checkouts/k/a.swift", DENY),
+                         ["ci-workspace-path"])
+        self.assertEqual(leaks.scan_text(prefix + "ModuleCache.noindex/ABC/x.pcm", DENY), [])
+        self.assertEqual(leaks.scan_text(prefix + "ModuleCache.noindexed/x", DENY), ["ci-workspace-path"])
+        self.assertEqual(leaks.scan_text("/Users/runner/Library/Developer/Xcode/Archives/x", DENY), [])
+        self.assertEqual(leaks.scan_bytes((prefix + "P").encode("utf-16-le"), DENY), ["ci-workspace-path"])
+
     def test_runner_workspace_path_in_text(self):
         self.assertEqual(leaks.scan_text("built in /home/runner/work/x/x", []), ["ci-workspace-path"])
         self.assertEqual(leaks.scan_text("/Users/runner/work/x/ and " + WORD, DENY), ["ci-workspace-path", "denylist"])
@@ -266,7 +296,8 @@ class StreamingTests(GateCase):
               WORD.upper().encode(), WORD.encode("utf-16-be"), WORD.encode("utf-16-le"),
               b"/Users/runner/", b"/Users/Shared/", b"/Users/runner/work/", "/home/runner/work/".encode("utf-16-le"),
               "/Users/runner/work/".encode("utf-16-be"), "/Users/runner/work/_temp/".encode("utf-16-le"),
-              b"/home/runner/work/_tool/"]
+              b"/home/runner/work/_tool/", b"/Users/runner/Library/Developer/Xcode/DerivedData/",
+              "/Users/runner/Library/Developer/Xcode/DerivedData/ModuleCache.noindex/".encode("utf-16-be")]
 
     def test_chunked_scan_equals_whole_scan(self):
         matcher = leaks.Matcher([WORD])
@@ -371,6 +402,30 @@ class StructuralTests(GateCase):
         result = self.scan(info=dict(CLEAN_INFO, signature="signed",
                                      signatures={APP + "Demo": "signed", APP + "PlugIns/E.appex/E": "adhoc"}))
         self.assertEqual(self.rules(result)["signed"]["paths"], [APP + "Demo"])
+
+    def test_encrypted_binaries_block(self):
+        paths = [APP + "Demo", APP + "Frameworks/K.framework/K"]
+        result = self.scan(info=dict(CLEAN_INFO, encrypted_macho_files=paths))
+        self.assertFalse(result.ok)
+        self.assertEqual([(f["rule"], f["severity"], f["count"], f["paths"]) for f in result.findings],
+                         [("encrypted-binary", "block", 2, paths)])
+        self.assertTrue(self.scan(info=dict(CLEAN_INFO, encrypted_macho_files=[])).ok)
+
+    def test_encrypted_slice_found_by_inspection(self):
+        from tests import helpers as h
+
+        clear = h.macho(cryptid=0)
+        encrypted = h.macho(cputype=h.CPU_ARM, cpusubtype=9, bits=32, cryptid=1)
+        for exe, blocked in ((h.fat([clear, encrypted]), True), (h.fat([clear]), False), (clear, False)):
+            with self.subTest(blocked=blocked):
+                entries = h.app_entries(exe=exe)
+                entries[h.APP + "/Frameworks/K.framework/K"] = h.macho(filetype=h.MH_DYLIB)
+                result = leaks.scan_ipa(h.build_ipa(entries, os.path.join(self.dir, "e.ipa")), denylist=DENY)
+                rules = self.rules(result)
+                self.assertEqual("encrypted-binary" in rules, blocked)
+                if blocked:
+                    self.assertEqual(rules["encrypted-binary"]["paths"], [h.APP + "/Demo"])
+                    self.assertFalse(result.ok)
 
     def test_info_object_is_accepted(self):
         info = types.SimpleNamespace(**dict(CLEAN_INFO, signature="signed"))
