@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import datetime
 import glob
 import hashlib
 import json
@@ -19,6 +20,7 @@ import types
 import unittest
 
 from altsource import gh as ghmod
+from altsource import retract as retractmod
 from altsource import sync as syncmod
 
 # -- fake IPA tooling ---------------------------------------------------------------------------------
@@ -1727,6 +1729,288 @@ class NormalizePublishedTests(SyncCase):
         self.assertFalse(result.changed)
         self.assertEqual(self.record()["assetId"], asset["id"])
         self.assertEqual(result.blocked, [])
+
+
+class TombstoneTests(SyncCase):
+    """``apps/<bid>/retracted.json``: written by sync for withdrawn versions only."""
+
+    TAG = "io.example.demo-v1.2.3"
+    PATH = "apps/io.example.demo/retracted.json"
+    RECORD = "apps/io.example.demo/versions/1.2.3.json"
+    STAMP = "2026-10-23T08:09:10Z"
+
+    def now(self):
+        return datetime.datetime(2026, 10, 23, 8, 9, 10, 999, tzinfo=datetime.timezone.utc)
+
+    def sync(self, **kw):
+        kw.setdefault("now", self.now)
+        result = self.run_sync(**kw)
+        self.git.refresh("main")  # the local checkout catches up with the commit
+        return result
+
+    def two_versions(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes())
+        self.publish("io.example.demo-v1.3.0", ipa_bytes(short_version="1.3.0"))
+        self.sync()
+        return rel
+
+    def tombstones(self):
+        path = os.path.join(self.root, *self.PATH.split("/"))
+        return load_json(path)["versions"] if os.path.exists(path) else None
+
+    def committed(self, path):
+        return self.git.remote_tree.get(path)
+
+    def test_deleted_release_gets_a_tombstone(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        result = self.sync()
+        self.assertEqual(result.retracted, [self.TAG])
+        message, additions, deletions = self.gh.commits[-1]
+        self.assertEqual(deletions, [self.RECORD])
+        self.assertEqual(message, "catalog: sync 1 app(s), 1 version(s)")
+        self.assertEqual(additions[self.PATH], (
+            '{\n  "schemaVersion": 1,\n  "versions": {\n    "1.2.3": {\n      "date": "%s",\n'
+            '      "reason": "deleted"\n    }\n  }\n}\n' % self.STAMP).encode())
+        self.assertEqual(self.read(self.PATH), additions[self.PATH])  # the working tree too
+        listed = [v["marketingVersion"] for v in json.loads(additions["source.json"])["apps"][0]["versions"]]
+        self.assertEqual(listed, ["1.3.0"])
+        self.assertIn("%s: withdrawn (deleted); tombstone added" % self.TAG, self.log)
+        self.assertIn("retracted=1\n", self.outputs())
+        self.assertEqual((result.errors, result.blocked), ([], []))
+
+    def test_manually_unpublished_release_gets_a_tombstone(self):
+        rel = self.two_versions()
+        self.gh.releases[rel["id"]]["draft"] = True  # converted to a draft in the web interface
+        result = self.sync()
+        self.assertEqual(result.retracted, [self.TAG])
+        self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "unpublished"}})
+        self.assertIn(self.RECORD, self.gh.commits[-1][2])
+
+    def test_last_version_withdrawn_keeps_the_tombstone_while_the_app_is_unlisted(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes())
+        self.sync()
+        del self.gh.releases[rel["id"]]
+        result = self.sync()
+        self.assertEqual((result.apps, result.versions), (0, 0))
+        self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "deleted"}})
+        self.assertEqual(json.loads(self.committed("source.json"))["apps"], [])
+
+    def test_gate_takedown_gets_no_tombstone(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes(payload="mentions newly-listed-word"))
+        self.sync()
+        result = self.sync(denylist=DENY + ["newly-listed-word"], rescan=True)
+        self.assertIn(("unpublish", rel["id"]), self.gh.calls)
+        self.assertEqual(self.gh.commits[-1][2], [self.RECORD])
+        self.assertEqual(result.retracted, [])
+        self.assertIsNone(self.committed(self.PATH))
+        self.assertIsNone(self.tombstones())
+        # the next run sees a draft marked blocked and still writes none
+        self.assertFalse(self.sync(denylist=DENY + ["newly-listed-word"]).changed)
+
+    def test_takedown_before_a_head_moved_retry_gets_no_tombstone(self):
+        rel, asset = self.publish(self.TAG, ipa_bytes())
+        self.publish("io.example.demo-v1.3.0", ipa_bytes(short_version="1.3.0"))
+        self.sync()
+        self.gh.releases[rel["id"]]["immutable"] = True  # deleted, not unpublished, when blocked
+        self.git.push_elsewhere({"README.md": b"x\n"})
+        result = self.sync(denylist=DENY + ["demo app"], rescan=True)
+        self.assertEqual(result.attempts, 2)
+        self.assertIn(("delete_release", rel["id"]), self.gh.calls)
+        self.assertNotIn(rel["id"], self.gh.releases)  # the second attempt finds no release at all
+        self.assertEqual(result.retracted, [])
+        self.assertIsNone(self.committed(self.PATH))
+
+    def test_ungated_asset_takedown_gets_no_tombstone(self):
+        rel = self.two_versions()
+        self.gh.add_asset(self.gh.releases[rel["id"]], "build.log", b"log")
+        result = self.sync()
+        self.assertIn(("unpublish", rel["id"]), self.gh.calls)
+        self.assertIn(self.RECORD, self.gh.commits[-1][2])
+        self.assertEqual(result.retracted, [])
+        self.assertIsNone(self.committed(self.PATH))
+
+    def test_blocked_draft_gets_no_tombstone(self):
+        rel = self.two_versions()
+        # an earlier run took it down, but its commit never landed
+        self.gh.releases[rel["id"]].update(draft=True, name="[blocked] " + self.TAG)
+        result = self.sync()
+        self.assertIn(self.RECORD, self.gh.commits[-1][2])
+        self.assertEqual(result.retracted, [])
+        self.assertIsNone(self.committed(self.PATH))
+
+    def test_replacement_left_as_a_draft_gets_no_tombstone(self):
+        self.deps.NormalizeError = FakeNormalizeError
+        rel, asset = self.publish(self.TAG, ipa_bytes())
+        self.sync()
+        # the IPA is swapped by hand for a file that is not in normalized form; publishing it again fails
+        self.gh.delete_asset(asset["id"])
+        self.gh.add_asset(self.gh.releases[rel["id"]], "Demo-1.2.3.ipa", ipa_bytes(junk=True))
+
+        def broken(release_id, prerelease, make_latest="false"):
+            raise ghmod.GhError("PATCH failed (HTTP 500)", status=500)
+
+        self.gh.publish = broken
+        result = self.sync()
+        self.assertTrue(self.gh.releases[rel["id"]]["draft"])
+        self.assertTrue(any("left as a draft for stage-draft" in e for e in result.errors))
+        self.assertEqual(self.gh.commits[-1][2], [self.RECORD])
+        self.assertEqual(result.retracted, [])
+        self.assertIsNone(self.committed(self.PATH))
+
+    def test_publishing_again_removes_the_entry_and_the_empty_file(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        self.sync()
+        self.assertIsNotNone(self.committed(self.PATH))
+        self.publish(self.TAG, ipa_bytes())  # the operator publishes the version again
+        result = self.sync()
+        self.assertEqual(result.restored, [self.TAG])
+        self.assertEqual(result.retracted, [])
+        _, additions, deletions = self.gh.commits[-1]
+        self.assertEqual(deletions, [self.PATH])
+        self.assertIn(self.RECORD, additions)
+        self.assertIsNone(self.committed(self.PATH))
+        self.assertIsNone(self.tombstones())
+        self.assertIn("%s: published again; tombstone removed" % self.TAG, self.log)
+
+    def test_publishing_one_version_again_keeps_the_others(self):
+        rel_a = self.two_versions()
+        rel_b = [r for r in self.gh.releases.values() if r["tag_name"].endswith("1.3.0")][0]
+        del self.gh.releases[rel_a["id"]]
+        self.gh.releases[rel_b["id"]]["draft"] = True
+        result = self.sync()
+        self.assertEqual(sorted(result.retracted), [self.TAG, "io.example.demo-v1.3.0"])
+        self.assertEqual(sorted(self.tombstones()), ["1.2.3", "1.3.0"])
+        self.gh.releases[rel_b["id"]]["draft"] = False
+        result = self.sync()
+        self.assertEqual(result.restored, ["io.example.demo-v1.3.0"])
+        self.assertEqual(self.tombstones(), {"1.2.3": {"date": self.STAMP, "reason": "deleted"}})
+
+    def test_republished_version_taken_down_by_the_gate_keeps_its_tombstone(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        self.sync()
+        self.publish(self.TAG, ipa_bytes(payload="built on leaky-host-0"))
+        result = self.sync()
+        self.assertEqual(result.blocked, [self.TAG])
+        self.assertEqual(result.restored, [])
+        self.assertEqual(sorted(self.tombstones()), ["1.2.3"])
+
+    def test_incomplete_listing_changes_no_tombstone(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        self.sync()
+        before = self.read(self.PATH)
+        self.gh.releases.clear()
+        self.gh.list_error = ghmod.GhError("GET releases failed (HTTP 502)", status=502)
+        self.gh.calls.clear()
+        with self.assertRaises(syncmod.SyncAborted):
+            self.run_sync(now=self.now)
+        self.assertEqual(self.gh.mutations(), [])
+        self.assertEqual(self.read(self.PATH), before)
+        self.assertTrue(os.path.exists(os.path.join(self.root, "apps/io.example.demo/versions/1.3.0.json")))
+
+    def test_runs_are_deterministic(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        self.git.push_elsewhere({"README.md": b"x\n"})
+        clock = iter([self.now(), datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc)])
+        result = self.sync(now=lambda: next(clock))
+        self.assertEqual(result.attempts, 2)  # both attempts plan the same file
+        first = self.committed(self.PATH)
+        self.assertIn(self.STAMP.encode(), first)
+        for _ in range(2):
+            self.gh.calls.clear()
+            again = self.sync(now=lambda: datetime.datetime(2031, 1, 1))
+            self.assertFalse(again.changed)
+            self.assertEqual(self.committed(self.PATH), first)
+            self.assertEqual([c for c in self.gh.mutations()], [])
+
+    def test_existing_file_is_rewritten_in_canonical_form(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        self.sync()
+        messy = json.dumps({"versions": {"1.0.0": {"reason": "deleted", "date": "2026-01-01T00:00:00Z"},
+                                         "1.2.3": {"reason": "deleted", "date": self.STAMP}},
+                            "schemaVersion": 1}).encode()
+        self.git.seed({self.PATH: messy})
+        result = self.sync()
+        self.assertEqual(result.errors, [])
+        self.assertEqual(list(self.tombstones()), ["1.0.0", "1.2.3"])
+        self.assertTrue(self.committed(self.PATH).startswith(b'{\n  "schemaVersion": 1,\n  "versions": {\n'))
+
+    def test_damaged_file_keeps_its_readable_entries(self):
+        rel = self.two_versions()
+        self.git.seed({self.PATH: json.dumps({"schemaVersion": 1, "versions": {
+            "1.0.0": {"date": "2026-01-01T00:00:00Z", "reason": "deleted"},
+            "not-a-version": {"date": "2026-01-01T00:00:00Z", "reason": "deleted"},
+            "1.1.0": {"date": "yesterday", "reason": "deleted"}}}).encode()})
+        del self.gh.releases[rel["id"]]
+        result = self.sync()
+        self.assertEqual(result.errors, [self.PATH + ": 2 invalid part(s) dropped"])
+        self.assertEqual(sorted(self.tombstones()), ["1.0.0", "1.2.3"])
+
+    def test_unreadable_json_is_replaced(self):
+        self.two_versions()
+        self.git.seed({self.PATH: b"{not json"})
+        result = self.sync()
+        self.assertEqual(result.errors, [self.PATH + ": 1 invalid part(s) dropped"])
+        self.assertEqual(self.gh.commits[-1][2], [self.PATH])  # nothing readable was left
+
+    def test_entry_that_fails_the_leak_check_is_dropped_without_naming_it(self):
+        self.two_versions()
+        self.git.seed({self.PATH: retractmod.dumps({
+            "1.0.0-leaky-host-0": {"date": "2026-01-01T00:00:00Z", "reason": "deleted"},
+            "1.0.1": {"date": "2026-01-01T00:00:00Z", "reason": "deleted"}})})
+        result = self.sync()
+        self.assertEqual(result.errors, [self.PATH + ": an entry is blocked (denylist); dropped"])
+        self.assertEqual(list(self.tombstones()), ["1.0.1"])
+        self.assertNotIn("leaky-host-0", "\n".join(self.log) + json.dumps(result.to_dict()))
+
+    def test_withdrawn_version_whose_tag_fails_the_leak_check_gets_no_tombstone(self):
+        tag = "io.example.demo-v1.2.3-later-word"
+        rel = self.gh.add_release(tag)
+        self.gh.add_asset(rel, "Demo-1.2.3.ipa", ipa_bytes())
+        self.sync()
+        del self.gh.releases[rel["id"]]
+        result = self.sync(denylist=DENY + ["later-word"])
+        self.assertEqual(result.errors, ["release %d: tombstone blocked (denylist); not written" % rel["id"]])
+        self.assertIsNone(self.committed(self.PATH))
+        self.assertNotIn("later-word", "\n".join(self.log + result.errors + result.warnings + result.retracted))
+
+    def test_removed_app_directory_is_not_recreated(self):
+        rel, _ = self.publish(self.TAG, ipa_bytes())
+        self.sync()
+        del self.gh.releases[rel["id"]]
+        self.sync()
+        # the operator removes the app: its directory, tombstones included, and every release
+        shutil.rmtree(os.path.join(self.root, "apps", "io.example.demo"))
+        removed = [p for p in self.git.tree if p.startswith("apps/io.example.demo/")]
+        for path in removed:
+            del self.git.tree[path]
+            del self.git.remote_tree[path]
+        result = self.sync()
+        self.assertFalse(result.changed)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "apps", "io.example.demo")))
+
+    def test_dry_run_reports_the_tombstone(self):
+        rel = self.two_versions()
+        del self.gh.releases[rel["id"]]
+        commits = len(self.gh.commits)
+        result = self.run_sync(dry_run=True, now=self.now)
+        self.assertIn(self.PATH, result.files)
+        self.assertIn("would write " + self.PATH, self.log)
+        self.assertEqual(len(self.gh.commits), commits)
+        self.assertIsNone(self.tombstones())
+
+    def test_tombstones_do_not_change_the_listing(self):
+        self.two_versions()
+        source = self.committed("source.json")
+        self.git.seed({self.PATH: retractmod.dumps({"1.3.0": {"date": self.STAMP, "reason": "deleted"}})})
+        result = self.sync()
+        self.assertEqual(result.restored, ["io.example.demo-v1.3.0"])  # published releases are the truth
+        self.assertEqual(self.committed("source.json"), source)
 
 
 class RealNormalizeTests(unittest.TestCase):

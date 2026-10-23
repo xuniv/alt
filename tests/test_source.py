@@ -16,7 +16,7 @@ import tempfile
 import unittest
 import zlib
 
-from altsource import cli, source, tags
+from altsource import cli, retract, source, tags
 from altsource import stage as stagemod
 from altsource import sync as syncmod
 from tests.test_sync import BASE, DENY, FakeGit, FakeGitHub, FakeToolkit, ipa_bytes
@@ -1020,6 +1020,40 @@ class PagesAssemblyTests(unittest.TestCase):
             base = json.loads(fh.read().decode("utf-8"))
         obj, out = self.assemble("base", {"io.example.a": False}, base)
         self.assertDeployed(obj, out)
+
+
+class RetractionTests(SourceCase):
+    """Tombstones (``apps/<bid>/retracted.json``) are a signal for builders, not a generator input."""
+
+    def test_tombstones_do_not_change_the_generated_source(self):
+        self.repo.app(BID, {"name": "Demo"})
+        self.repo.add(record("1.0.0"), record("1.1.0"))
+        before, logs = self.repo.generate()
+        self.repo.write("apps/%s/retracted.json" % BID, retract.dumps({
+            "1.1.0": {"date": "2026-10-23T08:00:00Z", "reason": "deleted"},
+            "0.9.0": {"date": "2026-10-22T08:00:00Z", "reason": "unpublished"}}))
+        after, logs_after = self.repo.generate()
+        self.assertEqual(source.dumps_source(after), source.dumps_source(before))
+        self.assertEqual(logs_after, logs)
+
+    def test_app_with_only_tombstones_is_not_listed(self):
+        self.repo.app(BID)
+        self.repo.write("apps/%s/retracted.json" % BID, b"{damaged")
+        obj, _ = self.repo.generate()
+        self.assertEqual(obj["apps"], [])
+
+
+class CatalogTriggerTests(unittest.TestCase):
+    """Deleting or unpublishing a release starts a catalog run, which drops the version from source.json."""
+
+    def test_release_deleted_and_unpublished_trigger_the_catalog(self):
+        with open(CATALOG_WORKFLOW, encoding="utf-8") as fh:
+            text = fh.read()
+        match = re.search(r"^on:\n(?:(?:  .*)?\n)*?  release:\n    types: \[([^\]]*)\]$", text, re.M)
+        self.assertIsNotNone(match, "catalog.yml has no release trigger with a types list")
+        types = [t.strip() for t in match.group(1).split(",")]
+        self.assertIn("deleted", types)
+        self.assertIn("unpublished", types)
 
 
 def urllib_quote(url):

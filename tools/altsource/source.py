@@ -9,6 +9,9 @@ Inputs, all inside the repository:
 - ``apps/<bid>/versions/<semver>.json``: one record per published release, written by sync;
 - ``site/icon.png``: the icon of last resort, so every app and the source always have an iconURL.
 
+``apps/<bid>/retracted.json`` (tombstones of withdrawn versions, written by sync) is not an input:
+the published releases, through their records, decide what is listed.
+
 The output is strict JSON accepted by AltStore Classic, SideStore, Feather and LiveContainer. One
 malformed app breaks the whole source in those clients, so :func:`validate_source` re-checks the
 generated object against their decoding rules before anything is committed.

@@ -1,9 +1,9 @@
 """Command line entry point: ``python3 -m altsource <command> ...``.
 
-Exit codes: 0 ok, 2 gate rejected, 3 conflict, 1 anything else (including command line usage
-errors, which argparse would otherwise report with 2). Output is limited to rule ids,
-counts, in-IPA relative paths and public catalog data; error details of foreign exceptions are
-withheld when running inside GitHub Actions.
+Exit codes: 0 ok, 2 gate rejected, 3 conflict, 4 not retracted (``retracted`` only), 1 anything
+else (including command line usage errors, which argparse would otherwise report with 2). Output
+is limited to rule ids, counts, in-IPA relative paths and public catalog data; error details of
+foreign exceptions are withheld when running inside GitHub Actions.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import re
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
 
+from . import retract as retractmod
 from .gh import GhError, write_outputs
 from .stage import (
     ARCHIVE_ERRORS,
@@ -41,6 +42,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_REJECTED = 2
 EXIT_CONFLICT = 3
+EXIT_NOT_RETRACTED = 4
 
 RUNNERS = ("xcode-27", "macos-26", "macos-15", "macos-latest")
 DEFAULT_RUNNER = "macos-latest"
@@ -209,6 +211,25 @@ def _stage_outputs(ctx: Context, result: Any) -> None:
         ctx.eprint("warning: %s %s %d" % (warning.get("rule"), warning.get("severity"), warning.get("count", 0)))
 
 
+def _warn_retracted(ctx: Context, root: str, result: Any) -> None:
+    """Warn when a staged version was withdrawn earlier (only called once the gate passed it).
+
+    Staging is an explicit operator action and goes ahead; publishing the version makes the next
+    sync remove its tombstone.
+    """
+    bid, semver = str(getattr(result, "bundle_id", "") or ""), str(getattr(result, "semver", "") or "")
+    if not bid or not semver:
+        return
+    try:
+        retracted = retractmod.is_retracted(root, bid, semver)
+    except retractmod.RetractError:
+        ctx.eprint("warning: the app's retracted.json is not valid; withdrawn versions were not checked")
+        return
+    if retracted:
+        ctx.eprint("warning: this version was withdrawn (retracted.json); once it is published, the next "
+                   "sync removes the tombstone")
+
+
 # -- commands -------------------------------------------------------------------------------------
 
 def cmd_inspect(args, ctx: Context) -> int:
@@ -265,6 +286,7 @@ def cmd_stage(args, ctx: Context) -> int:
         deps=ctx.deps,
     )
     _stage_outputs(ctx, result)
+    _warn_retracted(ctx, args.root, result)
     return EXIT_OK
 
 
@@ -333,6 +355,7 @@ def cmd_stage_draft(args, ctx: Context) -> int:
         else:  # the gate passed the tag
             ctx.print("%s published=%s noop=%s" % (
                 tag, "true" if result.published else "false", "true" if result.noop else "false"))
+        _warn_retracted(ctx, args.root, result)
         staged.append(tag)
     counts: Dict[str, Any] = {"staged": len(staged)} if args.all else {}
     counts.update(rejected=rejected, failed=failed)
@@ -351,6 +374,7 @@ def cmd_sync(args, ctx: Context) -> int:
         ctx.print("commit=%s" % result.commit)
     ctx.print("blocked=%d errors=%d" % (len(result.blocked), len(result.errors)))
     ctx.print("normalized=%d" % len(result.normalized))
+    ctx.print("retracted=%d restored=%d" % (len(result.retracted), len(result.restored)))
     if args.exit_zero:
         return EXIT_OK
     if result.blocked:
@@ -410,6 +434,14 @@ def cmd_validate(args, ctx: Context) -> int:
         for message in errors:
             failed = True
             ctx.print("apps/%s/app.json: %s" % (bid, message))
+    for bid in sorted(os.listdir(apps_dir)) if os.path.isdir(apps_dir) else []:
+        if not os.path.exists(os.path.join(apps_dir, bid, retractmod.FILE_NAME)):
+            continue
+        try:
+            retractmod.read(args.root, bid)
+        except retractmod.RetractError as exc:
+            failed = True
+            ctx.print("apps/%s/%s: %s" % (bid, retractmod.FILE_NAME, exc))
     if failed:
         return EXIT_ERROR
     ctx.eprint("valid")
@@ -450,6 +482,35 @@ def cmd_parse_tag(args, ctx: Context) -> int:
         ctx.print("%s=%s" % (key, value))
     ctx.outputs(values)
     return EXIT_OK
+
+
+def cmd_retracted(args, ctx: Context) -> int:
+    """Exit 0 when ``--version`` of ``--bid`` (without it: any version) is withdrawn, 4 when not.
+
+    In GitHub Actions nothing is printed except errors; elsewhere a short report goes to stdout.
+    A missing ``retracted.json`` means nothing is withdrawn; a malformed one is an error (exit 1),
+    so that callers do not build a version that may have been withdrawn.
+    """
+    try:
+        ctx.deps.make_tag(args.bid, "0.0.0")
+        retractmod.rel_path(args.bid)
+    except errors_of(ctx.deps, "TagError") + (ValueError,):
+        raise CliError("invalid bundle identifier") from None
+    if args.version is not None and not retractmod.is_semver(args.version):
+        raise CliError("version is not a semantic version")
+    try:
+        entries = retractmod.read(args.root, args.bid)
+    except retractmod.RetractError as exc:
+        raise CliError("retracted.json is not valid (%s)" % exc) from None
+    if args.version is not None:
+        found = entries.get(args.version)
+        if not ctx.in_ci:
+            ctx.print("retracted (%s, %s)" % (found["reason"], found["date"]) if found else "not retracted")
+        return EXIT_OK if found else EXIT_NOT_RETRACTED
+    if not ctx.in_ci:
+        for version in sorted(entries, key=lambda v: parse_semver(ctx.deps, v)):
+            ctx.print("%s %s %s" % (version, entries[version]["reason"], entries[version]["date"]))
+    return EXIT_OK if entries else EXIT_NOT_RETRACTED
 
 
 def cmd_alias(args, ctx: Context) -> int:
@@ -683,7 +744,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-home-paths", action="store_true")
     p.set_defaults(func=cmd_scan)
 
-    p = sub.add_parser("stage", parents=[denylist], help="gate an IPA, then draft and publish it")
+    p = sub.add_parser("stage", parents=[denylist, rooted], help="gate an IPA, then draft and publish it")
     p.add_argument("ipa")
     p.add_argument("--bid", help="expected bundle identifier")
     p.add_argument("--semver", help="version for the tag (default: CFBundleShortVersionString)")
@@ -694,7 +755,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-home-paths", action="store_true")
     p.set_defaults(func=cmd_stage)
 
-    p = sub.add_parser("stage-draft", parents=[denylist], help="gate and publish existing drafts")
+    p = sub.add_parser("stage-draft", parents=[denylist, rooted], help="gate and publish existing drafts")
     p.add_argument("tag", nargs="?")
     p.add_argument("--all", action="store_true", help="every pending draft with a grammar tag")
     p.add_argument("--notes-file", metavar="F", help="replace the draft's release notes")
@@ -731,6 +792,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("parse-tag", help="split a release tag into bundle id and semver")
     p.add_argument("tag")
     p.set_defaults(func=cmd_parse_tag)
+
+    p = sub.add_parser("retracted", parents=[rooted], help="whether a version was withdrawn (exit 0) or not "
+                       "(exit 4), from apps/<bid>/retracted.json")
+    p.add_argument("--bid", required=True)
+    p.add_argument("--version", metavar="V", help="semver to check (default: any version of the app)")
+    p.set_defaults(func=cmd_retracted)
 
     p = sub.add_parser("alias", help="secret-name alias for a bundle id")
     p.add_argument("bid")

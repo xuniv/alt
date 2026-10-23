@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-from altsource import cli
+from altsource import cli, retract
 from tests.test_sync import BASE, FakeGit, FakeGitHub, FakeToolkit, ipa_bytes, load_json, write_ipa
 from altsource.sync import dumps_json
 
@@ -322,7 +322,23 @@ class CatalogCommandTests(CliCase):
         self.assertIn("changed=true\n", out)
         self.assertIn("apps=1 versions=1\n", out)
         self.assertIn("normalized=0\n", out)
+        self.assertIn("retracted=0 restored=0\n", out)
         self.assertEqual(self.outputs()["changed"], "true")
+
+    def test_sync_prints_tombstone_counts(self):
+        rel = self.gh.add_release("io.example.demo-v1.2.3")
+        self.gh.add_asset(rel, "Demo.ipa", ipa_bytes())
+        self.assertEqual(self.run_cli("sync", "--root", self.root, git=self.git)[0], 0)
+        self.git.refresh("main")
+        del self.gh.releases[rel["id"]]
+        code, out, err = self.run_cli("sync", "--root", self.root, git=self.git)
+        self.assertEqual(code, 0, err)
+        self.assertIn("retracted=1 restored=0\n", out)
+        self.assertEqual(self.outputs()["retracted"], "1")
+        self.assertIn("io.example.demo-v1.2.3: withdrawn (deleted); tombstone added", err)
+        code, out, _ = self.run_cli("retracted", "--root", self.root, "--bid", "io.example.demo",
+                                    "--version", "1.2.3")
+        self.assertEqual(code, 0)
 
     def test_sync_prints_normalized_count(self):
         rel = self.gh.add_release("io.example.demo-v1.2.3")
@@ -608,6 +624,124 @@ class ResolveBuildTests(CliCase):
         self.assertIn("does not enable privateBuild", err)
         self.assertEqual(self.run_cli("resolve-build", "--bid", "io.example.app-v2", "--ref", "v1.0.0",
                                       "--checkout", self.checkout, "--root", self.root)[0], 1)
+
+
+class RetractedCommandTests(CliCase):
+    BID = "io.example.demo"
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.join(self.dir, "repo")
+        os.makedirs(self.root)
+
+    def tombstones(self, data):
+        path = os.path.join(self.root, "apps", self.BID, "retracted.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+
+    def retracted(self, *extra, ci=False):
+        env = dict(self.env, GITHUB_ACTIONS="true") if ci else self.env
+        return self.run_cli("retracted", "--root", self.root, "--bid", self.BID, *extra, gh=Untouchable(), env=env)
+
+    def test_exit_codes_and_reports(self):
+        self.tombstones(retract.dumps({"1.10.0": {"date": "2026-10-23T08:00:00Z", "reason": "unpublished"},
+                                       "1.2.0": {"date": "2026-10-22T08:00:00Z", "reason": "deleted"}}))
+        self.assertEqual(self.retracted("--version", "1.2.0"), (0, "retracted (deleted, 2026-10-22T08:00:00Z)\n", ""))
+        self.assertEqual(self.retracted("--version", "1.3.0"), (4, "not retracted\n", ""))
+        self.assertEqual(self.retracted(), (0, "1.2.0 deleted 2026-10-22T08:00:00Z\n"
+                                               "1.10.0 unpublished 2026-10-23T08:00:00Z\n", ""))
+
+    def test_nothing_but_the_exit_code_in_ci(self):
+        self.tombstones(retract.dumps({"1.2.0": {"date": "2026-10-22T08:00:00Z", "reason": "deleted"}}))
+        self.assertEqual(self.retracted("--version", "1.2.0", ci=True), (0, "", ""))
+        self.assertEqual(self.retracted("--version", "1.2.1", ci=True), (4, "", ""))
+        self.assertEqual(self.retracted(ci=True), (0, "", ""))
+        self.assertEqual(self.outputs(), {})
+
+    def test_missing_file_means_not_retracted(self):
+        self.assertEqual(self.retracted("--version", "1.0.0", ci=True), (4, "", ""))
+        self.assertEqual(self.retracted(ci=True), (4, "", ""))
+        self.tombstones(retract.dumps({}))
+        self.assertEqual(self.retracted(ci=True), (4, "", ""))
+
+    def test_damaged_file_is_an_error(self):
+        self.tombstones(b'{"schemaVersion": 1, "versions": {"1.0.0": "leaky-host-0"}}')
+        code, out, err = self.retracted("--version", "1.2.0", ci=True)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("retracted.json is not valid", err)
+        self.assertNotIn("leaky-host-0", err)
+
+    def test_invalid_arguments(self):
+        code, _, err = self.run_cli("retracted", "--root", self.root, "--bid", "../leaky-host-0",
+                                    env=dict(self.env, GITHUB_ACTIONS="true"))
+        self.assertEqual(code, 1)
+        self.assertIn("invalid bundle identifier", err)
+        self.assertNotIn("leaky-host-0", err)
+        code, _, err = self.retracted("--version", "v1.0.0")
+        self.assertEqual(code, 1)
+        self.assertIn("not a semantic version", err)
+        self.assertEqual(self.run_cli("retracted", "--root", self.root)[0], 1)  # --bid is required
+
+    def test_module_entry_point(self):
+        self.tombstones(retract.dumps({"1.2.0": {"date": "2026-10-22T08:00:00Z", "reason": "deleted"}}))
+        env = dict(os.environ, PYTHONPATH=TOOLS, GITHUB_ACTIONS="true")
+        for version, code in (("1.2.0", 0), ("1.2.1", 4)):
+            proc = subprocess.run([sys.executable, "-m", "altsource", "retracted", "--root", self.root,
+                                   "--bid", self.BID, "--version", version], capture_output=True, env=env)
+            self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (code, b"", b""))
+
+    def test_validate_reports_a_damaged_file(self):
+        with open(os.path.join(self.root, "source.json"), "w", encoding="utf-8") as fh:
+            json.dump({"apps": []}, fh)
+        self.assertEqual(self.run_cli("validate", "--root", self.root)[0], 0)
+        self.tombstones(retract.dumps({"1.2.0": {"date": "2026-10-22T08:00:00Z", "reason": "deleted"}}))
+        self.assertEqual(self.run_cli("validate", "--root", self.root)[0], 0)
+        self.tombstones(b"[]")
+        code, out, _ = self.run_cli("validate", "--root", self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("apps/io.example.demo/retracted.json: must be an object", out)
+
+
+class RetractedStagingTests(CliCase):
+    """Staging is an explicit operator action: a withdrawn version goes ahead, with a warning."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.join(self.dir, "repo")
+        path = os.path.join(self.root, "apps", "io.example.demo", "retracted.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "wb") as fh:
+            fh.write(retract.dumps({"1.2.3": {"date": "2026-10-22T08:00:00Z", "reason": "deleted"}}))
+
+    def test_stage_warns_about_a_withdrawn_version(self):
+        code, out, err = self.run_cli("stage", self.ipa(), "--root", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("published=true\n", out)
+        self.assertIn("warning: this version was withdrawn", err)
+        code, _, err = self.run_cli("stage", self.ipa("b.ipa", short_version="1.2.4"), "--root", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("withdrawn", err)
+
+    def test_stage_draft_warns_about_a_withdrawn_version(self):
+        rel = self.gh.add_release("io.example.demo-v1.2.3", draft=True)
+        self.gh.add_asset(rel, "a.ipa", ipa_bytes())
+        code, out, err = self.run_cli("stage-draft", "--all", "--root", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("io.example.demo-v1.2.3 published=true", out)
+        self.assertIn("warning: this version was withdrawn", err)
+
+    def test_rejected_ipa_gets_no_warning(self):
+        code, _, err = self.run_cli("stage", self.ipa(payload="leaky-host-0"), "--root", self.root, gh=Untouchable())
+        self.assertEqual(code, 2)
+        self.assertNotIn("withdrawn", err)
+
+    def test_damaged_tombstones_only_warn(self):
+        with open(os.path.join(self.root, "apps", "io.example.demo", "retracted.json"), "wb") as fh:
+            fh.write(b"{")
+        code, _, err = self.run_cli("stage", self.ipa(), "--root", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("retracted.json is not valid", err)
 
 
 class StageDraftLabelTests(CliCase):

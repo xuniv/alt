@@ -28,6 +28,14 @@ unchanged; the error is reported and ``sync --rescan`` tries again. When the old
 verified upload completes the replacement; when that cannot be confirmed, the release is left as a
 draft. Immutable releases are recorded as they are, with a warning. Without gate scanning
 (``scan_published=False``) nothing is normalized.
+
+Sync also keeps the tombstones of withdrawn versions (``apps/<bid>/retracted.json``, see
+:mod:`altsource.retract`). A record that a run drops because no release uses its tag any more is
+remembered as ``deleted``; one whose release is a draft again (and not marked blocked by the gate)
+as ``unpublished``. Records that sync drops itself (a gate block, an ungated asset, a takedown, a
+replacement left as a draft) get no tombstone, and an aborted run writes none. Once a release for a
+withdrawn version is published again, its entry is removed, and the file with its last entry.
+Tombstones never change ``source.json``; builders read them.
 """
 
 from __future__ import annotations
@@ -45,8 +53,9 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from . import retract as retractmod
 from .stage import (
     APP_JSON_MAX_BYTES,
     ARCHIVE_ERRORS,
@@ -82,6 +91,7 @@ TITLE_PATH = "<release-title>"
 ASSET_NAME_PATH = "<asset-name>"
 LABEL_PATH = "<asset-label>"
 RECORD_PATH = "<catalog-record>"
+TOMBSTONE_PATH = "<tombstone>"
 LIST_ATTEMPTS = 2  # listings that decide whether a failed replacement can be undone
 RECORD_RE = re.compile(r"^apps/[^/]+/versions/[^/]+\.json$")
 _WARNING_PREFIX = re.compile(r"^warning:\s*", re.IGNORECASE)
@@ -117,6 +127,8 @@ class SyncResult:
     warnings: List[str] = dataclasses.field(default_factory=list)
     blocked: List[str] = dataclasses.field(default_factory=list)
     normalized: List[str] = dataclasses.field(default_factory=list)  # tags whose IPA was replaced
+    retracted: List[str] = dataclasses.field(default_factory=list)  # tags that got a tombstone
+    restored: List[str] = dataclasses.field(default_factory=list)  # tags whose tombstone was removed
     dry_run: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -246,7 +258,7 @@ def _write_tree(root: str, files: Mapping[str, bytes], deletions: Sequence[str])
 
 class _Run:
     def __init__(self, root, *, gh, deps, denylist, scan_published, policy, dry_run, log, tmp, cache,
-                 rescan=False, sleep=time.sleep):
+                 rescan=False, sleep=time.sleep, taken_down=None):
         self.root = root
         self.rescan = rescan
         self.sleep = sleep
@@ -266,6 +278,12 @@ class _Run:
         # survive a restart after HeadMoved because the next attempt no longer sees the cause
         self.remediations: List[str] = []
         self.normalized: List[str] = []
+        # ids of releases this sync unpublished or deleted itself, shared by every attempt: dropping
+        # their records is not a withdrawal
+        self.taken_down: Set[int] = taken_down if taken_down is not None else set()
+        self.retracted: List[str] = []
+        self.restored: List[str] = []
+        self.tombstone_removals: List[str] = []
         self.desired: Dict[str, bytes] = {}
         self.records: Dict[str, Dict[str, Any]] = {}
         self.ipa_errors = errors_of(deps, "IpaError") + ARCHIVE_ERRORS
@@ -334,6 +352,7 @@ class _Run:
             self.block(tag, "%s; immutable release left in place: allow it in app.json or delete the "
                             "release" % what)
             return
+        self.taken_down.add(int(rel["id"]))  # also when the request fails: it may have taken effect
         if self.dry_run:
             self.block(tag, "%s; would be unpublished" % what)
             return
@@ -671,6 +690,7 @@ class _Run:
         old_name = str(asset.get("name") or "")
         upload_name = _upload_name(name, old_id)
         prerelease = bool(rel.get("prerelease"))
+        self.taken_down.add(rel_id)  # a draft left behind by a failed replacement is not a withdrawal
         try:
             self.gh.unpublish(rel_id)
         except Exception as exc:  # the release is still published with the old IPA
@@ -862,6 +882,110 @@ class _Run:
             seed["allowHomePaths"] = True
         return seed
 
+    # -- tombstones of withdrawn versions ------------------------------------------------------
+
+    def withdrawal(self, record: Dict[str, Any], drafts: Sequence[Dict[str, Any]]) -> Optional[str]:
+        """Why a dropped record's release is gone (a tombstone reason), or None when it is not a withdrawal.
+
+        Only called for records whose tag no published release uses. Releases this sync took down
+        itself and drafts that carry the gate's mark (an earlier run's takedown) do not count.
+        """
+        if _int(record.get("releaseId")) in self.taken_down:
+            return None
+        if any(_int(r.get("id")) in self.taken_down for r in drafts):
+            return None
+        if any(str(r.get("name") or "").startswith(BLOCKED_MARK) for r in drafts):
+            return None
+        return retractmod.UNPUBLISHED if drafts else retractmod.DELETED
+
+    def tombstone_rules(self, path: str, values: Sequence[Any]) -> List[str]:
+        """Blocking rules for the strings of one tombstone (its file path included)."""
+        return _rules(value_findings(self.deps, [path] + list(values), self.denylist, TOMBSTONE_PATH))
+
+    def plan_tombstones(self, existing: Mapping[str, Tuple[str, Dict[str, Any]]],
+                        releases: Sequence[Dict[str, Any]],
+                        published: Sequence[Tuple[Dict[str, Any], str, str, str]], stamp: str) -> None:
+        """Plan every ``apps/<bid>/retracted.json`` once the records of this attempt are known.
+
+        Requires the complete release listing (an incomplete one aborted earlier). A record that is
+        dropped because no published release uses its tag gets an entry dated ``stamp``, unless
+        :meth:`withdrawal` says otherwise. Entries whose version is published again are removed; a
+        file left without entries is deleted. Files are rewritten in canonical form, damaged parts
+        are dropped, and every string is checked like a record: an entry that fails is dropped and
+        reported by rule, without naming it.
+        """
+        published_tags = {tag for _, tag, _, _ in published}
+        live: Dict[Tuple[str, str], str] = {}
+        for rel, tag, bid, semver in published:
+            listed = "apps/%s/versions/%s.json" % (bid, semver) in self.desired
+            if listed or _int(rel.get("id")) not in self.taken_down:
+                live[(bid, semver)] = tag
+        drafts: Dict[str, List[Dict[str, Any]]] = {}
+        for rel in releases:
+            if isinstance(rel, dict) and rel.get("draft"):
+                drafts.setdefault(str(rel.get("tag_name") or ""), []).append(rel)
+
+        added: Dict[str, Dict[str, Tuple[str, Dict[str, str]]]] = {}  # bid -> semver -> (tag, entry)
+        for tag, (path, record) in sorted(existing.items()):
+            if path in self.desired or tag in published_tags:
+                continue  # listed, or still published (kept, skipped or taken down by this run)
+            reason = self.withdrawal(record, drafts.get(tag, []))
+            if reason is None:
+                continue
+            try:
+                bid, semver = (str(x) for x in self.deps.parse_tag(tag))
+                target = retractmod.rel_path(bid)
+            except self.tag_errors:  # RetractError is a ValueError as well
+                continue
+            entry = retractmod.entry(stamp, reason)
+            rules = self.tombstone_rules(target, [tag, semver, entry])
+            if rules:
+                rid = _int(record.get("releaseId"))
+                self.error("%s: tombstone blocked (%s); not written" % (
+                    "release %d" % rid if rid is not None else "a withdrawn version", ", ".join(rules)))
+                continue
+            added.setdefault(bid, {})[semver] = (tag, entry)
+
+        on_disk: Dict[str, str] = {}
+        for full in sorted(glob.glob(os.path.join(self.root, "apps", "*", retractmod.FILE_NAME))):
+            bid = os.path.basename(os.path.dirname(full))
+            try:
+                retractmod.rel_path(bid)
+            except retractmod.RetractError:
+                continue  # not an app directory; left alone
+            on_disk[bid] = full
+        for bid in sorted(set(on_disk) | set(added)):
+            target = retractmod.rel_path(bid)
+            shown = target if not self.tombstone_rules(target, []) else "a tombstone file"
+            entries: Dict[str, Dict[str, str]] = {}
+            if bid in on_disk:
+                try:
+                    with open(on_disk[bid], "rb") as fh:
+                        data = fh.read(retractmod.MAX_BYTES + 1)
+                except OSError as exc:  # local trouble; going on could lose this run's tombstones
+                    raise SyncAborted("%s could not be read (%s); nothing changed"
+                                      % (shown, type(exc).__name__)) from None
+                entries, problems = retractmod.parse_lenient(data)
+                if problems:
+                    self.error("%s: %d invalid part(s) dropped" % (shown, problems))
+                for semver in sorted(entries):
+                    rules = self.tombstone_rules(target, [semver, entries[semver]])
+                    if rules:
+                        del entries[semver]
+                        self.error("%s: an entry is blocked (%s); dropped" % (shown, ", ".join(rules)))
+                    elif (bid, semver) in live:
+                        del entries[semver]
+                        self.restored.append(live[(bid, semver)])
+                        self.log("%s: published again; tombstone removed" % live[(bid, semver)])
+            for semver, (tag, entry) in sorted(added.get(bid, {}).items()):
+                entries[semver] = entry
+                self.retracted.append(tag)
+                self.log("%s: withdrawn (%s); tombstone added" % (tag, entry["reason"]))
+            if entries:
+                self.desired[target] = retractmod.dumps(entries)
+            elif bid in on_disk:
+                self.tombstone_removals.append(target)
+
 
 def _verified(listing: Sequence[Dict[str, Any]], want: str, asset_id: Optional[int],
               name: str) -> Optional[Dict[str, Any]]:
@@ -896,6 +1020,19 @@ def _republished(rel: Dict[str, Any], response: Any) -> Dict[str, Any]:
         out.update(response)
     out["draft"] = False
     return out
+
+
+def _int(value: Any) -> Optional[int]:
+    """``value`` as a release id (None unless it is an integer)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _utc_stamp(now: Optional[Callable[[], datetime.datetime]]) -> str:
+    """``YYYY-MM-DDTHH:MM:SSZ`` of ``now()`` (default: the current time)."""
+    moment = now() if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _text_hits(deps: Any, text: str, denylist: Sequence[str], where: str) -> List[Dict[str, Any]]:
@@ -986,8 +1123,13 @@ def sync(
     output_path: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
     sleep: Callable[[float], None] = time.sleep,
+    now: Optional[Callable[[], datetime.datetime]] = None,
 ) -> SyncResult:
-    """Regenerate every derived file from the published releases and commit the difference."""
+    """Regenerate every derived file from the published releases and commit the difference.
+
+    ``now`` returns the time that new tombstones carry (default: the current time); it is read
+    once, so every attempt of the run plans the same files.
+    """
     root = os.path.abspath(repo_root)
     deps = deps if deps is not None else Toolkit()
     log = log or _stderr_log
@@ -1004,6 +1146,8 @@ def sync(
     from .gh import HeadMoved, write_outputs
 
     result = SyncResult(dry_run=dry_run)
+    stamp = _utc_stamp(now)
+    taken_down: Set[int] = set()
     cache: Dict[int, str] = {}
     carried_blocked: List[str] = []  # remediations of earlier attempts that ended in HeadMoved
     carried_errors: List[str] = []
@@ -1014,7 +1158,7 @@ def sync(
             head = git.head()
             run = _Run(root, gh=gh, deps=deps, denylist=denylist, scan_published=scan_published,
                        policy=policy, dry_run=dry_run, log=log, tmp=tmp, cache=cache, rescan=rescan,
-                       sleep=sleep)
+                       sleep=sleep, taken_down=taken_down)
             try:
                 releases = gh.list_releases()
             except Exception as exc:
@@ -1048,6 +1192,7 @@ def sync(
             run.app_files(published, base)
             for path, record in run.records.items():
                 run.desired[path] = dumps_json(record)
+            run.plan_tombstones(existing, releases, published, stamp)
 
             source = _generate(root, run.desired, deps, pages_base)
             problems = [str(e) for e in (deps.validate_source(source) or [])]
@@ -1065,15 +1210,18 @@ def sync(
 
             tree = git.tree_blobs()
             additions = {p: d for p, d in run.desired.items() if tree.get(p) != git.blob_id(d)}
-            deletions = sorted(p for p in tree if RECORD_RE.match(p) and p not in run.desired)
-            local_deletions = sorted(set(deletions) | {p for p in disk_record_paths(root)
-                                                       if p not in run.desired})
+            removals = set(run.tombstone_removals)
+            deletions = sorted(p for p in tree if (RECORD_RE.match(p) and p not in run.desired) or p in removals)
+            local_deletions = sorted(set(deletions) | removals | {p for p in disk_record_paths(root)
+                                                                  if p not in run.desired})
 
             result.apps, result.versions = _counts(source)
             result.errors = _merged(carried_errors, run.errors)
             result.warnings = list(run.warnings)
             result.blocked = _merged(carried_blocked, run.blocked)
             result.normalized = _merged(carried_normalized, run.normalized)
+            result.retracted = list(run.retracted)
+            result.restored = list(run.restored)
             result.files = sorted(set(additions) | set(deletions))
             result.changed = bool(additions or deletions)
 
@@ -1104,5 +1252,5 @@ def sync(
 
     # written even when releases were blocked: a deploy step keyed on ``commit`` must still run
     write_outputs({"changed": result.changed, "commit": result.commit or "", "blocked": len(result.blocked),
-                   "errors": len(result.errors)}, output_path, env)
+                   "errors": len(result.errors), "retracted": len(result.retracted)}, output_path, env)
     return result
