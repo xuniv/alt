@@ -1,0 +1,15 @@
+{
+  "name": "alt",
+  "identifier": "io.github.xuniv.alt",
+  "subtitle": "Unsigned builds for sideloading",
+  "description": "Unsigned IPA builds published as GitHub Releases. Add this source to AltStore, SideStore or Feather; the store re-signs each app on install.",
+  "website": "https://github.com/xuniv/alt",
+  "tintColor": "5B6CFF",
+  "featuredApps": [],
+  "news": [],
+  "defaults": {
+    "developerName": "xuniv",
+    "category": "utilities",
+    "tintColor": "5B6CFF"
+  }
+}

@@ -1,0 +1,224 @@
+# catalog: regenerate the catalog from the published releases, then deploy the Pages site.
+#
+# Triggers
+#   release              published, edited, unpublished, deleted, released, prereleased. These runs
+#                        only relay a repository_dispatch "catalog" event: release events run on the
+#                        tag ref, which the github-pages environment does not accept for deployments.
+#   repository_dispatch  type "catalog" (the relay above); runs on main.
+#   push                 to main, touching apps/**/app.json, apps/**/icon.png, source.base.json, site/**.
+#   schedule             daily at 04:43 UTC.
+#   workflow_dispatch    input rescan (boolean, default false): download and scan every published IPA
+#                        again, for example after the denylist changed.
+#   workflow_call        used by stage.yml, build.yml and ingest.yml; secret ALT_DENYLIST.
+#
+# Jobs
+#   relay    release events only: requests the repository_dispatch run described above.
+#   sync     runs "sync --exit-zero": commits the derived files (records, missing app.json/icon.png,
+#            source.json) to main through the API and takes down published releases that fail the gate.
+#            Blocked releases do not stop the deploy; the report job fails the run afterwards. Outputs:
+#            changed, commit (empty when nothing was committed), blocked, errors. Only this job uses the
+#            concurrency group alt-catalog; the workflows that call this one serialize their release
+#            writes in the separate group alt-release, so a caller never waits on a group that its own
+#            catalog call needs.
+#   pages    deploys site/, source.json and apps/*/icon.png (Pages source must be "GitHub Actions")
+#            when sync committed a change (or did not report changed=false), and on every push or
+#            manual run (of this workflow or of the workflow that calls it), so a manual run also
+#            repairs a stale site. Deploys share the group alt-pages and wait in line (queue: max);
+#            none is cancelled.
+#   report   runs only when sync reported blocked releases or errors, and fails.
+#
+# Repository secret ALT_DENYLIST (newline separated) is required; sync fails closed without it. Callers
+# pass only this secret.
+name: catalog
+
+on:
+  release:
+    types: [published, edited, unpublished, deleted, released, prereleased]
+  repository_dispatch:
+    types: [catalog]
+  push:
+    branches: [main]
+    paths:
+      - apps/**/app.json
+      - apps/**/icon.png
+      - source.base.json
+      - site/**
+  schedule:
+    - cron: "43 4 * * *"
+  workflow_dispatch:
+    inputs:
+      rescan:
+        description: Scan every published IPA again
+        type: boolean
+        default: false
+  workflow_call:
+    secrets:
+      ALT_DENYLIST:
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  relay:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Request a catalog run on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh api --method POST "repos/$REPO/dispatches" -f event_type=catalog --silent
+
+  sync:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    concurrency:
+      group: alt-catalog
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      commit: ${{ steps.sync.outputs.commit }}
+      blocked: ${{ steps.sync.outputs.blocked }}
+      errors: ${{ steps.sync.outputs.errors }}
+    steps:
+      - name: Validate inputs
+        env:
+          RESCAN: ${{ inputs.rescan }}
+        run: |
+          export LC_ALL=C
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::the catalog is only written from main"
+            exit 1
+          fi
+          if [[ ! "$RESCAN" =~ ^(true|false)?$ ]]; then
+            echo "::error::rescan must be true or false"
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Sync the catalog
+        id: sync
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+          ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}
+          RESCAN: ${{ inputs.rescan }}
+        run: |
+          args=(sync --exit-zero)
+          if [ "$RESCAN" = "true" ]; then
+            args+=(--rescan)
+          fi
+          python3 -m altsource "${args[@]}"
+
+  pages:
+    needs: sync
+    # after a sync commit, and on every push or manual run. changed is checked as well: the runner
+    # withholds a job output in which a masked value occurs, and a withheld output must not skip the
+    # deploy of a commit
+    if: >-
+      needs.sync.outputs.commit != '' || needs.sync.outputs.changed != 'false' ||
+      github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # deploys queue up instead of replacing each other: with the default queue a third pending deploy
+    # cancels the waiting one, and the run that called this workflow would end as cancelled. Each
+    # deploy checks out the current main.
+    concurrency:
+      group: alt-pages
+      cancel-in-progress: false
+      queue: max
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Validate the catalog
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+        run: python3 -m altsource validate
+
+      - name: Assemble the site
+        run: |
+          out="$RUNNER_TEMP/pages"
+          rm -rf "$out"
+          mkdir -p "$out"
+          # source.json falls back to the site icon, so a site without it would serve broken icons
+          if [ ! -d site ] || [ -L site ] || [ ! -f site/icon.png ]; then
+            echo "::error::site/icon.png is missing"
+            exit 1
+          fi
+          if [ -n "$(find site -type l -print -quit)" ]; then
+            echo "::error::site/ must not contain symbolic links"
+            exit 1
+          fi
+          cp -R site/. "$out/"
+          if [ ! -f source.json ] || [ -L source.json ]; then
+            echo "::error::source.json is missing"
+            exit 1
+          fi
+          cp source.json "$out/source.json"
+          icons=0
+          for icon in apps/*/icon.png; do
+            if [ -f "$icon" ] && [ ! -L "$icon" ]; then
+              mkdir -p "$out/$(dirname "$icon")"
+              cp "$icon" "$out/$icon"
+              icons=$((icons + 1))
+            fi
+          done
+          echo "site assembled: source.json and $icons icon(s)"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/pages
+          retention-days: 1
+
+      - name: Deploy the site
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  report:
+    needs: [sync, pages]
+    if: >-
+      !cancelled() && needs.sync.result == 'success' &&
+      (needs.sync.outputs.blocked != '0' || needs.sync.outputs.errors != '0')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Report the sync result
+        env:
+          BLOCKED: ${{ needs.sync.outputs.blocked }}
+          ERRORS: ${{ needs.sync.outputs.errors }}
+        run: |
+          echo "::error::sync reported blocked=${BLOCKED:-unknown} errors=${ERRORS:-unknown}; see the sync job log"
+          exit 1

@@ -1,0 +1,55 @@
+# ci: unit tests and catalog consistency checks.
+#
+# Triggers: push (every branch) and pull_request. No inputs. The job uses no secrets and a read-only
+# token, so pull requests from forks run the same checks. On pull requests, "generate --check" fails
+# when source.json does not match the committed records, app.json files and source.base.json (run
+# generate before proposing curated changes). Pushes skip it: a curated change pushed to main is
+# followed by a catalog run that regenerates source.json. Both catalog checks are skipped until the
+# first sync created source.json.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: tools
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run unit tests
+        run: |
+          python3 --version
+          python3 -m unittest discover -s tests -t .
+
+      - name: Check the generated catalog
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ ! -f source.json ]; then
+            echo "::notice::source.json does not exist yet; catalog checks skipped"
+            exit 0
+          fi
+          if [ "$EVENT" = "pull_request" ]; then
+            python3 -m altsource generate --check
+          fi
+          python3 -m altsource validate

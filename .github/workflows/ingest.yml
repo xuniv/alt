@@ -1,0 +1,240 @@
+# ingest: download an IPA from an https URL, run the gate and publish it (route 3).
+#
+# Triggers
+#   repository_dispatch  type "ingest"; client_payload keys:
+#                          url (required), sha256, semver, notes, bundleIdentifier,
+#                          app (app.json fields attached to the release as app.json; app.allowHomePaths
+#                          turns home-path findings into warnings)
+#                        Any other key is rejected.
+#   workflow_dispatch    inputs url (required), sha256, semver, notes, bundle_id,
+#                        allow_home_paths (boolean, default false)
+#
+# The inputs are read from the event payload file rather than from expressions, so the URL and the
+# notes never appear in a step environment printed to the log; the URL and its host are masked before
+# anything else runs. Limits: sha256 64 hex digits, semver per SemVer 2.0 without build metadata, notes
+# at most 4000 characters, app at most 64 KiB of JSON. The download refuses non-https URLs, userinfo
+# and non-global addresses. The catalog workflow runs after a publication.
+#
+# Repository secret ALT_DENYLIST is required.
+name: ingest
+
+on:
+  repository_dispatch:
+    types: [ingest]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: https URL of the IPA
+        type: string
+        required: true
+      sha256:
+        description: Expected SHA-256 of the download (optional)
+        type: string
+        required: false
+        default: ""
+      semver:
+        description: Version for the tag (default CFBundleShortVersionString)
+        type: string
+        required: false
+        default: ""
+      notes:
+        description: Release notes (optional)
+        type: string
+        required: false
+        default: ""
+      bundle_id:
+        description: Expected bundle identifier (optional)
+        type: string
+        required: false
+        default: ""
+      allow_home_paths:
+        description: Report home paths in the IPA as warnings instead of blocking
+        type: boolean
+        default: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    concurrency:
+      group: alt-release
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      published: ${{ steps.stage.outputs.published }}
+    steps:
+      - name: Read inputs
+        id: inputs
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::ingest only runs on main"
+            exit 1
+          fi
+          python3 - "$RUNNER_TEMP/ingest" <<'PY'
+          import json, os, re, sys, urllib.parse
+
+          SEMVER = r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
+          BID = r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?"
+
+
+          def fail(message):
+              print("::error::" + message)
+              sys.exit(1)
+
+
+          def mask(value):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print("::add-mask::" + escaped)
+
+
+          def text(value, name):
+              if value is None:
+                  return ""
+              if not isinstance(value, str):
+                  fail(name + " must be a string")
+              return value.strip()
+
+
+          out = sys.argv[1]
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+              event = json.load(fh)
+          name = os.environ.get("GITHUB_EVENT_NAME")
+          if name == "workflow_dispatch":
+              src = event.get("inputs") or {}
+              url = src.get("url")
+              values = {"sha256": src.get("sha256"), "semver": src.get("semver"),
+                        "notes": src.get("notes"), "bundle_id": src.get("bundle_id")}
+              allow = src.get("allow_home_paths")
+              if allow not in (None, "", True, False, "true", "false"):
+                  fail("allow_home_paths must be true or false")
+              allow = allow in (True, "true")
+              app = None
+          elif name == "repository_dispatch":
+              src = event.get("client_payload")
+              if not isinstance(src, dict):
+                  fail("client_payload must be an object")
+              url = src.get("url")
+              unknown = set(src) - {"url", "sha256", "semver", "notes", "bundleIdentifier", "app"}
+              if unknown:
+                  fail("client_payload has %d unknown key(s)" % len(unknown))
+              values = {"sha256": src.get("sha256"), "semver": src.get("semver"),
+                        "notes": src.get("notes"), "bundle_id": src.get("bundleIdentifier")}
+              app = src.get("app")
+              if app is not None and not isinstance(app, dict):
+                  fail("app must be an object")
+              allow = isinstance(app, dict) and app.get("allowHomePaths") is True
+          else:
+              fail("unsupported event")
+
+          if not isinstance(url, str) or not url.strip():
+              fail("url is required")
+          url = url.strip()
+          mask(url)
+          if len(url) > 2048 or not re.fullmatch(r"https://[\x21-\x7e]+", url):
+              fail("url must be an https URL of printable ASCII characters")
+          try:
+              parts = urllib.parse.urlsplit(url)
+              host = parts.hostname or ""
+              _ = parts.port
+          except ValueError:
+              fail("url cannot be parsed")
+          if "@" in parts.netloc or not host:
+              fail("url must name a host and carry no user information")
+          if len(host) >= 3:
+              mask(host)
+
+          sha256 = text(values["sha256"], "sha256").lower()
+          if sha256 and not re.fullmatch(r"[0-9a-f]{64}", sha256):
+              fail("sha256 must be 64 hex digits")
+          semver = text(values["semver"], "semver")
+          if semver and (len(semver) > 128 or not re.fullmatch(SEMVER, semver)):
+              fail("semver must be X.Y.Z with an optional pre-release suffix")
+          bid = text(values["bundle_id"], "bundle identifier")
+          if bid and (len(bid) > 155 or not re.fullmatch(BID, bid) or re.search(r"-v\d", bid)):
+              fail("the bundle identifier is not valid")
+          notes = text(values["notes"], "notes")
+          if len(notes) > 4000 or "\0" in notes:
+              fail("notes must be text of at most 4000 characters")
+
+          os.makedirs(out, exist_ok=True)
+          with open(os.path.join(out, "url"), "w", encoding="utf-8") as fh:
+              fh.write(url)
+          with open(os.path.join(out, "notes.txt"), "w", encoding="utf-8") as fh:
+              fh.write(notes)
+          if app is not None:
+              data = json.dumps(app, indent=2, ensure_ascii=False) + "\n"
+              if len(data.encode("utf-8")) > 64 * 1024:
+                  fail("app must be at most 64 KiB of JSON")
+              with open(os.path.join(out, "app.json"), "w", encoding="utf-8") as fh:
+                  fh.write(data)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("sha256=%s\nsemver=%s\nbundle_id=%s\nallow_home_paths=%s\napp=%s\n" % (
+                  sha256, semver, bid, "true" if allow else "false", "true" if app is not None else "false"))
+          print("inputs valid")
+          PY
+
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Download the IPA
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          SHA256: ${{ steps.inputs.outputs.sha256 }}
+        run: |
+          dir="$RUNNER_TEMP/ingest"
+          args=(fetch "$(cat "$dir/url")" "$dir/input.ipa")
+          if [ -n "$SHA256" ]; then
+            args+=(--sha256 "$SHA256")
+          fi
+          python3 -m altsource "${args[@]}" >/dev/null
+          echo "download complete"
+
+      - name: Stage the IPA
+        id: stage
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+          ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}
+          SEMVER: ${{ steps.inputs.outputs.semver }}
+          BID: ${{ steps.inputs.outputs.bundle_id }}
+          ALLOW_HOME_PATHS: ${{ steps.inputs.outputs.allow_home_paths }}
+          HAS_APP: ${{ steps.inputs.outputs.app }}
+        run: |
+          dir="$RUNNER_TEMP/ingest"
+          args=(stage "$dir/input.ipa" --notes-file "$dir/notes.txt")
+          if [ -n "$BID" ]; then
+            args+=(--bid "$BID")
+          fi
+          if [ -n "$SEMVER" ]; then
+            args+=(--semver "$SEMVER")
+          fi
+          if [ "$HAS_APP" = "true" ]; then
+            args+=(--app-json "$dir/app.json")
+          fi
+          if [ "$ALLOW_HOME_PATHS" = "true" ]; then
+            args+=(--allow-home-paths)
+          fi
+          python3 -m altsource "${args[@]}"
+
+  catalog:
+    needs: ingest
+    if: needs.ingest.outputs.published == 'true'
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/catalog.yml
+    secrets:
+      ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}

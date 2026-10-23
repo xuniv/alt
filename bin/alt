@@ -1,0 +1,1324 @@
+#!/usr/bin/env python3
+"""Operator command line for the alt source: ``bin/alt <command> ...``.
+
+Commands publish local or mirrored IPAs through the pre-publication gate, dispatch the build and ingest
+workflows, register private build repositories and manage the optional pre-push hook. Every GitHub
+request goes through the ``gh`` client as an argument array (no shell). ``--dry-run`` still runs
+read-only queries but prints each mutating command instead of running it.
+
+Every command except ``hook uninstall`` first checks that the local denylist exists and that ``gh`` is
+logged in as ``ALT_OWNER`` (default ``xuniv``) with access to ``ALT_REPO`` (default ``xuniv/alt``);
+commands that write also need push access. ``doctor`` reports these checks instead of stopping.
+
+Environment: ``ALT_OWNER``, ``ALT_REPO``, ``ALT_CONFIG_DIR`` (default ``~/.config/xuniv-alt``),
+``ALT_DENYLIST_FILE`` (default ``<config dir>/ipa-denylist``: the terms the gate looks for in IPAs and
+release text, the same list as the ``ALT_DENYLIST`` secret), ``ALT_CACHE_DIR`` (default
+``~/.cache/xuniv-alt``; the hook log lives there).
+
+Exit codes follow ``python3 -m altsource``: 0 ok, 2 gate rejected, 3 conflict, 1 anything else.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fnmatch
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+import zlib
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, TextIO, Tuple
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from altsource import cli as altcli  # noqa: E402
+from altsource.gh import GitHub  # noqa: E402
+from altsource.stage import (  # noqa: E402
+    APP_JSON_MAX_BYTES,
+    NOTES_PATH,
+    Toolkit,
+    check_app_json_text,
+    text_findings,
+    validate_app_json,
+)
+from altsource.sync import dumps_json  # noqa: E402
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_REJECTED = 2
+
+DEFAULT_OWNER = "xuniv"
+DEFAULT_REPO = "xuniv/alt"
+KEY_TITLE = "alt-build"
+STATUS_WORKFLOWS = ("build.yml", "ingest.yml", "stage.yml", "catalog.yml")
+REQUIRED_WORKFLOWS = ("catalog.yml", "stage.yml", "build.yml", "ingest.yml", "poll.yml", "ci.yml")
+REQUIRED_SECRETS = ("ALT_DENYLIST", "ALT_PAYLOAD_IDENTITY")
+REQUIRED_VARIABLES = ("ALT_LOG_RECIPIENT", "ALT_PAYLOAD_RECIPIENT")
+# per-app secrets live in the GitHub environment alt-<ALIAS> under fixed names, so that a workflow job
+# that references them receives no other app's secrets (a computed secrets[...] index ships all of them)
+ENV_PREFIX = "alt-"
+ENV_KEY_SECRET = "ALT_KEY"
+ENV_APP_SECRET = "ALT_APP"
+ENV_BRANCH = "main"
+LEGACY_SECRET_PREFIXES = ("ALT_KEY_", "ALT_APP_")  # per-app repository secrets of earlier versions
+PAYLOAD_SECRET = "ALT_PAYLOAD_IDENTITY"
+PAYLOAD_VARIABLE = "ALT_PAYLOAD_RECIPIENT"
+HOOK_TEMPLATE = os.path.join(REPO_ROOT, "bin", "alt-hook-pre-push")
+HOOK_MARKER = "alt-pre-push-hook"
+HOOK_NAME = "pre-push"
+CHAINED_NAME = "pre-push.alt-chained"
+HOOK_PLACEHOLDERS = ("ALT_BIN", "ALT_BID", "ALT_TAG_GLOB")
+SECRET_MAX_BYTES = 48 * 1024
+DISPATCH_MAX_BYTES = 64 * 1024
+NOTES_MAX_CHARS = 4000  # the limit ingest.yml and build.yml apply to release notes
+GH_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1", "GH_PAGER": "",
+          "GH_SPINNER_DISABLED": "1"}
+
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+BID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
+REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+/-]{0,199}$")
+GLOB_RE = re.compile(r"^[A-Za-z0-9._*?/+!\[\]-]{1,100}$")
+SHA256_RE = re.compile(r"^[0-9A-Fa-f]{64}$")
+PUBKEY_RE = re.compile(r"^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$")
+AGE_RECIPIENT_RE = re.compile(r"^age1[0-9a-z]{20,200}$")
+AGE_IDENTITY_RE = re.compile(r"^AGE-SECRET-KEY-1[0-9A-Z]{20,200}$")
+RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+class OpError(Exception):
+    """A failure whose message is safe to print; ``code`` is the exit status."""
+
+    def __init__(self, message: str, code: int = EXIT_ERROR):
+        super().__init__(message)
+        self.code = code
+
+
+class UsageError(Exception):
+    def __init__(self, usage: str, message: str):
+        super().__init__(message)
+        self.usage = usage
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str):  # type: ignore[override]
+        raise UsageError(self.format_usage(), message)
+
+
+# -- settings and context ---------------------------------------------------------------------------
+
+class Settings:
+    def __init__(self, environ: Mapping[str, str]):
+        home = environ.get("HOME") or os.path.expanduser("~")
+        self.owner = environ.get("ALT_OWNER") or DEFAULT_OWNER
+        self.repo = environ.get("ALT_REPO") or DEFAULT_REPO
+        self.config_dir = environ.get("ALT_CONFIG_DIR") or os.path.join(home, ".config", "xuniv-alt")
+        self.denylist_file = environ.get("ALT_DENYLIST_FILE") or os.path.join(self.config_dir, "ipa-denylist")
+        self.identity_file = os.path.join(self.config_dir, "log-identity.txt")
+        self.cache_dir = environ.get("ALT_CACHE_DIR") or os.path.join(home, ".cache", "xuniv-alt")
+
+
+class Gh:
+    """Runs ``gh`` with an argument array; with ``dry_run`` mutating calls are printed instead."""
+
+    def __init__(self, environ: Mapping[str, str], out: TextIO, dry_run: bool):
+        self.environ = environ
+        self.out = out
+        self.dry_run = dry_run
+
+    def __call__(self, args: Sequence[str], *, write: bool = False, input: Optional[bytes] = None,
+                 stdin_path: Optional[str] = None, display: Optional[str] = None,
+                 check: bool = True) -> "subprocess.CompletedProcess[bytes]":
+        cmd = ["gh"] + [str(a) for a in args]
+        if write and self.dry_run:
+            self.out.write("+ %s\n" % (display or shlex.join(cmd)))
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+        env = dict(self.environ)
+        env.update(GH_ENV)
+        try:
+            if stdin_path is not None:
+                with open(stdin_path, "rb") as fh:
+                    proc = subprocess.run(cmd, stdin=fh, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            elif input is not None:
+                proc = subprocess.run(cmd, input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            else:
+                proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, env=env)
+        except FileNotFoundError:
+            raise OpError("gh is not installed") from None
+        if check and proc.returncode != 0:
+            raise OpError("gh %s failed: %s" % (" ".join(cmd[1:3]), _last_line(proc.stderr)))
+        return proc
+
+    def json(self, args: Sequence[str], **kwargs: Any) -> Any:
+        proc = self(args, **kwargs)
+        text = (proc.stdout or b"").decode("utf-8", "replace").strip()
+        try:
+            return json.loads(text) if text else None
+        except ValueError:
+            raise OpError("gh %s returned invalid JSON" % " ".join(str(a) for a in args[:2])) from None
+
+
+class Ctx:
+    def __init__(self, *, environ: Mapping[str, str], out: TextIO, err: TextIO, dry_run: bool, deps: Any,
+                 root: str, stage_gh: Any):
+        self.environ = environ
+        self.out = out
+        self.err = err
+        self.dry_run = dry_run
+        self.deps = deps
+        self.root = root
+        self.settings = Settings(environ)
+        self.gh = Gh(environ, out, dry_run)
+        self._stage_gh = stage_gh
+
+    def print(self, text: str = "") -> None:
+        self.out.write(text + "\n")
+
+    def warn(self, text: str) -> None:
+        self.err.write("alt: warning: %s\n" % text)
+
+    def plan(self, text: str) -> None:
+        """A planned step that --dry-run skips."""
+        self.out.write("+ %s\n" % text)
+
+    def stage_gh(self) -> Any:
+        if self._stage_gh is None:
+            self._stage_gh = GitHub(self.settings.repo)
+        return self._stage_gh
+
+    def tool(self, cmd: Sequence[str], *, input: Optional[bytes] = None,
+             what: Optional[str] = None) -> "subprocess.CompletedProcess[bytes]":
+        """Run a local program (not gh); output is captured and never echoed."""
+        kwargs: Dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "env": dict(self.environ)}
+        if input is None:
+            kwargs["stdin"] = subprocess.DEVNULL
+        else:
+            kwargs["input"] = input
+        try:
+            return subprocess.run(list(cmd), **kwargs)
+        except FileNotFoundError:
+            raise OpError("%s is not installed" % (what or cmd[0])) from None
+
+
+def _last_line(data: Optional[bytes]) -> str:
+    lines = [line.strip() for line in (data or b"").decode("utf-8", "replace").splitlines() if line.strip()]
+    return lines[-1][:300] if lines else "no details"
+
+
+# -- validation helpers -----------------------------------------------------------------------------
+
+def check_repo(repo: str, what: str = "repository") -> str:
+    if not isinstance(repo, str) or not REPO_RE.match(repo) or repo.split("/")[1] in (".", ".."):
+        raise OpError("%s must look like OWNER/REPO" % what)
+    return repo
+
+
+def check_bid(bid: str) -> str:
+    """Bundle identifier per the tag grammar; also keeps it safe inside the hook script."""
+    if not BID_RE.match(bid or "") or len(bid) > 255 or re.search(r"-v\d", bid):
+        raise OpError("invalid bundle identifier")
+    return bid
+
+
+def check_ref(ref: str, what: str = "ref") -> str:
+    if (not REF_RE.match(ref or "") or ".." in ref or "//" in ref or ref.endswith(("/", ".", ".lock"))
+            or "/." in ref):
+        raise OpError("invalid %s" % what)
+    return ref
+
+
+def check_semver(semver: Optional[str]) -> Optional[str]:
+    if semver is not None and not re.fullmatch(altcli.SEMVER_PATTERN, semver):
+        raise OpError("--semver must be a semantic version such as 1.2.3 or 1.2.3-beta.1")
+    return semver
+
+
+def check_file(path: Optional[str], what: str) -> Optional[str]:
+    if path is not None and not os.path.isfile(path):
+        raise OpError("%s not found" % what)
+    return path
+
+
+def read_limited(path: str, limit: int, what: str) -> bytes:
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(limit + 1)
+    except OSError:
+        raise OpError("%s cannot be read" % what) from None
+    if len(raw) > limit:
+        raise OpError("%s is too large" % what)
+    return raw
+
+
+def load_json_file(path: str, what: str, limit: int = APP_JSON_MAX_BYTES) -> Any:
+    try:
+        return json.loads(read_limited(path, limit, what).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise OpError("%s is not valid JSON" % what) from None
+
+
+def app_json_path(ctx: Ctx, bid: str) -> str:
+    return os.path.join(ctx.root, "apps", bid, "app.json")
+
+
+def private_build_enabled(ctx: Ctx, bid: str) -> bool:
+    try:
+        app = load_json_file(app_json_path(ctx, bid), "app.json")
+    except OpError:
+        return False
+    pb = app.get("privateBuild") if isinstance(app, dict) else None
+    return isinstance(pb, dict) and pb.get("enabled") is True
+
+
+def private_apps(ctx: Ctx) -> List[str]:
+    apps_dir = os.path.join(ctx.root, "apps")
+    names = sorted(os.listdir(apps_dir)) if os.path.isdir(apps_dir) else []
+    return [bid for bid in names if BID_RE.match(bid) and private_build_enabled(ctx, bid)]
+
+
+# -- preflight --------------------------------------------------------------------------------------
+
+def load_denylist(ctx: Ctx) -> List[str]:
+    path = ctx.settings.denylist_file
+    if not os.path.isfile(path):
+        raise OpError("local denylist not found (create it or set ALT_DENYLIST_FILE); refusing to continue")
+    try:
+        return altcli.load_denylist(path, {})
+    except altcli.CliError as exc:
+        raise OpError("local denylist: %s" % exc) from None
+
+
+def assert_login(ctx: Ctx) -> None:
+    proc = ctx.gh(["api", "user", "--jq", ".login"], check=False)
+    if proc.returncode != 0:
+        raise OpError("gh is not logged in (run gh auth login)")
+    login = proc.stdout.decode("utf-8", "replace").strip()
+    if login.lower() != ctx.settings.owner.lower():
+        # the other account name is not repeated: it may be personal
+        raise OpError("gh is not logged in as %s; switch accounts first" % ctx.settings.owner)
+
+
+def assert_repo(ctx: Ctx, write: bool) -> None:
+    repo = check_repo(ctx.settings.repo, "ALT_REPO")
+    info = ctx.gh.json(["api", "repos/" + repo])
+    if not isinstance(info, dict) or str(info.get("full_name", "")).lower() != repo.lower():
+        raise OpError("%s is not accessible under that name" % repo)
+    perms = info.get("permissions") if isinstance(info.get("permissions"), dict) else {}
+    if write and perms.get("push") is not True:
+        raise OpError("the logged-in account cannot push to %s" % repo)
+
+
+def preflight(ctx: Ctx, *, write: bool = True) -> List[str]:
+    """Denylist present, gh logged in as ALT_OWNER, ALT_REPO reachable. Returns the denylist."""
+    denylist = load_denylist(ctx)
+    assert_login(ctx)
+    assert_repo(ctx, write)
+    return denylist
+
+
+# -- publish / mirror -------------------------------------------------------------------------------
+
+def _kv(text: str) -> Dict[str, str]:
+    values = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and re.match(r"^[a-z_]+$", key):
+            values[key] = value
+    return values
+
+
+def _stage_environ(ctx: Ctx) -> Dict[str, str]:
+    env = {k: v for k, v in ctx.environ.items()
+           if k not in ("GITHUB_OUTPUT", "GITHUB_ACTIONS", "ALT_DENYLIST")}
+    env["ALT_REPO"] = ctx.settings.repo
+    return env
+
+
+def publish_ipa(ctx: Ctx, ipa: str, *, semver: Optional[str], notes_file: Optional[str], defer: bool) -> int:
+    """Local gate + draft upload through ``altsource stage --no-publish``, then dispatch stage.yml."""
+    repo = ctx.settings.repo
+    argv = ["stage", ipa, "--no-publish", "--denylist-file", ctx.settings.denylist_file]
+    if semver:
+        argv += ["--semver", semver]
+    if notes_file:
+        argv += ["--notes-file", notes_file]
+    if ctx.dry_run:
+        argv.append("--dry-run")
+    buf = io.StringIO()
+    code = altcli.main(argv, deps=ctx.deps, gh=None if ctx.dry_run else ctx.stage_gh(),
+                       environ=_stage_environ(ctx), out=buf, err=ctx.err)
+    ctx.out.write(buf.getvalue())
+    if code != EXIT_OK:
+        return code
+    values = _kv(buf.getvalue())
+    tag = values.get("tag", "")
+    if not tag:
+        raise OpError("stage reported no tag")
+    if values.get("noop") == "true":
+        ctx.print("%s is already published with this IPA; nothing to do" % tag)
+        return EXIT_OK
+    if ctx.dry_run:
+        ctx.plan("gh api --method POST repos/%s/releases --input -  # draft %s" % (repo, tag))
+        ctx.plan("gh api --method POST https://uploads.github.com/repos/%s/releases/<id>/assets?name=%s"
+                 % (repo, urllib.parse.quote(values.get("asset", ""), safe="")))
+    if defer:
+        ctx.print("draft %s waits for the next scheduled stage run" % tag)
+        return EXIT_OK
+    proc = ctx.gh(["workflow", "run", "stage.yml", "-R", repo, "-f", "tag=" + tag], write=True)
+    if not ctx.dry_run:
+        ctx.print("dispatched stage.yml for %s" % tag)
+        _echo(ctx, proc)
+    return EXIT_OK
+
+
+def _echo(ctx: Ctx, proc: "subprocess.CompletedProcess[bytes]") -> None:
+    for line in (proc.stdout or b"").decode("utf-8", "replace").splitlines():
+        if line.strip():
+            ctx.print("  " + line.strip())
+
+
+def cmd_publish(args: argparse.Namespace, ctx: Ctx) -> int:
+    check_file(args.ipa, "IPA")
+    check_semver(args.semver)
+    check_file(args.notes_file, "notes file")
+    preflight(ctx)
+    return publish_ipa(ctx, args.ipa, semver=args.semver, notes_file=args.notes_file, defer=args.defer)
+
+
+def cmd_mirror(args: argparse.Namespace, ctx: Ctx) -> int:
+    repo = check_repo(args.repo)
+    tag = check_ref(args.tag, "tag")
+    check_semver(args.semver)
+    check_file(args.notes_file, "notes file")
+    preflight(ctx)
+    rel = ctx.gh.json(["api", "repos/%s/releases/tags/%s" % (repo, urllib.parse.quote(tag, safe=""))])
+    assets = rel.get("assets") if isinstance(rel, dict) else None
+    ipas = [a for a in assets or [] if isinstance(a, dict) and fnmatch.fnmatchcase(str(a.get("name", "")), "*.ipa")]
+    if len(ipas) != 1:
+        raise OpError("the release must carry exactly one *.ipa asset (found %d)" % len(ipas))
+    if ipas[0].get("state", "uploaded") != "uploaded":
+        raise OpError("the release's IPA asset is not fully uploaded")
+    with private_tempdir("alt-mirror-") as tmp:
+        # only the IPA: release notes and other assets (symbols, archives) stay private
+        ctx.gh(["release", "download", tag, "-R", repo, "--pattern", "*.ipa", "--dir", tmp])
+        files = sorted(os.listdir(tmp))
+        if len(files) != 1 or not files[0].endswith(".ipa") or not os.path.isfile(os.path.join(tmp, files[0])):
+            raise OpError("download did not produce exactly one IPA")
+        return publish_ipa(ctx, os.path.join(tmp, files[0]), semver=args.semver, notes_file=args.notes_file,
+                           defer=args.defer)
+
+
+# -- build / ingest ---------------------------------------------------------------------------------
+
+def cmd_build(args: argparse.Namespace, ctx: Ctx) -> int:
+    bid = check_bid(args.bid)
+    ref = check_ref(args.ref)
+    preflight(ctx)
+    if not private_build_enabled(ctx, bid):
+        ctx.warn("apps/%s/app.json in this checkout does not enable privateBuild; the build will refuse "
+                 "it unless main does" % bid)
+    publish = "false" if args.no_publish else "true"
+    proc = ctx.gh(["workflow", "run", "build.yml", "-R", ctx.settings.repo, "-f", "app=" + bid,
+                   "-f", "ref=" + ref, "-f", "publish=" + publish], write=True)
+    if not ctx.dry_run:
+        ctx.print("dispatched build.yml: app=%s ref=%s publish=%s" % (bid, ref, publish))
+        _echo(ctx, proc)
+    return EXIT_OK
+
+
+def check_url(url: str) -> str:
+    if not isinstance(url, str) or len(url) > 2048 or any(ord(c) <= 32 or ord(c) == 127 for c in url):
+        raise OpError("invalid URL")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        _ = parts.port
+    except ValueError:
+        raise OpError("invalid URL") from None
+    if parts.scheme != "https" or not parts.hostname:
+        raise OpError("the URL must be an absolute https URL")
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise OpError("the URL must not carry credentials")
+    return url
+
+
+def _rejected(ctx: Ctx, findings: Sequence[Dict[str, Any]], denylist: Sequence[str], what: str) -> int:
+    """Report rule ids, counts and redacted paths, never the matched text."""
+    ctx.err.write("gate rejected: %s\n" % what)
+    for finding in findings:
+        ctx.err.write("%s %s %d\n" % (finding.get("rule"), finding.get("severity"), int(finding.get("count") or 0)))
+        for path in finding.get("paths") or []:
+            ctx.err.write("  %s\n" % altcli.safe_path(str(path), denylist))
+    return EXIT_REJECTED
+
+
+def cmd_ingest(args: argparse.Namespace, ctx: Ctx) -> int:
+    url = check_url(args.url)
+    if args.sha256 is not None and not SHA256_RE.match(args.sha256):
+        raise OpError("--sha256 must be 64 hex digits")
+    check_semver(args.semver)
+    check_file(args.notes_file, "notes file")
+    check_file(args.app_json, "app.json file")
+    denylist = preflight(ctx)
+    payload: Dict[str, Any] = {"url": url}
+    if args.sha256:
+        payload["sha256"] = args.sha256.lower()
+    if args.semver:
+        payload["semver"] = args.semver
+    if args.notes_file:
+        try:
+            notes = read_limited(args.notes_file, 32 * 1024, "notes file").decode("utf-8").strip()
+        except UnicodeDecodeError:
+            raise OpError("notes file is not UTF-8 text") from None
+        if len(notes) > NOTES_MAX_CHARS or "\0" in notes:
+            raise OpError("release notes must be text of at most %d characters" % NOTES_MAX_CHARS)
+        findings = text_findings(ctx.deps, notes, denylist, NOTES_PATH)
+        if findings:
+            return _rejected(ctx, findings, denylist, "release notes")
+        if notes:
+            payload["notes"] = notes
+    if args.app_json:
+        raw = read_limited(args.app_json, APP_JSON_MAX_BYTES, "app.json file")
+        app, findings = check_app_json_text(ctx.deps, raw, denylist)
+        if findings or app is None:
+            return _rejected(ctx, findings, denylist, "app.json")
+        payload["app"] = app
+    body = json.dumps({"event_type": "ingest", "client_payload": payload}, ensure_ascii=False,
+                      sort_keys=True).encode("utf-8")
+    if len(body) >= DISPATCH_MAX_BYTES:
+        raise OpError("the dispatch payload is too large")
+    path = "repos/%s/dispatches" % ctx.settings.repo
+    ctx.gh(["api", "--method", "POST", path, "--input", "-"], input=body, write=True,
+           display="gh api --method POST %s --input -  # event_type=ingest, client_payload: %s"
+                   % (path, ", ".join(sorted(payload))))
+    if not ctx.dry_run:
+        ctx.print("dispatched ingest (%s)" % ", ".join(sorted(payload)))
+    return EXIT_OK
+
+
+# -- register / unregister --------------------------------------------------------------------------
+
+def validate_build_config(obj: Any) -> Dict[str, Any]:
+    """Check a registered build configuration with the rules of ``altsource resolve-build``."""
+    try:
+        section = altcli._build_section(obj, "build config", reveal=True)
+        if "runner" in section and section["runner"] not in altcli.RUNNERS:
+            raise altcli.CliError("runner must be one of %s" % ", ".join(altcli.RUNNERS))
+        if "xcode" in section:
+            xcode = section["xcode"]
+            if not isinstance(xcode, str) or (xcode and not altcli.XCODE_RE.match(xcode)):
+                raise altcli.CliError("xcode must look like 27 or 27.0 or 27.0.1")
+        if "setup" in section:
+            setup = section["setup"]
+            setup = setup.split() if isinstance(setup, str) else setup
+            if not isinstance(setup, list) or not all(isinstance(s, str) and s in altcli.SETUP_TOOLS
+                                                      for s in setup):
+                raise altcli.CliError("setup may only list %s" % ", ".join(altcli.SETUP_TOOLS))
+        if "command" in section:
+            command = section["command"]
+            if not isinstance(command, str) or not command.strip() or len(command) > 8192 or "\0" in command:
+                raise altcli.CliError("command must be a non-empty string")
+        if "ipa_glob" in section:
+            altcli._validate_glob(section["ipa_glob"])
+        if "env" in section:
+            altcli._validate_env(section["env"], reveal=True)
+    except altcli.CliError as exc:
+        raise OpError(str(exc)) from None
+    return section
+
+
+def _deploy_keys(ctx: Ctx, repo: str) -> List[Dict[str, Any]]:
+    keys = ctx.gh.json(["api", "repos/%s/keys?per_page=100" % repo])
+    if not isinstance(keys, list):
+        raise OpError("unexpected deploy key listing")
+    return [k for k in keys if isinstance(k, dict) and k.get("title") == KEY_TITLE and isinstance(k.get("id"), int)]
+
+
+def _delete_key(ctx: Ctx, repo: str, key_id: int) -> None:
+    ctx.gh(["api", "--method", "DELETE", "repos/%s/keys/%d" % (repo, key_id)], write=True)
+
+
+def _secret_names(ctx: Ctx, environment: Optional[str] = None) -> List[str]:
+    args = ["secret", "list", "-R", ctx.settings.repo, "--json", "name"]
+    if environment is not None:
+        args[2:2] = ["--env", environment]
+    data = ctx.gh.json(args)
+    return [str(s.get("name")) for s in data or [] if isinstance(s, dict)]
+
+
+def _variable_names(ctx: Ctx) -> List[str]:
+    data = ctx.gh.json(["variable", "list", "-R", ctx.settings.repo, "--json", "name"])
+    return [str(v.get("name")) for v in data or [] if isinstance(v, dict)]
+
+
+def env_name(alias: str) -> str:
+    """The GitHub environment that holds an app's ALT_KEY and ALT_APP secrets."""
+    return ENV_PREFIX + alias
+
+
+def _env_path(ctx: Ctx, environment: str) -> str:
+    return "repos/%s/environments/%s" % (ctx.settings.repo, urllib.parse.quote(environment, safe=""))
+
+
+def _get_environment(ctx: Ctx, environment: str) -> Optional[Dict[str, Any]]:
+    """The environment, or None when it does not exist."""
+    proc = ctx.gh(["api", _env_path(ctx, environment)], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        info = json.loads(proc.stdout.decode("utf-8", "replace") or "null")
+    except ValueError:
+        raise OpError("gh api returned invalid JSON for environment %s" % environment) from None
+    return info if isinstance(info, dict) else None
+
+
+def _branch_policies(ctx: Ctx, environment: str) -> List[Dict[str, Any]]:
+    data = ctx.gh.json(["api", _env_path(ctx, environment) + "/deployment-branch-policies?per_page=100"])
+    policies = data.get("branch_policies") if isinstance(data, dict) else None
+    return [p for p in policies or [] if isinstance(p, dict)]
+
+
+def ensure_environment(ctx: Ctx, environment: str) -> None:
+    """Create or update ``environment`` so that only ``main`` may use its secrets."""
+    body = {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
+    ctx.gh(["api", "--method", "PUT", _env_path(ctx, environment), "--input", "-"],
+           input=json.dumps(body).encode("utf-8"), write=True)
+    if ctx.dry_run and _get_environment(ctx, environment) is None:
+        policies: List[Dict[str, Any]] = []
+    else:
+        policies = _branch_policies(ctx, environment)
+    if not any(p.get("name") == ENV_BRANCH and p.get("type", "branch") == "branch" for p in policies):
+        ctx.gh(["api", "--method", "POST", _env_path(ctx, environment) + "/deployment-branch-policies",
+                "-f", "name=" + ENV_BRANCH, "-f", "type=branch"], write=True)
+    if not ctx.dry_run:
+        ctx.print("environment %s allows deployments from %s only" % (environment, ENV_BRANCH))
+
+
+def _legacy_secrets(names: Sequence[str], alias: Optional[str] = None) -> List[str]:
+    if alias is not None:
+        return [n for n in names if n in tuple(p + alias for p in LEGACY_SECRET_PREFIXES)]
+    return sorted(n for n in names if n.startswith(LEGACY_SECRET_PREFIXES))
+
+
+@contextlib.contextmanager
+def private_tempdir(prefix: str, *, shred: bool = False) -> Iterator[str]:
+    """A temporary directory created and used under umask 077; removed (optionally shredded) on exit."""
+    previous = os.umask(0o077)
+    try:
+        tmp = tempfile.mkdtemp(prefix=prefix)
+        try:
+            yield tmp
+        finally:
+            if shred:
+                _shred(tmp)
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        os.umask(previous)
+
+
+def _shred(path: str) -> None:
+    """Overwrite and remove every file below ``path``, then the directory itself."""
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            target = os.path.join(dirpath, name)
+            try:
+                if not os.path.islink(target):
+                    size = os.path.getsize(target)
+                    with open(target, "r+b") as fh:
+                        fh.write(b"\0" * size)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+            except OSError:
+                pass
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _planned_app_json(ctx: Ctx, bid: str, tag_pattern: Optional[str]) -> Tuple[Dict[str, Any], bool]:
+    """(new app.json object, whether it changes) with privateBuild enabled."""
+    path = app_json_path(ctx, bid)
+    app: Dict[str, Any] = {}
+    if os.path.exists(path):
+        loaded = load_json_file(path, "apps/%s/app.json" % bid)
+        errors = validate_app_json(loaded)
+        if errors:
+            raise OpError("apps/%s/app.json: %s; fix it first" % (bid, errors[0]))
+        app = loaded
+    new = dict(app)
+    pb = dict(new.get("privateBuild") or {}) if isinstance(new.get("privateBuild"), dict) else {}
+    pb["enabled"] = True
+    if tag_pattern:
+        pb["tagPattern"] = tag_pattern
+    new["privateBuild"] = pb
+    errors = validate_app_json(new)
+    if errors:
+        raise OpError("apps/%s/app.json: %s" % (bid, errors[0]))
+    return new, new != app or not os.path.exists(path)
+
+
+def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
+    repo = check_repo(args.repo)
+    bid = check_bid(args.bid)
+    if args.tag_pattern is not None:
+        try:
+            compiled = re.compile(args.tag_pattern)
+        except re.error:
+            raise OpError("--tag-pattern is not a valid regular expression") from None
+        if "version" not in compiled.groupindex:
+            raise OpError("--tag-pattern needs a named group 'version'")
+    config: Dict[str, Any] = {"repo": repo}
+    if args.build_json:
+        build = validate_build_config(load_json_file(args.build_json, "build config", altcli.BUILD_CONFIG_MAX_BYTES))
+        if build:
+            config["build"] = build
+    config_json = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(config_json) > SECRET_MAX_BYTES:
+        raise OpError("the build configuration is too large for a secret")
+    app, app_changed = _planned_app_json(ctx, bid, args.tag_pattern)
+    preflight(ctx)
+    alias = ctx.deps.alias_for(bid)
+    environment = env_name(alias)
+    alt_repo = ctx.settings.repo
+
+    old = _deploy_keys(ctx, repo)
+    if old and not args.rotate:
+        raise OpError("%s already has a deploy key titled %s; pass --rotate to replace it" % (repo, KEY_TITLE))
+    ensure_environment(ctx, environment)
+    for key in old:
+        _delete_key(ctx, repo, key["id"])
+    legacy = _legacy_secrets(_secret_names(ctx), alias)
+
+    if ctx.dry_run:
+        ctx.plan("ssh-keygen -q -t ed25519 -N '' -C '' -f <temporary directory>/key")
+        ctx.plan("gh api --method POST repos/%s/keys -f title=%s -F read_only=true -f key=<public key>"
+                 % (repo, KEY_TITLE))
+        ctx.plan("gh secret set %s --env %s -R %s < <private key>" % (ENV_KEY_SECRET, environment, alt_repo))
+        ctx.plan("gh secret set %s --env %s -R %s < <app config: %s>"
+                 % (ENV_APP_SECRET, environment, alt_repo, ", ".join(sorted(config))))
+        for name in legacy:
+            ctx.plan("gh secret delete %s -R %s" % (name, alt_repo))
+        if app_changed:
+            ctx.plan("write apps/%s/app.json with privateBuild.enabled" % bid)
+        return EXIT_OK
+
+    with private_tempdir("alt-key-", shred=True) as tmp:
+        keyfile = os.path.join(tmp, "key")
+        proc = ctx.tool(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", keyfile])
+        if proc.returncode != 0 or not os.path.isfile(keyfile):
+            raise OpError("ssh-keygen failed (exit %d)" % proc.returncode)
+        with open(keyfile + ".pub", encoding="ascii") as fh:
+            public = fh.read().strip()
+        if not PUBKEY_RE.match(public):
+            raise OpError("ssh-keygen produced an unexpected public key")
+        uploaded: Optional[int] = None
+        try:
+            created = ctx.gh.json(["api", "--method", "POST", "repos/%s/keys" % repo, "-f", "title=" + KEY_TITLE,
+                                   "-F", "read_only=true", "-f", "key=" + public], write=True)
+            if isinstance(created, dict) and isinstance(created.get("id"), int):
+                uploaded = created["id"]
+            if not isinstance(created, dict) or created.get("read_only") is not True or uploaded is None:
+                raise OpError("GitHub did not confirm a read-only deploy key")
+            ctx.print("deploy key %s added to %s (read-only)" % (KEY_TITLE, repo))
+            ctx.gh(["secret", "set", ENV_KEY_SECRET, "--env", environment, "-R", alt_repo], stdin_path=keyfile,
+                   write=True)
+            ctx.print("secret %s set in environment %s" % (ENV_KEY_SECRET, environment))
+            ctx.gh(["secret", "set", ENV_APP_SECRET, "--env", environment, "-R", alt_repo], input=config_json,
+                   write=True)
+            ctx.print("secret %s set in environment %s" % (ENV_APP_SECRET, environment))
+        except BaseException:
+            if uploaded is not None:  # its private half is about to be destroyed: remove it again
+                try:
+                    _delete_key(ctx, repo, uploaded)
+                except Exception:
+                    ctx.warn("the new deploy key could not be removed; delete it on %s" % repo)
+            raise
+
+    for name in legacy:  # repository secrets of earlier versions; no workflow reads them any more
+        try:
+            ctx.gh(["secret", "delete", name, "-R", alt_repo], write=True)
+            ctx.print("old repository secret %s deleted" % name)
+        except OpError:
+            ctx.warn("old repository secret %s could not be deleted; delete it on %s" % (name, alt_repo))
+
+    rel = "apps/%s/app.json" % bid
+    if app_changed:
+        path = app_json_path(ctx, bid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(dumps_json(app))
+        ctx.print("%s now enables privateBuild; review it and commit it to main (not done automatically)" % rel)
+    else:
+        ctx.print("%s already enables privateBuild" % rel)
+    return EXIT_OK
+
+
+def cmd_unregister(args: argparse.Namespace, ctx: Ctx) -> int:
+    bid = check_bid(args.bid)
+    repo = check_repo(args.repo)
+    preflight(ctx)
+    alias = ctx.deps.alias_for(bid)
+    failures = 0
+    try:
+        keys = _deploy_keys(ctx, repo)
+        for key in keys:
+            _delete_key(ctx, repo, key["id"])
+            if not ctx.dry_run:
+                ctx.print("deploy key %s removed from %s" % (KEY_TITLE, repo))
+        if not keys:
+            ctx.print("%s has no deploy key titled %s" % (repo, KEY_TITLE))
+    except OpError as exc:
+        failures += 1
+        ctx.err.write("alt: error: %s\n" % exc)
+    environment = env_name(alias)
+    try:
+        if _get_environment(ctx, environment) is None:
+            ctx.print("environment %s does not exist" % environment)
+        else:
+            # deleting the environment deletes its secrets ALT_KEY and ALT_APP
+            ctx.gh(["api", "--method", "DELETE", _env_path(ctx, environment)], write=True)
+            if not ctx.dry_run:
+                ctx.print("environment %s deleted with its secrets" % environment)
+    except OpError as exc:
+        failures += 1
+        ctx.err.write("alt: error: %s\n" % exc)
+    for name in _legacy_secrets(_secret_names(ctx), alias):
+        try:
+            ctx.gh(["secret", "delete", name, "-R", ctx.settings.repo], write=True)
+            if not ctx.dry_run:
+                ctx.print("old repository secret %s deleted" % name)
+        except OpError as exc:
+            failures += 1
+            ctx.err.write("alt: error: %s\n" % exc)
+    if private_build_enabled(ctx, bid):
+        ctx.print("apps/%s/app.json still enables privateBuild; disable it and commit the change" % bid)
+    return EXIT_ERROR if failures else EXIT_OK
+
+
+# -- payload key ------------------------------------------------------------------------------------
+
+def _read_age_identity(ctx: Ctx, path: str) -> Tuple[str, str]:
+    """(identity line, recipient) of an age-keygen file; comment lines (such as the creation time) are
+    dropped, so that only the key itself becomes the secret."""
+    with open(path, encoding="ascii", errors="replace") as fh:
+        lines = [line.strip() for line in fh]
+    keys = [line for line in lines if AGE_IDENTITY_RE.match(line)]
+    if len(keys) != 1:
+        raise OpError("age-keygen produced an unexpected identity file")
+    proc = ctx.tool(["age-keygen", "-y", path], what="age-keygen")
+    recipient = proc.stdout.decode("ascii", "replace").strip() if proc.returncode == 0 else ""
+    if not AGE_RECIPIENT_RE.match(recipient):
+        raise OpError("age-keygen did not print the recipient of the identity")
+    return keys[0], recipient
+
+
+def cmd_payload_key(args: argparse.Namespace, ctx: Ctx) -> int:
+    """Create the age key pair that protects build.yml's payload artifact between its jobs."""
+    preflight(ctx)
+    repo = ctx.settings.repo
+    present = [n for n in _secret_names(ctx) if n == PAYLOAD_SECRET]
+    present += [n for n in _variable_names(ctx) if n == PAYLOAD_VARIABLE]
+    if present and not args.rotate:
+        raise OpError("%s is already set; pass --rotate to replace the payload key" % " and ".join(present))
+    if ctx.dry_run:
+        ctx.plan("age-keygen -o <temporary directory>/identity")
+        ctx.plan("gh secret set %s -R %s < <age identity>" % (PAYLOAD_SECRET, repo))
+        ctx.plan("gh variable set %s -R %s --body <age recipient>" % (PAYLOAD_VARIABLE, repo))
+        return EXIT_OK
+    with private_tempdir("alt-payload-", shred=True) as tmp:
+        path = os.path.join(tmp, "identity")
+        proc = ctx.tool(["age-keygen", "-o", path], what="age-keygen")
+        if proc.returncode != 0 or not os.path.isfile(path):
+            raise OpError("age-keygen failed (exit %d)" % proc.returncode)
+        identity, recipient = _read_age_identity(ctx, path)
+        ctx.gh(["secret", "set", PAYLOAD_SECRET, "-R", repo], input=(identity + "\n").encode("ascii"), write=True)
+        ctx.print("secret %s set on %s" % (PAYLOAD_SECRET, repo))
+        try:
+            ctx.gh(["variable", "set", PAYLOAD_VARIABLE, "-R", repo, "--body", recipient], write=True)
+        except OpError:
+            raise OpError("variable %s could not be set, so it no longer matches the secret; run "
+                          "alt payload-key --rotate again" % PAYLOAD_VARIABLE) from None
+        ctx.print("variable %s set on %s" % (PAYLOAD_VARIABLE, repo))
+    return EXIT_OK
+
+
+# -- pre-push hook ----------------------------------------------------------------------------------
+
+def _git(ctx: Ctx, path: str, *args: str) -> "subprocess.CompletedProcess[bytes]":
+    return ctx.tool(["git", "-C", path] + list(args), what="git")
+
+
+def hooks_dir(ctx: Ctx, path: str) -> str:
+    if not os.path.isdir(path):
+        raise OpError("not a directory: %s" % path)
+    proc = _git(ctx, path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if proc.returncode != 0:
+        raise OpError("not a git repository: %s" % path)
+    # git before 2.31 echoes the unknown option and prints a path relative to PATH
+    lines = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+    common = lines[-1].strip() if lines else ""
+    if not common:
+        raise OpError("not a git repository: %s" % path)
+    common = os.path.join(os.path.abspath(path), common) if not os.path.isabs(common) else common
+    custom = _git(ctx, path, "config", "--get", "core.hooksPath")
+    if custom.returncode == 0 and custom.stdout.strip():
+        raise OpError("core.hooksPath is set for this repository; hooks in .git/hooks would not run")
+    return os.path.join(common, "hooks")
+
+
+def is_alt_hook(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return False
+    return HOOK_MARKER.encode("ascii") in head
+
+
+def render_hook(alt_bin: str, bid: str, tag_glob: str, template: str = HOOK_TEMPLATE) -> str:
+    try:
+        with open(template, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        raise OpError("hook template is missing") from None
+    values = {"ALT_BIN": alt_bin, "ALT_BID": bid, "ALT_TAG_GLOB": tag_glob}
+    for name in HOOK_PLACEHOLDERS:
+        pattern = re.compile(r"^%s=@%s@$" % (name, name), re.M)
+        if len(pattern.findall(text)) != 1:
+            raise OpError("hook template is damaged")
+        text = pattern.sub(lambda _m, n=name: "%s=%s" % (n, shlex.quote(values[n])), text)
+    if HOOK_MARKER not in text[:512]:
+        raise OpError("hook template is damaged")
+    return text
+
+
+def cmd_hook_install(args: argparse.Namespace, ctx: Ctx) -> int:
+    bid = check_bid(args.bid)
+    if not GLOB_RE.match(args.tag_glob or ""):
+        raise OpError("--tag-glob may only use letters, digits and . _ - + / * ? [ ] !")
+    preflight(ctx, write=False)
+    hooks = hooks_dir(ctx, args.path)
+    hook = os.path.join(hooks, HOOK_NAME)
+    chained = os.path.join(hooks, CHAINED_NAME)
+    content = render_hook(os.path.realpath(os.path.join(REPO_ROOT, "bin", "alt")), bid, args.tag_glob)
+    if not private_build_enabled(ctx, bid):
+        ctx.warn("apps/%s/app.json in this checkout does not enable privateBuild" % bid)
+
+    ours = os.path.lexists(hook) and is_alt_hook(hook)
+    if ours:
+        with open(hook, encoding="utf-8", errors="replace") as fh:
+            if fh.read() == content and os.access(hook, os.X_OK):
+                ctx.print("pre-push hook already installed (bid %s, tags %s)" % (bid, args.tag_glob))
+                return EXIT_OK
+    elif os.path.lexists(hook) and os.path.lexists(chained):
+        raise OpError("%s exists and %s is taken; resolve this by hand" % (HOOK_NAME, CHAINED_NAME))
+    if ctx.dry_run:
+        if os.path.lexists(hook) and not ours:
+            ctx.plan("move %s to %s" % (hook, chained))
+        ctx.plan("write %s (bid %s, tags %s)" % (hook, bid, args.tag_glob))
+        return EXIT_OK
+    os.makedirs(hooks, exist_ok=True)
+    moved = os.path.lexists(hook) and not ours
+    fd, tmp = tempfile.mkstemp(prefix=".pre-push-", dir=hooks)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(tmp, 0o755)
+        if moved:
+            os.rename(hook, chained)
+        os.replace(tmp, hook)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        if moved and os.path.lexists(chained) and not os.path.lexists(hook):
+            os.rename(chained, hook)
+        raise
+    if moved:
+        ctx.print("existing pre-push hook kept as %s and chained" % CHAINED_NAME)
+    ctx.print("installed %s (bid %s, tags %s); logs go to %s"
+              % (hook, bid, args.tag_glob, os.path.join(ctx.settings.cache_dir, "hook.log")))
+    return EXIT_OK
+
+
+def cmd_hook_uninstall(args: argparse.Namespace, ctx: Ctx) -> int:
+    hooks = hooks_dir(ctx, args.path)
+    hook = os.path.join(hooks, HOOK_NAME)
+    chained = os.path.join(hooks, CHAINED_NAME)
+    ours = os.path.lexists(hook) and is_alt_hook(hook)
+    if not ours:
+        if not os.path.lexists(hook) and os.path.lexists(chained):
+            if ctx.dry_run:
+                ctx.plan("move %s back to %s" % (chained, hook))
+            else:
+                os.rename(chained, hook)
+                ctx.print("restored the chained pre-push hook")
+            return EXIT_OK
+        if os.path.lexists(chained):
+            ctx.warn("%s is not the alt hook; %s left in place" % (HOOK_NAME, CHAINED_NAME))
+        ctx.print("alt pre-push hook is not installed")
+        return EXIT_OK
+    if ctx.dry_run:
+        ctx.plan("remove %s" % hook)
+        if os.path.lexists(chained):
+            ctx.plan("move %s back to %s" % (chained, hook))
+        return EXIT_OK
+    os.unlink(hook)
+    if os.path.lexists(chained):
+        os.rename(chained, hook)
+        ctx.print("removed the alt pre-push hook; restored the chained hook")
+    else:
+        ctx.print("removed the alt pre-push hook")
+    return EXIT_OK
+
+
+# -- status / diag / doctor -------------------------------------------------------------------------
+
+def cmd_status(args: argparse.Namespace, ctx: Ctx) -> int:
+    if not 1 <= args.limit <= 100:
+        raise OpError("--limit must be between 1 and 100")
+    preflight(ctx, write=False)
+    failed = 0
+    for workflow in STATUS_WORKFLOWS:
+        ctx.print(workflow)
+        try:
+            runs = ctx.gh.json(["run", "list", "-R", ctx.settings.repo, "--workflow", workflow, "--limit",
+                                str(args.limit), "--json",
+                                "databaseId,displayTitle,status,conclusion,createdAt,event"])
+        except OpError as exc:
+            failed += 1
+            ctx.print("  unavailable: %s" % exc)
+            continue
+        if not runs:
+            ctx.print("  no runs")
+        for run in runs or []:
+            state = run.get("conclusion") or run.get("status") or "?"
+            ctx.print("  %-12s %-20s %-16s %-18s %s" % (run.get("databaseId"), run.get("createdAt", ""), state,
+                                                      run.get("event", ""), run.get("displayTitle", "")))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+def cmd_diag(args: argparse.Namespace, ctx: Ctx) -> int:
+    if not RUN_ID_RE.match(args.run_id or ""):
+        raise OpError("RUN_ID must be a number")
+    preflight(ctx, write=False)
+    identity = ctx.settings.identity_file
+    if not os.path.isfile(identity):
+        raise OpError("log identity not found (log-identity.txt in the config directory)")
+    with private_tempdir("alt-diag-") as tmp:
+        ctx.gh(["run", "download", args.run_id, "-R", ctx.settings.repo, "-n", "diag", "-D", tmp])
+        files = sorted(os.path.join(d, f) for d, _dirs, names in os.walk(tmp) for f in names)
+        if not files:
+            raise OpError("the diag artifact is empty")
+        for path in files:
+            if len(files) > 1:
+                ctx.print("== %s ==" % os.path.relpath(path, tmp))
+            proc = ctx.tool(["age", "-d", "-i", identity, path], what="age")
+            if proc.returncode != 0:
+                raise OpError("age could not decrypt %s" % os.path.basename(path))
+            if proc.stdout[:2] == GZIP_MAGIC:
+                _print_log_archive(ctx, proc.stdout)
+            else:
+                _print_text(ctx, proc.stdout)
+    return EXIT_OK
+
+
+def _print_text(ctx: Ctx, data: bytes) -> None:
+    text = data.decode("utf-8", "replace")
+    ctx.out.write(text if text.endswith("\n") or not text else text + "\n")
+
+
+def _print_log_archive(ctx: Ctx, data: bytes) -> None:
+    """Print each file of a decrypted ``.tar.gz`` of logs (build.yml's diag artifact); nothing is extracted."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            members = sorted((m for m in tar.getmembers() if m.isfile()), key=lambda m: m.name)
+            if not members:
+                raise OpError("the diag archive holds no files")
+            for member in members:
+                name = member.name[2:] if member.name.startswith("./") else member.name
+                ctx.print("== %s ==" % name)
+                handle = tar.extractfile(member)
+                _print_text(ctx, handle.read() if handle is not None else b"")
+    except (tarfile.TarError, EOFError, OSError, zlib.error):
+        raise OpError("the decrypted diag archive is damaged") from None
+
+
+class _Report:
+    def __init__(self, ctx: Ctx):
+        self.ctx = ctx
+        self.failures = 0
+
+    def ok(self, what: str) -> None:
+        self.ctx.print("ok    %s" % what)
+
+    def fail(self, what: str) -> None:
+        self.failures += 1
+        self.ctx.print("FAIL  %s" % what)
+
+    def warn(self, what: str) -> None:
+        self.ctx.print("warn  %s" % what)
+
+    def check(self, what: str, fn: Callable[[], Optional[str]]) -> None:
+        """``fn`` returns None when fine or a failure detail; OpError counts as a failure."""
+        try:
+            detail = fn()
+        except OpError as exc:
+            detail = str(exc)
+        if detail is None:
+            self.ok(what)
+        else:
+            self.fail("%s: %s" % (what, detail))
+
+
+def cmd_doctor(args: argparse.Namespace, ctx: Ctx) -> int:
+    report = _Report(ctx)
+    settings = ctx.settings
+    repo = settings.repo
+
+    def denylist() -> Optional[str]:
+        load_denylist(ctx)
+        mode = stat.S_IMODE(os.stat(settings.denylist_file).st_mode)
+        if mode & 0o077:
+            report.warn("denylist file is readable by other users (chmod 600)")
+        return None
+
+    report.check("local denylist", denylist)
+    try:
+        assert_login(ctx)
+        report.ok("gh logged in as %s" % settings.owner)
+        assert_repo(ctx, write=True)
+        report.ok("%s reachable with push access" % repo)
+    except OpError as exc:
+        report.fail(str(exc))
+        ctx.print("remote checks skipped")
+        return EXIT_ERROR
+
+    def actions() -> Optional[str]:
+        perms = ctx.gh.json(["api", "repos/%s/actions/permissions" % repo])
+        if not isinstance(perms, dict) or perms.get("enabled") is not True:
+            return "GitHub Actions is disabled"
+        workflow = ctx.gh.json(["api", "repos/%s/actions/permissions/workflow" % repo], check=False) or {}
+        if isinstance(workflow, dict) and workflow.get("default_workflow_permissions") not in (None, "read"):
+            report.warn("default GITHUB_TOKEN permissions are not read-only")
+        return None
+
+    report.check("GitHub Actions enabled", actions)
+
+    def workflows() -> Optional[str]:
+        data = ctx.gh.json(["api", "repos/%s/actions/workflows?per_page=100" % repo])
+        listed = data.get("workflows") if isinstance(data, dict) else None
+        states = {os.path.basename(str(w.get("path", ""))): w.get("state") for w in listed or []
+                  if isinstance(w, dict)}
+        missing = [w for w in REQUIRED_WORKFLOWS if w not in states]
+        inactive = [w for w in REQUIRED_WORKFLOWS if w in states and states[w] != "active"]
+        problems = []
+        if missing:
+            problems.append("missing " + ", ".join(missing))
+        if inactive:
+            problems.append("not enabled " + ", ".join(inactive))
+        return "; ".join(problems) or None
+
+    report.check("workflows enabled (%s)" % ", ".join(REQUIRED_WORKFLOWS), workflows)
+
+    try:
+        apps = private_apps(ctx)
+        aliases = [ctx.deps.alias_for(bid) for bid in apps]
+    except Exception as exc:  # e.g. a module that is not available
+        apps, aliases = [], []
+        report.fail("private build apps could not be listed (%s)" % type(exc).__name__)
+
+    def secrets() -> Optional[str]:
+        names = set(_secret_names(ctx))
+        legacy = _legacy_secrets(sorted(names))
+        if legacy:
+            report.warn("%d per-app repository secret(s) of an earlier version are no longer read; run alt "
+                        "register --rotate for the app or delete them" % len(legacy))
+        missing = [n for n in REQUIRED_SECRETS if n not in names]
+        return ("missing " + ", ".join(missing)) if missing else None
+
+    report.check("repository secrets", secrets)
+
+    def variables() -> Optional[str]:
+        names = set(_variable_names(ctx))
+        missing = [n for n in REQUIRED_VARIABLES if n not in names]
+        return ("missing " + ", ".join(missing)) if missing else None
+
+    report.check("variables", variables)
+
+    def environment_check(environment: str) -> Optional[str]:
+        info = _get_environment(ctx, environment)
+        if info is None:
+            return "missing (run alt register)"
+        policy = info.get("deployment_branch_policy")
+        if not isinstance(policy, dict):
+            return "every branch may use its secrets; allow %s only" % ENV_BRANCH
+        if policy.get("custom_branch_policies") is True and not any(
+                p.get("name") == ENV_BRANCH for p in _branch_policies(ctx, environment)):
+            return "%s is not an allowed branch" % ENV_BRANCH
+        names = set(_secret_names(ctx, environment))
+        missing = [n for n in (ENV_KEY_SECRET, ENV_APP_SECRET) if n not in names]
+        return ("missing secret " + ", ".join(missing)) if missing else None
+
+    for alias in aliases:
+        environment = env_name(alias)
+        report.check("environment %s" % environment, lambda e=environment: environment_check(e))
+
+    def pages() -> Optional[str]:
+        proc = ctx.gh(["api", "repos/%s/pages" % repo], check=False)
+        if proc.returncode != 0:
+            return "GitHub Pages is not configured"
+        try:
+            info = json.loads(proc.stdout.decode("utf-8", "replace") or "null")
+        except ValueError:
+            return "unexpected response"
+        if not isinstance(info, dict) or info.get("build_type") != "workflow":
+            return "Pages must be built by GitHub Actions"
+        return None
+
+    report.check("GitHub Pages deployed by Actions", pages)
+
+    for tool, purpose in (("ssh-keygen", "register"), ("age", "diag"), ("age-keygen", "payload-key"),
+                          ("git", "hook")):
+        if shutil.which(tool, path=ctx.environ.get("PATH")):
+            report.ok("%s available" % tool)
+        else:
+            report.warn("%s not found (needed by alt %s)" % (tool, purpose))
+    if os.path.isfile(settings.identity_file):
+        report.ok("log identity present")
+    else:
+        report.warn("log identity not found (needed by alt diag)")
+    ctx.print("%d problem(s)" % report.failures)
+    return EXIT_ERROR if report.failures else EXIT_OK
+
+
+# -- parser and entry point -------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    common = _Parser(add_help=False)
+    common.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
+                        help="print mutating commands instead of running them")
+    parser = _Parser(prog="alt", description="Operate the alt source: publish, mirror, build, ingest, register.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="run read-only queries but print mutating commands instead of running them")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+
+    p = sub.add_parser("publish", parents=[common], help="gate an IPA locally, upload a draft, dispatch stage.yml")
+    p.add_argument("ipa", metavar="IPA")
+    p.add_argument("--semver", metavar="V", help="version for the tag (default: CFBundleShortVersionString)")
+    p.add_argument("--notes-file", metavar="F", help="release notes (scanned with the denylist)")
+    p.add_argument("--defer", action="store_true", help="leave the draft for the next scheduled stage run")
+    p.set_defaults(func=cmd_publish)
+
+    p = sub.add_parser("mirror", parents=[common], help="publish the IPA of a private release")
+    p.add_argument("repo", metavar="OWNER/REPO")
+    p.add_argument("tag", metavar="TAG")
+    p.add_argument("--semver", metavar="V")
+    p.add_argument("--notes-file", metavar="F", help="release notes; the private release's notes are never copied")
+    p.add_argument("--defer", action="store_true")
+    p.set_defaults(func=cmd_mirror)
+
+    p = sub.add_parser("build", parents=[common], help="dispatch build.yml for a registered app")
+    p.add_argument("bid", metavar="BID")
+    p.add_argument("ref", metavar="REF")
+    p.add_argument("--no-publish", action="store_true", help="build and gate only")
+    p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("ingest", parents=[common], help="dispatch an ingest of an https IPA URL")
+    p.add_argument("url", metavar="URL")
+    p.add_argument("--sha256", metavar="H")
+    p.add_argument("--semver", metavar="V")
+    p.add_argument("--notes-file", metavar="F")
+    p.add_argument("--app-json", metavar="F", help="app.json fields for a new app")
+    p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("register", parents=[common], help="give build.yml read access to a private repository")
+    p.add_argument("repo", metavar="OWNER/REPO")
+    p.add_argument("--bid", required=True)
+    p.add_argument("--tag-pattern", metavar="RE", help="regex with a named group 'version' (stored in app.json)")
+    p.add_argument("--build-json", metavar="F", help="build configuration stored with the registration")
+    p.add_argument("--rotate", action="store_true", help="replace an existing alt-build deploy key")
+    p.set_defaults(func=cmd_register)
+
+    p = sub.add_parser("unregister", parents=[common], help="remove the deploy key and the environment of an app")
+    p.add_argument("bid", metavar="BID")
+    p.add_argument("repo", metavar="OWNER/REPO")
+    p.set_defaults(func=cmd_unregister)
+
+    p = sub.add_parser("payload-key", parents=[common],
+                       help="create the age key pair that encrypts build.yml's payload artifact")
+    p.add_argument("--rotate", action="store_true", help="replace an existing payload key")
+    p.set_defaults(func=cmd_payload_key)
+
+    hook = sub.add_parser("hook", help="manage the local pre-push hook of a private repository")
+    hsub = hook.add_subparsers(dest="hook_command", metavar="ACTION")
+    hsub.required = True
+    p = hsub.add_parser("install", parents=[common], help="start alt build for pushed tags")
+    p.add_argument("path", metavar="PATH")
+    p.add_argument("--bid", required=True)
+    p.add_argument("--tag-glob", default="v*", metavar="GLOB", help="tags that trigger a build (default: v*)")
+    p.set_defaults(func=cmd_hook_install)
+    p = hsub.add_parser("uninstall", parents=[common], help="remove the hook and restore a chained one")
+    p.add_argument("path", metavar="PATH")
+    p.set_defaults(func=cmd_hook_uninstall)
+
+    p = sub.add_parser("status", parents=[common], help="recent build, ingest, stage and catalog runs")
+    p.add_argument("--limit", type=int, default=5, metavar="N")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("diag", parents=[common], help="download and decrypt the diag log of a failed build")
+    p.add_argument("run_id", metavar="RUN_ID")
+    p.set_defaults(func=cmd_diag)
+
+    p = sub.add_parser("doctor", parents=[common],
+                       help="check login, denylist, workflows, secrets, environments and Pages")
+    p.set_defaults(func=cmd_doctor)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None, *, environ: Optional[Mapping[str, str]] = None,
+         out: Optional[TextIO] = None, err: Optional[TextIO] = None, deps: Any = None,
+         root: Optional[str] = None, stage_gh: Any = None) -> int:
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    err = err or sys.stderr
+    try:
+        args = build_parser().parse_args(argv)
+    except UsageError as exc:
+        err.write(exc.usage)
+        err.write("alt: error: %s\n" % exc)
+        return EXIT_ERROR
+    ctx = Ctx(environ=environ, out=out, err=err, dry_run=bool(getattr(args, "dry_run", False)),
+              deps=deps if deps is not None else Toolkit(), root=root or REPO_ROOT, stage_gh=stage_gh)
+    try:
+        return args.func(args, ctx)
+    except KeyboardInterrupt:
+        return 130
+    except OpError as exc:
+        err.write("alt: error: %s\n" % exc)
+        return exc.code
+    except ImportError as exc:
+        name = str(getattr(exc, "name", "") or "")
+        if name.startswith("altsource"):
+            err.write("alt: error: module %s is not available\n" % name)
+            return EXIT_ERROR
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main())

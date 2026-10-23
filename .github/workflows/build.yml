@@ -1,0 +1,809 @@
+# build: build an app from its private source repository on a hosted macOS runner and publish the
+# IPA (route 2).
+#
+# Trigger
+#   workflow_dispatch, inputs:
+#     app      bundle identifier; apps/<app>/app.json must set privateBuild.enabled
+#     ref      tag in the private repository; must match privateBuild.tagPattern (default
+#              ^v<semver>$), which yields the version
+#     publish  boolean, default true; false stops after the gate (no release)
+#     notes    optional release notes, at most 4000 characters, gated like the IPA
+#   The run title is "build <app> <ref>"; poll.yml looks runs up by it.
+#
+# Configuration (ALIAS = bundle identifier upper-cased, every non-alphanumeric character as "_"):
+#   environment alt-<ALIAS>         one per app (bin/alt register), deployments from main only, with
+#     secret ALT_APP                JSON {"repo": "owner/name", "build": {...}}; build keys override
+#                                   .alt.json
+#     secret ALT_KEY                read-only deploy key of the private repository
+#   secret ALT_DENYLIST             newline separated denylist; gate job and catalog only
+#   secret ALT_PAYLOAD_IDENTITY     age identity that decrypts the payload; gate job only
+#   variable ALT_PAYLOAD_RECIPIENT  age recipient (age1...) of ALT_PAYLOAD_IDENTITY
+#   variable ALT_LOG_RECIPIENT      age recipient (age1...) for the encrypted diagnostics
+#   Every secret is referenced by a fixed name, so a job receives only the secrets it names: the macOS
+#   runner gets its own app's ALT_APP and ALT_KEY and nothing else.
+#
+# Jobs
+#   app      (ubuntu, no secrets) validates the inputs and the app and outputs the alias.
+#   resolve  (ubuntu, environment alt-<ALIAS>) masks the repository name, fetches the tag over SSH
+#            with the pinned host keys in .github/known_hosts, reads .alt.json at the tag and
+#            validates the merged configuration.
+#   build    (macOS runner named by the configuration, environment alt-<ALIAS>) fetches the private
+#            repository with its tags, removes the key, checks out the resolved commit (the tag's
+#            current commit when the runner withheld that output) and resolves the configuration again
+#            from it, selects /Applications/Xcode_<xcode>.app, installs allowlisted tools with brew,
+#            runs the build command (bash -eo pipefail) in the checkout with VERSION, ALT_OUT and the
+#            configured env set (in that step only), writing its output to a file only, and takes the
+#            single IPA matching ipa_glob (searched in ALT_OUT first, then in the checkout). The private
+#            build command and its dependencies run on this runner as the same user as every later
+#            step, so the job holds no denylist and nothing it checks is trusted: it normalizes the
+#            IPA, encrypts it to ALT_PAYLOAD_RECIPIENT and uploads it as the "payload" artifact
+#            (retention 1 day; artifacts of a public repository can be downloaded by any signed-in
+#            user). The collected logs are uploaded as the "diag" artifact, encrypted to
+#            ALT_LOG_RECIPIENT (retention 3 days), on success and on failure.
+#   gate     (ubuntu) decrypts the payload on a clean runner, runs the full gate and publishes the
+#            release; with publish=false it runs the gate only (stage --dry-run).
+#   cleanup  (ubuntu) deletes the payload artifact after the gate job, also when it failed, was
+#            skipped or the run was cancelled.
+#   catalog  regenerates the catalog and deploys the site (catalog.yml); only when publishing.
+name: build
+run-name: build ${{ inputs.app }} ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Bundle identifier
+        type: string
+        required: true
+      ref:
+        description: Tag in the private repository
+        type: string
+        required: true
+      publish:
+        description: Publish the release after the gate
+        type: boolean
+        default: true
+      notes:
+        description: Release notes (optional)
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      # derived from the public bundle identifier; this job holds no secret that could mask it
+      alias: ${{ steps.app.outputs.alias }}
+    steps:
+      - name: Validate inputs
+        env:
+          APP: ${{ inputs.app }}
+          REF: ${{ inputs.ref }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          export LC_ALL=C
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::builds are only dispatched from main"
+            exit 1
+          fi
+          bid_re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+          if [ "${#APP}" -gt 155 ] || [[ ! "$APP" =~ $bid_re ]] || [[ "$APP" =~ -v[0-9] ]]; then
+            echo "::error::app must be a bundle identifier"
+            exit 1
+          fi
+          ref_re='^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+          if [[ ! "$REF" =~ $ref_re ]]; then
+            echo "::error::ref must be a tag name"
+            exit 1
+          fi
+          case "$REF" in
+            *..* | *//* | */.* | */ | *. | *.lock)
+              echo "::error::ref must be a tag name"
+              exit 1
+              ;;
+          esac
+          if [[ ! "$PUBLISH" =~ ^(true|false)$ ]]; then
+            echo "::error::publish must be true or false"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+              notes = (json.load(fh).get("inputs") or {}).get("notes") or ""
+          if not isinstance(notes, str) or len(notes) > 4000 or "\0" in notes:
+              print("::error::notes must be text of at most 4000 characters")
+              sys.exit(1)
+          PY
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the app
+        id: app
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          APP: ${{ inputs.app }}
+        run: |
+          export LC_ALL=C
+          python3 - <<'PY'
+          import json, os, sys
+          try:
+              with open(os.path.join("apps", os.environ["APP"], "app.json"), encoding="utf-8") as fh:
+                  app = json.load(fh)
+          except (OSError, ValueError):
+              app = None
+          private = app.get("privateBuild") if isinstance(app, dict) else None
+          if not isinstance(private, dict) or private.get("enabled") is not True:
+              print("::error::apps/<app>/app.json does not enable privateBuild")
+              sys.exit(1)
+          PY
+          alias=$(python3 -m altsource alias "$APP")
+          if [[ ! "$alias" =~ ^[A-Z0-9_]{1,200}$ ]]; then
+            echo "::error::no secret alias for this app"
+            exit 1
+          fi
+          echo "alias=$alias" >> "$GITHUB_OUTPUT"
+          echo "environment: alt-$alias"
+
+  resolve:
+    needs: app
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    environment:
+      name: alt-${{ needs.app.outputs.alias }}
+      deployment: false
+    outputs:
+      # an index into the runner allowlist: a job output that contains a masked value is dropped,
+      # and a single digit cannot contain one
+      runner: ${{ steps.label.outputs.index }}
+      # dropped in the rare case that a masked value (for example a numeric env value) occurs in it;
+      # the build job then builds the tag's current commit and validates it again
+      commit: ${{ steps.clone.outputs.commit }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the tag
+        id: clone
+        env:
+          REF: ${{ inputs.ref }}
+          ALT_APP_CONFIG: ${{ secrets.ALT_APP }}
+          ALT_DEPLOY_KEY: ${{ secrets.ALT_KEY }}
+        run: |
+          export LC_ALL=C
+          diag="$RUNNER_TEMP/diag"
+          mkdir -p "$diag"
+          python3 - "$RUNNER_TEMP/alt-repo" <<'PY'
+          import json, os, re, sys
+          raw = os.environ.get("ALT_APP_CONFIG") or ""
+          try:
+              config = json.loads(raw) if raw else None
+          except ValueError:
+              config = None
+          repo = config.get("repo") if isinstance(config, dict) else None
+          if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+              print("::error::secret ALT_APP of environment alt-<ALIAS> is missing or has no repo")
+              sys.exit(1)
+          print("::add-mask::" + repo)
+          with open(sys.argv[1], "w", encoding="utf-8") as fh:
+              fh.write(repo)
+          PY
+          if [ -z "$ALT_DEPLOY_KEY" ]; then
+            echo "::error::secret ALT_KEY of environment alt-<ALIAS> is missing"
+            exit 1
+          fi
+          repo=$(cat "$RUNNER_TEMP/alt-repo")
+          ssh_dir="$RUNNER_TEMP/alt-ssh"
+          rm -rf "$ssh_dir"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          (umask 077 && mkdir "$ssh_dir" && printf '%s\n' "$ALT_DEPLOY_KEY" > "$ssh_dir/key")
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i '$ssh_dir/key' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$GITHUB_WORKSPACE/.github/known_hosts' -o GlobalKnownHostsFile=/dev/null"
+          export GIT_TERMINAL_PROMPT=0
+          src="$RUNNER_TEMP/src"
+          rm -rf "$src"
+          git init -q "$src" >>"$diag/git.log" 2>&1
+          if ! git -C "$src" fetch --quiet --depth=1 --no-tags "git@github.com:$repo.git" \
+              "+refs/tags/$REF:refs/tags/$REF" >>"$diag/git.log" 2>&1; then
+            echo "::error::the tag could not be fetched from the private repository"
+            exit 1
+          fi
+          rm -rf "$ssh_dir"
+          if ! commit=$(git -C "$src" rev-parse --verify --quiet "refs/tags/$REF^{commit}"); then
+            echo "::error::the tag does not point at a commit"
+            exit 1
+          fi
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            echo "::error::unexpected commit id"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          checkout="$RUNNER_TEMP/alt-checkout"
+          rm -rf "$checkout"
+          mkdir -p "$checkout"
+          if git -C "$src" cat-file -e "$commit:.alt.json" 2>/dev/null; then
+            if [ "$(git -C "$src" cat-file -s "$commit:.alt.json")" -gt 65536 ]; then
+              echo "::error::.alt.json is too large"
+              exit 1
+            fi
+            git -C "$src" show "$commit:.alt.json" > "$checkout/.alt.json"
+          fi
+          echo "tag fetched"
+
+      - name: Resolve the build configuration
+        id: config
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          APP: ${{ inputs.app }}
+          REF: ${{ inputs.ref }}
+          ALT_APP_CONFIG: ${{ secrets.ALT_APP }}
+        run: python3 -m altsource resolve-build --bid "$APP" --ref "$REF" --checkout "$RUNNER_TEMP/alt-checkout"
+
+      - name: Check the runner label
+        id: label
+        env:
+          LABEL: ${{ steps.config.outputs.runner }}
+        run: |
+          case "$LABEL" in
+            xcode-27) index=0 ;;
+            macos-26) index=1 ;;
+            macos-15) index=2 ;;
+            macos-latest) index=3 ;;
+            *)
+              echo "::error::the runner label is not allowlisted"
+              exit 1
+              ;;
+          esac
+          echo "index=$index" >> "$GITHUB_OUTPUT"
+          echo "runner: $LABEL"
+
+      - name: Encrypt diagnostics
+        id: diag
+        if: failure() || cancelled()
+        env:
+          RECIPIENT: ${{ vars.ALT_LOG_RECIPIENT }}
+        run: |
+          export LC_ALL=C
+          diag="$RUNNER_TEMP/diag"
+          if [ ! -d "$diag" ] || [ -z "$(ls -A "$diag")" ]; then
+            echo "no diagnostics collected"
+            exit 0
+          fi
+          if [ "${#RECIPIENT}" -gt 4096 ] || [[ ! "$RECIPIENT" =~ ^age1[0-9a-z]+$ ]]; then
+            echo "::warning::diagnostics were not uploaded: ALT_LOG_RECIPIENT is not an age recipient"
+            exit 0
+          fi
+          if ! command -v age >/dev/null 2>&1; then
+            if ! { sudo apt-get update -qq && sudo apt-get install -y -qq age; } >/dev/null 2>&1; then
+              echo "::warning::diagnostics were not uploaded: age could not be installed"
+              exit 0
+            fi
+          fi
+          tar -C "$diag" -czf - . | age -r "$RECIPIENT" -o "$RUNNER_TEMP/diag.tar.gz.age"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "diagnostics encrypted"
+
+      - name: Upload diagnostics
+        if: (failure() || cancelled()) && steps.diag.outputs.ready == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diag
+          path: ${{ runner.temp }}/diag.tar.gz.age
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+  build:
+    needs: [app, resolve]
+    runs-on: ${{ fromJSON('["xcode-27", "macos-26", "macos-15", "macos-latest"]')[fromJSON(needs.resolve.outputs.runner)] }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    environment:
+      name: alt-${{ needs.app.outputs.alias }}
+      deployment: false
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          APP: ${{ inputs.app }}
+          REF: ${{ inputs.ref }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          export LC_ALL=C
+          bid_re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+          if [ "${#APP}" -gt 155 ] || [[ ! "$APP" =~ $bid_re ]] || [[ "$APP" =~ -v[0-9] ]]; then
+            echo "::error::app must be a bundle identifier"
+            exit 1
+          fi
+          ref_re='^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+          if [[ ! "$REF" =~ $ref_re ]]; then
+            echo "::error::ref must be a tag name"
+            exit 1
+          fi
+          case "$REF" in
+            *..* | *//* | */.* | */ | *. | *.lock)
+              echo "::error::ref must be a tag name"
+              exit 1
+              ;;
+          esac
+          # empty when the runner withheld the output because it contained a masked value
+          if [ -n "$COMMIT" ] && [[ ! "$COMMIT" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            echo "::error::the resolved commit is not a commit id"
+            exit 1
+          fi
+
+      - name: Clone the source
+        env:
+          REF: ${{ inputs.ref }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          ALT_APP_CONFIG: ${{ secrets.ALT_APP }}
+          ALT_DEPLOY_KEY: ${{ secrets.ALT_KEY }}
+        run: |
+          export LC_ALL=C
+          diag="$RUNNER_TEMP/diag"
+          mkdir -p "$diag"
+          python3 - "$RUNNER_TEMP/alt-repo" <<'PY'
+          import json, os, re, sys
+          raw = os.environ.get("ALT_APP_CONFIG") or ""
+          try:
+              config = json.loads(raw) if raw else None
+          except ValueError:
+              config = None
+          repo = config.get("repo") if isinstance(config, dict) else None
+          if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+              print("::error::secret ALT_APP of environment alt-<ALIAS> is missing or has no repo")
+              sys.exit(1)
+          print("::add-mask::" + repo)
+          with open(sys.argv[1], "w", encoding="utf-8") as fh:
+              fh.write(repo)
+          PY
+          if [ -z "$ALT_DEPLOY_KEY" ]; then
+            echo "::error::secret ALT_KEY of environment alt-<ALIAS> is missing"
+            exit 1
+          fi
+          repo=$(cat "$RUNNER_TEMP/alt-repo")
+          ssh_dir="$RUNNER_TEMP/alt-ssh"
+          rm -rf "$ssh_dir"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          (umask 077 && mkdir "$ssh_dir" && printf '%s\n' "$ALT_DEPLOY_KEY" > "$ssh_dir/key")
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i '$ssh_dir/key' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$GITHUB_WORKSPACE/.github/known_hosts' -o GlobalKnownHostsFile=/dev/null"
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_LFS_SKIP_SMUDGE=1
+          src="$RUNNER_TEMP/src"
+          rm -rf "$src"
+          git init -q "$src" >>"$diag/git.log" 2>&1
+          if ! git -C "$src" fetch --quiet --no-tags "git@github.com:$repo.git" \
+              "+refs/tags/*:refs/tags/*" >>"$diag/git.log" 2>&1; then
+            echo "::error::the private repository could not be fetched"
+            exit 1
+          fi
+          rm -rf "$ssh_dir"
+          commit=$(git -C "$src" rev-parse --verify --quiet "refs/tags/$REF^{commit}" || true)
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            echo "::error::the tag does not point at a commit"
+            exit 1
+          fi
+          if [ -z "$COMMIT" ]; then
+            # the configuration of this commit is resolved and checked again in the next step
+            echo "::warning::the resolve job's commit output was withheld; building the tag's current commit"
+          elif [ "$commit" != "$COMMIT" ]; then
+            echo "::error::the tag no longer points at the resolved commit"
+            exit 1
+          fi
+          if ! git -C "$src" -c advice.detachedHead=false checkout --quiet --detach "$commit" \
+              >>"$diag/git.log" 2>&1; then
+            echo "::error::the resolved commit could not be checked out"
+            exit 1
+          fi
+          echo "source checked out; deploy key removed"
+
+      - name: Resolve the build configuration
+        id: config
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          APP: ${{ inputs.app }}
+          REF: ${{ inputs.ref }}
+          EXPECTED_RUNNER: ${{ fromJSON('["xcode-27", "macos-26", "macos-15", "macos-latest"]')[fromJSON(needs.resolve.outputs.runner)] }}
+          ALT_APP_CONFIG: ${{ secrets.ALT_APP }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/alt-build"
+          python3 -m altsource resolve-build --bid "$APP" --ref "$REF" --checkout "$RUNNER_TEMP/src" \
+            --json-out "$RUNNER_TEMP/alt-build/config.json"
+          python3 - "$RUNNER_TEMP/alt-build/config.json" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              runner = json.load(fh).get("runner")
+          if runner != os.environ["EXPECTED_RUNNER"]:
+              print("::error::the build configuration changed since the resolve job")
+              sys.exit(1)
+          PY
+
+      - name: Select Xcode
+        env:
+          XCODE: ${{ steps.config.outputs.xcode }}
+        run: |
+          export LC_ALL=C
+          if [ -n "$XCODE" ]; then
+            if [[ ! "$XCODE" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+              echo "::error::xcode must look like 27, 27.0 or 27.0.1"
+              exit 1
+            fi
+            app="/Applications/Xcode_$XCODE.app"
+            if [ ! -d "$app" ]; then
+              echo "::error::Xcode $XCODE is not installed on this runner"
+              exit 1
+            fi
+            sudo xcode-select --switch "$app/Contents/Developer"
+          fi
+          xcodebuild -version > "$RUNNER_TEMP/xcode-version.txt" 2>&1 || true
+          echo "selected: $(head -n 1 "$RUNNER_TEMP/xcode-version.txt")"
+
+      - name: Install build tools
+        env:
+          SETUP: ${{ steps.config.outputs.setup }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+        run: |
+          if [ -z "$SETUP" ]; then
+            echo "no build tools requested"
+            exit 0
+          fi
+          for tool in $SETUP; do
+            case "$tool" in
+              go | xcodegen | xcbeautify | ldid) ;;
+              *)
+                echo "::error::build tools must be one of go, xcodegen, xcbeautify, ldid"
+                exit 1
+                ;;
+            esac
+          done
+          for tool in $SETUP; do
+            if ! brew install "$tool" >>"$RUNNER_TEMP/diag/setup.log" 2>&1; then
+              echo "::error::$tool could not be installed"
+              exit 1
+            fi
+            echo "installed: $tool"
+          done
+
+      - name: Install age
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+        run: |
+          # encrypts the payload and the diagnostics; installed before the build command runs
+          if ! command -v age >/dev/null 2>&1; then
+            if ! brew install age >>"$RUNNER_TEMP/diag/setup.log" 2>&1; then
+              echo "::error::age could not be installed"
+              exit 1
+            fi
+          fi
+          echo "age available"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.config.outputs.version }}
+        run: |
+          work="$RUNNER_TEMP/alt-build"
+          python3 - "$work/config.json" "$work/command.sh" "$work/env.txt" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              config = json.load(fh)
+          with open(sys.argv[2], "w", encoding="utf-8") as fh:
+              fh.write(config["command"] + "\n")
+          env = json.loads(config["env"])
+          with open(sys.argv[3], "w", encoding="utf-8") as fh:
+              for key in sorted(env):
+                  fh.write("%s=%s\n" % (key, env[key]))
+          PY
+          env_args=()
+          while IFS= read -r line; do
+            env_args+=("$line")
+          done < "$work/env.txt"
+          out="$RUNNER_TEMP/out"
+          rm -rf "$out"
+          mkdir -p "$out"
+          log="$RUNNER_TEMP/diag/build.log"
+          start=$(date +%s)
+          set +e
+          (cd "$RUNNER_TEMP/src" && exec env "${env_args[@]}" VERSION="$VERSION" ALT_OUT="$out" \
+            bash -eo pipefail "$work/command.sh") </dev/null >"$log" 2>&1
+          code=$?
+          set -e
+          minutes=$(( ($(date +%s) - start + 59) / 60 ))
+          if [ "$code" -ne 0 ]; then
+            echo "build failed, exit $code, $minutes minutes"
+            exit 1
+          fi
+          echo "build finished, exit 0, $minutes minutes"
+
+      - name: Locate the IPA
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, sys
+          tmp = os.environ["RUNNER_TEMP"]
+          with open(os.path.join(tmp, "alt-build", "config.json"), encoding="utf-8") as fh:
+              pattern = json.load(fh)["ipa_glob"]
+          found = []
+          for base in (os.path.join(tmp, "out"), os.path.join(tmp, "src")):
+              root = os.path.realpath(base)
+              hits = glob.glob(os.path.join(glob.escape(base), pattern), recursive=True)
+              found = sorted({os.path.realpath(p) for p in hits if os.path.isfile(p) and not os.path.islink(p)})
+              found = [p for p in found if p.startswith(root + os.sep)]
+              if found:
+                  break
+          if len(found) != 1:
+              print("::error::expected exactly one IPA matching ipa_glob, found %d" % len(found))
+              sys.exit(1)
+          with open(os.path.join(tmp, "alt-build", "ipa-path"), "w", encoding="utf-8") as fh:
+              fh.write(found[0])
+          print("IPA located")
+          PY
+
+      - name: Normalize and encrypt the IPA
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.config.outputs.version }}
+          RECIPIENT: ${{ vars.ALT_PAYLOAD_RECIPIENT }}
+        run: |
+          # no gate here: the gate job runs it on a clean runner. This only stops a build of the wrong
+          # app or version early; the gate job checks the identity again.
+          work="$RUNNER_TEMP/alt-build"
+          diag="$RUNNER_TEMP/diag"
+          if [ "${#RECIPIENT}" -gt 4096 ] || [[ ! "$RECIPIENT" =~ ^age1[0-9a-z]+$ ]]; then
+            echo "::error::variable ALT_PAYLOAD_RECIPIENT is not an age recipient"
+            exit 1
+          fi
+          if ! python3 -m altsource normalize "$(cat "$work/ipa-path")" "$work/payload.ipa" \
+              >"$diag/normalize.json"; then
+            echo "::error::the IPA could not be normalized"
+            exit 1
+          fi
+          python3 - "$work/payload.ipa" <<'PY'
+          import os, sys
+          from altsource.stage import Toolkit, core_matches
+          deps = Toolkit()
+          try:
+              info = deps.inspect_ipa(sys.argv[1])
+          except Exception as exc:
+              print("::error::the IPA was rejected (%s)" % (getattr(exc, "rule", "") or type(exc).__name__))
+              sys.exit(1)
+          if info.bundle_id != os.environ["APP"]:
+              print("::error::the IPA has another bundle identifier")
+              sys.exit(1)
+          if not core_matches(deps, os.environ["VERSION"], info.short_version or ""):
+              print("::error::the IPA's CFBundleShortVersionString does not match the version")
+              sys.exit(1)
+          PY
+          payload="$RUNNER_TEMP/payload"
+          rm -rf "$payload"
+          mkdir -p "$payload"
+          age -r "$RECIPIENT" -o "$payload/payload.ipa.age" "$work/payload.ipa"
+          rm -f "$work/payload.ipa"
+          # an artifact of a public repository is readable by any signed-in user: never upload plaintext
+          if [ "$(head -n 1 "$payload/payload.ipa.age")" != "age-encryption.org/v1" ]; then
+            echo "::error::the payload is not age-encrypted"
+            rm -f "$payload/payload.ipa.age"
+            exit 1
+          fi
+          echo "payload encrypted"
+
+      - name: Upload the payload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: payload
+          path: ${{ runner.temp }}/payload/payload.ipa.age
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+
+      # always: the gate runs in a later job, so a rejected IPA needs the build log as well
+      - name: Encrypt diagnostics
+        id: diag
+        if: always()
+        env:
+          RECIPIENT: ${{ vars.ALT_LOG_RECIPIENT }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+        run: |
+          export LC_ALL=C
+          diag="$RUNNER_TEMP/diag"
+          if [ ! -d "$diag" ] || [ -z "$(ls -A "$diag")" ]; then
+            echo "no diagnostics collected"
+            exit 0
+          fi
+          if [ "${#RECIPIENT}" -gt 4096 ] || [[ ! "$RECIPIENT" =~ ^age1[0-9a-z]+$ ]]; then
+            echo "::warning::diagnostics were not uploaded: ALT_LOG_RECIPIENT is not an age recipient"
+            exit 0
+          fi
+          if ! command -v age >/dev/null 2>&1; then
+            if ! brew install age >/dev/null 2>&1; then
+              echo "::warning::diagnostics were not uploaded: age could not be installed"
+              exit 0
+            fi
+          fi
+          tar -C "$diag" -czf - . | age -r "$RECIPIENT" -o "$RUNNER_TEMP/diag.tar.gz.age"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "diagnostics encrypted"
+
+      - name: Upload diagnostics
+        if: always() && steps.diag.outputs.ready == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diag
+          path: ${{ runner.temp }}/diag.tar.gz.age
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+  gate:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: alt-release
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Derive the version
+        id: version
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          APP: ${{ inputs.app }}
+          REF: ${{ inputs.ref }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
+          from altsource.stage import Toolkit
+          bid, ref = os.environ["APP"], os.environ["REF"]
+          try:
+              with open(os.path.join("apps", bid, "app.json"), encoding="utf-8") as fh:
+                  private = json.load(fh).get("privateBuild") or {}
+              match = re.fullmatch(private.get("tagPattern") or DEFAULT_TAG_PATTERN, ref)
+              version = match.group("version") if match and "version" in match.re.groupindex else None
+          except (OSError, ValueError, AttributeError, TypeError, re.error):
+              version = None
+          if not version or not re.fullmatch(SEMVER_PATTERN, version):
+              print("::error::the ref does not yield a version")
+              sys.exit(1)
+          tag = Toolkit().make_tag(bid, version)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("version=%s\ntag=%s\n" % (version, tag))
+          PY
+
+      - name: Download the payload
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: payload
+          path: ${{ runner.temp }}/payload
+
+      - name: Decrypt the payload
+        env:
+          IDENTITY: ${{ secrets.ALT_PAYLOAD_IDENTITY }}
+        run: |
+          export LC_ALL=C
+          payload="$RUNNER_TEMP/payload"
+          if [ "$(find "$payload" -mindepth 1 | wc -l)" -ne 1 ] || [ ! -f "$payload/payload.ipa.age" ] \
+              || [ -L "$payload/payload.ipa.age" ]; then
+            echo "::error::the payload artifact must hold exactly one encrypted IPA"
+            exit 1
+          fi
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::secret ALT_PAYLOAD_IDENTITY is missing"
+            exit 1
+          fi
+          if ! command -v age >/dev/null 2>&1; then
+            if ! { sudo apt-get update -qq && sudo apt-get install -y -qq age; } >/dev/null 2>&1; then
+              echo "::error::age could not be installed"
+              exit 1
+            fi
+          fi
+          keys="$RUNNER_TEMP/alt-age"
+          rm -rf "$keys"
+          trap 'rm -rf "$keys"' EXIT
+          (umask 077 && mkdir "$keys" && printf '%s\n' "$IDENTITY" > "$keys/identity")
+          mkdir -p "$RUNNER_TEMP/alt-ipa"
+          if ! age -d -i "$keys/identity" -o "$RUNNER_TEMP/alt-ipa/payload.ipa" "$payload/payload.ipa.age" \
+              2>/dev/null; then
+            echo "::error::the payload could not be decrypted with ALT_PAYLOAD_IDENTITY"
+            exit 1
+          fi
+          echo "payload decrypted"
+
+      - name: Gate the IPA
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+          ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}
+          APP: ${{ inputs.app }}
+          PUBLISH: ${{ inputs.publish }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          python3 - "$RUNNER_TEMP/notes.txt" <<'PY'
+          import json, os, sys
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+              notes = (json.load(fh).get("inputs") or {}).get("notes") or ""
+          if not isinstance(notes, str) or len(notes) > 4000 or "\0" in notes:
+              print("::error::notes must be text of at most 4000 characters")
+              sys.exit(1)
+          with open(sys.argv[1], "w", encoding="utf-8") as fh:
+              fh.write(notes)
+          PY
+          args=(stage "$RUNNER_TEMP/alt-ipa/payload.ipa" --bid "$APP" --semver "$VERSION"
+                --notes-file "$RUNNER_TEMP/notes.txt")
+          if [ "$PUBLISH" != "true" ]; then
+            args+=(--dry-run)  # publish=false: the gate only, no GitHub calls
+          fi
+          python3 -m altsource "${args[@]}" | tee "$RUNNER_TEMP/stage.txt"
+          if [ "$(sed -n 's/^tag=//p' "$RUNNER_TEMP/stage.txt")" != "$TAG" ]; then
+            echo "::error::the IPA does not match the expected tag"
+            exit 1
+          fi
+
+  cleanup:
+    needs: [build, gate]
+    # also when the gate failed, was skipped or the run was cancelled: the payload must not outlive it
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete the payload artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=payload" \
+            --jq '.artifacts[].id')
+          for id in $ids; do
+            if [[ "$id" =~ ^[0-9]+$ ]]; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" --silent
+            fi
+          done
+          echo "payload artifact removed"
+
+  catalog:
+    needs: gate
+    if: inputs.publish
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/catalog.yml
+    secrets:
+      ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}

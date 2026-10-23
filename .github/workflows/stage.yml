@@ -1,0 +1,127 @@
+# stage: finalize draft releases staged by the operator (route 1).
+#
+# Triggers
+#   workflow_dispatch  input tag (string, optional): one draft release tag, <bundle id>-v<semver>.
+#                      Empty stages every pending draft whose tag follows the grammar.
+#   schedule           17 1,7,13,19 * * * (UTC): stages every pending draft.
+#
+# For each draft, the single .ipa asset is downloaded, normalized and run through the gate; on success
+# the normalized IPA replaces the upload and the release is published. A draft the gate rejects is
+# retitled "[blocked] <tag>" and skipped by later runs until it is staged again by tag. When anything
+# was published the catalog workflow runs; afterwards the run fails if any draft was rejected or failed.
+#
+# Repository secret ALT_DENYLIST is required.
+name: stage
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag (empty for every pending draft)
+        type: string
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 1,7,13,19 * * *"
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    concurrency:
+      group: alt-release
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      published: ${{ steps.result.outputs.published }}
+      rejected: ${{ steps.drafts.outputs.rejected }}
+      failed: ${{ steps.drafts.outputs.failed }}
+    steps:
+      - name: Validate inputs
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          export LC_ALL=C
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::drafts are only staged from main"
+            exit 1
+          fi
+          tag_re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [ -n "$TAG" ]; then
+            if [ "${#TAG}" -gt 200 ] || [[ ! "$TAG" =~ $tag_re ]]; then
+              echo "::error::tag must look like <bundle id>-v<semver>"
+              exit 1
+            fi
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Stage drafts
+        id: drafts
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+          ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$TAG" ]; then
+            python3 -m altsource stage-draft "$TAG" --exit-zero
+          else
+            python3 -m altsource stage-draft --all --exit-zero
+          fi
+
+      - name: Summarize
+        id: result
+        env:
+          STAGED: ${{ steps.drafts.outputs.staged }}
+          PUBLISHED: ${{ steps.drafts.outputs.published }}
+          REJECTED: ${{ steps.drafts.outputs.rejected }}
+          FAILED: ${{ steps.drafts.outputs.failed }}
+        run: |
+          published=false
+          if [ "${STAGED:-0}" != "0" ] || [ "$PUBLISHED" = "true" ]; then
+            published=true
+          fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          echo "published: $published, rejected: ${REJECTED:-0}, failed: ${FAILED:-0}"
+
+  catalog:
+    needs: stage
+    if: needs.stage.outputs.published == 'true'
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/catalog.yml
+    secrets:
+      ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}
+
+  report:
+    needs: [stage, catalog]
+    if: >-
+      !cancelled() && needs.stage.result == 'success' &&
+      (needs.stage.outputs.rejected != '0' || needs.stage.outputs.failed != '0')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Report rejected drafts
+        env:
+          REJECTED: ${{ needs.stage.outputs.rejected }}
+          FAILED: ${{ needs.stage.outputs.failed }}
+        run: |
+          echo "::error::drafts rejected: ${REJECTED:-unknown}, failed: ${FAILED:-unknown}; see the stage job log"
+          exit 1

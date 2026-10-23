@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-e4HDBnY7fP/Jx4rfSob03jBEuOWwvo6KDfl3i6e09aU='; style-src 'sha256-kH/3jPbMcjivA3jrDmnV5R3263imwqtdTxwMdKc3nBA='; img-src 'self' https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="An AltStore source of unsigned IPA builds published as GitHub Releases.">
+<title>alt · AltStore source</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7fb;
+  --surface: #ffffff;
+  --text: #1b1f2a;
+  --muted: #5c6475;
+  --border: #dde1ea;
+  --accent: #4352e8;
+  --on-accent: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #10131a;
+    --surface: #1a1e29;
+    --text: #e8eaf2;
+    --muted: #a3abbd;
+    --border: #2c3242;
+    --accent: #9aa5ff;
+    --on-accent: #10131a;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.wrap { max-width: 44rem; margin: 0 auto; padding: 2.5rem 1.25rem 3rem; }
+h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 .5rem; }
+h2 { font-size: 1.25rem; margin: 2.25rem 0 .75rem; }
+h3 { font-size: 1.05rem; margin: 0; }
+p { margin: 0 0 .75rem; }
+.lead, .muted { color: var(--muted); }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible, input:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+.actions { display: flex; flex-wrap: wrap; gap: .75rem; margin: 0 0 1rem; }
+.button, button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: .5rem 1.1rem;
+  border: 2px solid var(--accent);
+  border-radius: .75rem;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+.button.primary, button { background: var(--accent); color: var(--on-accent); }
+label { display: block; font-weight: 600; margin: 0 0 .35rem; }
+.url-row { display: flex; gap: .5rem; }
+input {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: .5rem .75rem;
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  background: var(--surface);
+  color: var(--text);
+  font: 15px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.status { min-height: 1.5em; margin-top: .4rem; color: var(--muted); }
+.apps { list-style: none; margin: 0; padding: 0; display: grid; gap: .75rem; }
+.app {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: var(--surface);
+}
+.icon {
+  flex: none;
+  width: 56px;
+  height: 56px;
+  border-radius: 13px;
+  background: var(--border);
+  object-fit: cover;
+}
+.body { min-width: 0; }
+.meta { font-size: .9rem; margin: .1rem 0 .4rem; }
+.summary {
+  margin: 0 0 .4rem;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+footer { border-top: 1px solid var(--border); margin-top: 2.5rem; padding-top: 1rem; font-size: .9rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>alt</h1>
+<p class="lead">Unsigned IPA builds published as GitHub Releases. Add this source to a sideloading store; the store signs each app when it installs it.</p>
+</header>
+<main>
+<section aria-labelledby="add-heading">
+<h2 id="add-heading">Add the source</h2>
+<div class="actions">
+<a class="button primary" href="altstore://source?url=https%3A%2F%2Fxuniv.github.io%2Falt%2Fsource.json">Add to AltStore</a>
+<a class="button" href="altstore-classic://source?url=https%3A%2F%2Fxuniv.github.io%2Falt%2Fsource.json">Add to AltStore Classic</a>
+<a class="button" href="sidestore://source?url=https%3A%2F%2Fxuniv.github.io%2Falt%2Fsource.json">Add to SideStore</a>
+</div>
+<p class="muted">These buttons open the store app on an iPhone or iPad where it is installed. In other stores, such as Feather, add the URL below by hand. AltStore PAL only installs notarized apps and cannot use this source.</p>
+<label for="source-url">Source URL</label>
+<div class="url-row">
+<input id="source-url" type="text" value="https://xuniv.github.io/alt/source.json" readonly spellcheck="false" autocapitalize="off" autocomplete="off">
+<button type="button" id="copy" hidden>Copy URL</button>
+</div>
+<p id="copy-status" class="status" role="status" aria-live="polite"></p>
+</section>
+<section aria-labelledby="apps-heading">
+<h2 id="apps-heading">Apps</h2>
+<p id="apps-status" class="status" role="status" aria-live="polite"></p>
+<noscript><p>The app list needs JavaScript. The catalog itself is <a href="source.json">source.json</a>.</p></noscript>
+<ul id="apps" class="apps"></ul>
+</section>
+</main>
+<footer>
+<p class="muted">Releases and tooling: <a href="https://github.com/xuniv/alt">github.com/xuniv/alt</a></p>
+</footer>
+</div>
+<script>
+(function () {
+  "use strict";
+  var SOURCE_URL = "https://xuniv.github.io/alt/source.json";
+  var input = document.getElementById("source-url");
+  var copy = document.getElementById("copy");
+  var copyStatus = document.getElementById("copy-status");
+  var list = document.getElementById("apps");
+  var status = document.getElementById("apps-status");
+
+  function str(value) {
+    return typeof value === "string" ? value : "";
+  }
+  function httpsURL(value) {
+    return /^https:\/\/[^\s"'<>\\]+$/.test(str(value)) ? value : null;
+  }
+  function node(tag, className, text) {
+    var el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text) el.textContent = text;
+    return el;
+  }
+  function fileSize(bytes) {
+    if (typeof bytes !== "number" || !isFinite(bytes) || bytes <= 0) return "";
+    return bytes < 1048576 ? Math.ceil(bytes / 1024) + " KB" : (bytes / 1048576).toFixed(1) + " MB";
+  }
+  function placeholder() {
+    var box = node("span", "icon");
+    box.setAttribute("aria-hidden", "true");
+    return box;
+  }
+
+  function selectURL() {
+    input.focus();
+    input.setSelectionRange(0, input.value.length);
+  }
+  function fallbackCopy() {
+    selectURL();
+    var copied = false;
+    try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
+    copyStatus.textContent = copied ? "Copied." : "The URL is selected; copy it with your keyboard or menu.";
+  }
+  copy.hidden = false;
+  copy.addEventListener("click", function () {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(SOURCE_URL).then(function () {
+        copyStatus.textContent = "Copied.";
+      }, fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
+  });
+  input.addEventListener("focus", selectURL);
+
+  function renderApp(app) {
+    var versions = Array.isArray(app.versions) ? app.versions : [];
+    var latest = versions.length && versions[0] && typeof versions[0] === "object" ? versions[0] : {};
+    var name = str(app.name) || str(app.bundleIdentifier);
+    var item = node("li", "app");
+    if (httpsURL(app.iconURL)) {
+      var icon = node("img", "icon");
+      icon.alt = "";
+      icon.width = 56;
+      icon.height = 56;
+      icon.loading = "lazy";
+      icon.decoding = "async";
+      icon.referrerPolicy = "no-referrer";
+      icon.addEventListener("error", function () {
+        if (icon.parentNode) icon.parentNode.replaceChild(placeholder(), icon);
+      });
+      icon.src = app.iconURL;
+      item.appendChild(icon);
+    } else {
+      item.appendChild(placeholder());
+    }
+
+    var body = node("div", "body");
+    body.appendChild(node("h3", "", name));
+    var version = str(latest.marketingVersion) || str(latest.version);
+    var meta = [str(app.developerName), version ? "Version " + version : "",
+      str(latest.date).slice(0, 10), fileSize(latest.size)].filter(Boolean).join(" · ");
+    if (meta) body.appendChild(node("p", "meta muted", meta));
+    var summary = str(app.subtitle) || str(app.localizedDescription);
+    if (summary) body.appendChild(node("p", "summary", summary));
+    if (httpsURL(latest.downloadURL)) {
+      var link = node("a", "", "Download IPA");
+      link.href = latest.downloadURL;
+      link.setAttribute("aria-label", "Download IPA of " + name);
+      body.appendChild(link);
+    }
+    item.appendChild(body);
+    return item;
+  }
+
+  function render(source) {
+    var apps = source && Array.isArray(source.apps) ? source.apps : [];
+    list.textContent = "";
+    var shown = 0;
+    apps.forEach(function (app) {
+      if (app && typeof app === "object") {
+        list.appendChild(renderApp(app));
+        shown += 1;
+      }
+    });
+    status.textContent = shown === 0 ? "No apps are listed yet."
+      : shown === 1 ? "1 app is listed." : shown + " apps are listed.";
+  }
+
+  status.textContent = "Loading the app list…";
+  fetch("./source.json", { cache: "no-cache", credentials: "omit" })
+    .then(function (response) {
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      return response.json();
+    })
+    .then(render)
+    .catch(function () {
+      status.textContent = "The app list could not be loaded.";
+    });
+})();
+</script>
+</body>
+</html>

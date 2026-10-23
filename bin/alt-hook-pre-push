@@ -1,0 +1,85 @@
+#!/bin/sh
+# alt-pre-push-hook: installed by "alt hook install", removed by "alt hook uninstall".
+#
+# For every pushed tag that matches the glob below, start "alt build <bid> <tag>" in the background
+# as soon as the remote tag points at the pushed object (checked for up to ALT_HOOK_TIMEOUT seconds,
+# default 600). A rejected push, for example of a tag that already exists on the remote at another
+# commit, starts no build. The hook prints nothing, never fails and never delays the push. A pre-push hook that existed
+# before was moved to pre-push.alt-chained; it runs first, with the same arguments and input, and its
+# exit status still decides the push. Output of the background job goes to
+# ${ALT_CACHE_DIR:-~/.cache/xuniv-alt}/hook.log.
+
+ALT_BIN=@ALT_BIN@
+ALT_BID=@ALT_BID@
+ALT_TAG_GLOB=@ALT_TAG_GLOB@
+
+hook_dir=$(dirname "$0")
+# git writes one "<local ref> <local sha> <remote ref> <remote sha>" line per pushed ref
+refs=$(cat)
+
+if [ -x "$hook_dir/pre-push.alt-chained" ]; then
+    if [ -n "$refs" ]; then
+        printf '%s\n' "$refs" | "$hook_dir/pre-push.alt-chained" "$@"
+    else
+        "$hook_dir/pre-push.alt-chained" "$@" </dev/null
+    fi
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        exit "$status"
+    fi
+fi
+
+# not rendered by the installer, or the alt checkout moved: do nothing
+case "$ALT_BIN" in
+    /*) ;;
+    *) exit 0 ;;
+esac
+[ -x "$ALT_BIN" ] || exit 0
+[ -n "$refs" ] || exit 0
+
+umask 077
+remote=${1:-origin}
+timeout=${ALT_HOOK_TIMEOUT:-600}
+interval=${ALT_HOOK_INTERVAL:-10}
+case "$timeout" in ''|*[!0-9]*) timeout=600 ;; esac
+case "$interval" in ''|*[!0-9]*) interval=10 ;; esac
+[ "$interval" -ge 1 ] || interval=10
+log_dir=${ALT_CACHE_DIR:-${HOME:-/nonexistent}/.cache/xuniv-alt}
+
+# runs detached: $1 alt, $2 bundle id, $3 tag, $4 remote, $5 timeout, $6 interval, $7 pushed object
+# id (for an annotated tag the tag object, which ls-remote also lists for refs/tags/<tag>)
+waiter='
+line=$(printf "%s\trefs/tags/%s" "$7" "$3")
+waited=0
+until git ls-remote "$4" "refs/tags/$3" 2>/dev/null | grep -qxF "$line"; do
+    if [ "$waited" -ge "$5" ]; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) tag $3: the pushed object is not on the remote after $5 s;" \
+            "no build started"
+        exit 1
+    fi
+    sleep "$6"
+    waited=$((waited + $6))
+done
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) tag $3 pushed; starting alt build"
+exec "$1" build "$2" "$3"
+'
+
+printf '%s\n' "$refs" | while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/tags/?*) tag=${remote_ref#refs/tags/} ;;
+        *) continue ;;
+    esac
+    case "$local_sha" in
+        *[!0-9a-f]* | '') continue ;;
+        *[!0]*) ;;
+        *) continue ;;  # the tag is being deleted
+    esac
+    case "$tag" in
+        $ALT_TAG_GLOB) ;;
+        *) continue ;;
+    esac
+    mkdir -p "$log_dir" 2>/dev/null || continue
+    nohup sh -c "$waiter" alt-pre-push "$ALT_BIN" "$ALT_BID" "$tag" "$remote" "$timeout" "$interval" \
+        "$local_sha" </dev/null >>"$log_dir/hook.log" 2>&1 &
+done
+exit 0
