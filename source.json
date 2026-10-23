@@ -64,62 +64,6 @@
       "versionDescription": "Version 0.2.3",
       "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.3/NukeBrowser-0.2.3.ipa",
       "size": 27373003
-    },
-    {
-      "name": "Selftest",
-      "bundleIdentifier": "io.github.xuniv.alt.selftest",
-      "developerName": "xuniv",
-      "subtitle": "Pipeline self-test",
-      "localizedDescription": "A minimal app used to verify the build, gate and catalog pipeline.",
-      "iconURL": "https://xuniv.github.io/alt/apps/io.github.xuniv.alt.selftest/icon.png",
-      "tintColor": "5B6CFF",
-      "category": "developer",
-      "versions": [
-        {
-          "version": "0.0.5",
-          "buildVersion": "4",
-          "marketingVersion": "0.0.5",
-          "date": "2026-10-23T13:24:48Z",
-          "localizedDescription": "Version 0.0.5",
-          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.5/Selftest-0.0.5.ipa",
-          "size": 20949,
-          "sha256": "1302ac521037dc12ed45b1f46a1423c48ecb5353394d63edaaf84f4a09676d30",
-          "minOSVersion": "17.0"
-        },
-        {
-          "version": "0.0.2",
-          "buildVersion": "4",
-          "marketingVersion": "0.0.2",
-          "date": "2026-10-23T15:14:58Z",
-          "localizedDescription": "Version 0.0.2",
-          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.2/Selftest-0.0.2.ipa",
-          "size": 20949,
-          "sha256": "a20edbc1e4d34516095be6ba30a05a7c515b064377382fe32135fb8d6230c190",
-          "minOSVersion": "17.0"
-        },
-        {
-          "version": "0.0.1",
-          "buildVersion": "4",
-          "marketingVersion": "0.0.1",
-          "date": "2026-10-23T12:35:58Z",
-          "localizedDescription": "Version 0.0.1",
-          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.1/Selftest-0.0.1.ipa",
-          "size": 20949,
-          "sha256": "7215b7845f567ad9a1b69d273c96cf422d1ba31a502387f83855b8fcdf239798",
-          "minOSVersion": "17.0"
-        }
-      ],
-      "appPermissions": {
-        "entitlements": [],
-        "privacy": {
-          "NSCameraUsageDescription": "Declared to exercise source permission generation."
-        }
-      },
-      "version": "0.0.5",
-      "versionDate": "2026-10-23T13:24:48Z",
-      "versionDescription": "Version 0.0.5",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.5/Selftest-0.0.5.ipa",
-      "size": 20949
     }
   ]
 }
