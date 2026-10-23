@@ -1,13 +1,14 @@
 #!/bin/sh
 # alt-pre-push-hook: installed by "alt hook install", removed by "alt hook uninstall".
 #
-# For every pushed tag that matches the glob below, start "alt build <bid> <tag>" in the background
-# as soon as the remote tag points at the pushed object (checked for up to ALT_HOOK_TIMEOUT seconds,
-# default 600). A rejected push, for example of a tag that already exists on the remote at another
-# commit, starts no build. The hook prints nothing, never fails and never delays the push. A pre-push hook that existed
-# before was moved to pre-push.alt-chained; it runs first, with the same arguments and input, and its
-# exit status still decides the push. Output of the background job goes to
-# ${ALT_CACHE_DIR:-~/.cache/xuniv-alt}/hook.log.
+# For every pushed tag that matches the glob below and is a valid build ref (the rules of build.yml's
+# ref input), start "alt build <bid> <tag>" in the background as soon as the remote tag points at the
+# pushed object (checked for up to ALT_HOOK_TIMEOUT seconds, default 600). A rejected push, for
+# example of a tag that already exists on the remote at another commit, starts no build. The hook
+# prints nothing, never fails and never delays the push. A pre-push hook that existed before was
+# moved to pre-push.alt-chained; it runs first, with the same arguments and input, and its exit
+# status still decides the push. Output of the background job, and a line for each skipped invalid
+# tag, goes to ${ALT_CACHE_DIR:-~/.cache/xuniv-alt}/hook.log.
 
 ALT_BIN=@ALT_BIN@
 ALT_BID=@ALT_BID@
@@ -45,6 +46,8 @@ case "$timeout" in ''|*[!0-9]*) timeout=600 ;; esac
 case "$interval" in ''|*[!0-9]*) interval=10 ;; esac
 [ "$interval" -ge 1 ] || interval=10
 log_dir=${ALT_CACHE_DIR:-${HOME:-/nonexistent}/.cache/xuniv-alt}
+# spelled out instead of A-Za-z0-9: a range in a bracket expression depends on the locale
+alnum=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 
 # runs detached: $1 alt, $2 bundle id, $3 tag, $4 remote, $5 timeout, $6 interval, $7 pushed object
 # id (for an annotated tag the tag object, which ls-remote also lists for refs/tags/<tag>)
@@ -79,6 +82,17 @@ printf '%s\n' "$refs" | while read -r local_ref local_sha remote_ref remote_sha;
         *) continue ;;
     esac
     mkdir -p "$log_dir" 2>/dev/null || continue
+    # the rules of build.yml's ref input: the run title "build <bid> <tag>" is public as soon as a
+    # build is dispatched (alt build checks them again and also refuses denylist terms)
+    case "$tag" in
+        [!$alnum]* | *[!$alnum._/-]* | *..* | *//* | */.* | */ | *. | *.lock) valid=no ;;
+        *) valid=yes ;;
+    esac
+    if [ "$valid" != yes ] || [ "${#tag}" -gt 128 ]; then
+        printf '%s tag %s: not a valid build ref; no build started\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" >>"$log_dir/hook.log" 2>/dev/null
+        continue
+    fi
     nohup sh -c "$waiter" alt-pre-push "$ALT_BIN" "$ALT_BID" "$tag" "$remote" "$timeout" "$interval" \
         "$local_sha" </dev/null >>"$log_dir/hook.log" 2>&1 &
 done

@@ -89,6 +89,10 @@ GH_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 BID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+/-]{0,199}$")
+# what build.yml accepts for its inputs app and ref (and bin/alt-hook-pre-push for pushed tags); the
+# run title "build <app> <ref>" is public as soon as the run is dispatched, before any job runs
+BUILD_BID_MAX = 155
+BUILD_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 GLOB_RE = re.compile(r"^[A-Za-z0-9._*?/+!\[\]-]{1,100}$")
 SHA256_RE = re.compile(r"^[0-9A-Fa-f]{64}$")
 PUBKEY_RE = re.compile(r"^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$")
@@ -237,6 +241,22 @@ def check_ref(ref: str, what: str = "ref") -> str:
     if (not REF_RE.match(ref or "") or ".." in ref or "//" in ref or ref.endswith(("/", ".", ".lock"))
             or "/." in ref):
         raise OpError("invalid %s" % what)
+    return ref
+
+
+def check_build_bid(bid: str) -> str:
+    """A bundle identifier that build.yml accepts as its ``app`` input."""
+    check_bid(bid)
+    if len(bid) > BUILD_BID_MAX:
+        raise OpError("invalid bundle identifier (at most %d characters for a build)" % BUILD_BID_MAX)
+    return bid
+
+
+def check_build_ref(ref: str) -> str:
+    """A tag name that build.yml accepts as its ``ref`` input (no ``+``, at most 128 characters)."""
+    if (not BUILD_REF_RE.match(ref or "") or ".." in ref or "//" in ref or "/." in ref
+            or ref.endswith(("/", ".", ".lock"))):
+        raise OpError("invalid ref: build.yml accepts letters, digits and . _ / - (at most 128 characters)")
     return ref
 
 
@@ -424,8 +444,14 @@ def cmd_mirror(args: argparse.Namespace, ctx: Ctx) -> int:
 # -- build / ingest ---------------------------------------------------------------------------------
 
 def cmd_build(args: argparse.Namespace, ctx: Ctx) -> int:
-    bid = check_bid(args.bid)
-    ref = check_ref(args.ref)
+    bid = check_build_bid(args.bid)
+    ref = check_build_ref(args.ref)
+    # the run title is public from the dispatch on, so it is gated like release notes before any gh call
+    title = "build %s %s" % (bid, ref)
+    denylist = load_denylist(ctx)
+    findings = text_findings(ctx.deps, title, denylist, "run title")
+    if findings:
+        return _rejected(ctx, findings, denylist, "run title")
     preflight(ctx)
     if not private_build_enabled(ctx, bid):
         ctx.warn("apps/%s/app.json in this checkout does not enable privateBuild; the build will refuse "
@@ -585,13 +611,29 @@ def _get_environment(ctx: Ctx, environment: str) -> Optional[Dict[str, Any]]:
 
 
 def _branch_policies(ctx: Ctx, environment: str) -> List[Dict[str, Any]]:
+    """Every deployment branch and tag policy of ``environment``."""
     data = ctx.gh.json(["api", _env_path(ctx, environment) + "/deployment-branch-policies?per_page=100"])
     policies = data.get("branch_policies") if isinstance(data, dict) else None
-    return [p for p in policies or [] if isinstance(p, dict)]
+    if not isinstance(policies, list):
+        raise OpError("unexpected deployment branch policy listing for environment %s" % environment)
+    policies = [p for p in policies if isinstance(p, dict)]
+    total = data.get("total_count")
+    if isinstance(total, int) and total > len(policies):
+        raise OpError("environment %s has more than %d deployment branch policies; remove them on GitHub"
+                      % (environment, len(policies)))
+    return policies
+
+
+def _is_main_policy(policy: Dict[str, Any]) -> bool:
+    return policy.get("name") == ENV_BRANCH and policy.get("type", "branch") == "branch"
 
 
 def ensure_environment(ctx: Ctx, environment: str) -> None:
-    """Create or update ``environment`` so that only ``main`` may use its secrets."""
+    """Create or update ``environment`` so that only ``main`` may use its secrets.
+
+    The deployment policies end up as exactly one branch policy ``main``: other branch policies (such as
+    ``*``) and every tag policy of an earlier setup are deleted.
+    """
     body = {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
     ctx.gh(["api", "--method", "PUT", _env_path(ctx, environment), "--input", "-"],
            input=json.dumps(body).encode("utf-8"), write=True)
@@ -599,11 +641,42 @@ def ensure_environment(ctx: Ctx, environment: str) -> None:
         policies: List[Dict[str, Any]] = []
     else:
         policies = _branch_policies(ctx, environment)
-    if not any(p.get("name") == ENV_BRANCH and p.get("type", "branch") == "branch" for p in policies):
+    kept = False
+    for policy in policies:
+        if _is_main_policy(policy) and not kept:
+            kept = True
+            continue
+        policy_id = policy.get("id")
+        if not isinstance(policy_id, int) or isinstance(policy_id, bool):
+            raise OpError("a deployment policy of environment %s has no id; remove it on GitHub" % environment)
+        ctx.gh(["api", "--method", "DELETE", "%s/deployment-branch-policies/%d"
+                % (_env_path(ctx, environment), policy_id)], write=True)
+        if not ctx.dry_run:
+            ctx.print("deployment %s policy %s removed from environment %s"
+                      % ("tag" if policy.get("type") == "tag" else "branch", policy.get("name"), environment))
+    if not kept:
         ctx.gh(["api", "--method", "POST", _env_path(ctx, environment) + "/deployment-branch-policies",
                 "-f", "name=" + ENV_BRANCH, "-f", "type=branch"], write=True)
     if not ctx.dry_run:
         ctx.print("environment %s allows deployments from %s only" % (environment, ENV_BRANCH))
+
+
+def environment_problem(ctx: Ctx, info: Dict[str, Any], environment: str) -> Optional[str]:
+    """Why ``environment`` does not limit its secrets to ``main`` alone, or None."""
+    policy = info.get("deployment_branch_policy")
+    if not isinstance(policy, dict):
+        return "every branch may use its secrets; allow %s only (run alt register)" % ENV_BRANCH
+    if policy.get("protected_branches") is not False or policy.get("custom_branch_policies") is not True:
+        return "not limited to selected branches; allow %s only (run alt register)" % ENV_BRANCH
+    policies = _branch_policies(ctx, environment)
+    if not any(_is_main_policy(p) for p in policies):
+        return "%s is not an allowed branch (run alt register)" % ENV_BRANCH
+    others = [p for p in policies if not _is_main_policy(p)]
+    if others:
+        tags = sum(1 for p in others if p.get("type") == "tag")
+        return ("deployment policies besides %s: %d (%d for tags); run alt register to remove them"
+                % (ENV_BRANCH, len(others), tags))
+    return None
 
 
 def _legacy_secrets(names: Sequence[str], alias: Optional[str] = None) -> List[str]:
@@ -908,10 +981,14 @@ def render_hook(alt_bin: str, bid: str, tag_glob: str, template: str = HOOK_TEMP
 
 
 def cmd_hook_install(args: argparse.Namespace, ctx: Ctx) -> int:
-    bid = check_bid(args.bid)
+    bid = check_build_bid(args.bid)
     if not GLOB_RE.match(args.tag_glob or ""):
         raise OpError("--tag-glob may only use letters, digits and . _ - + / * ? [ ] !")
-    preflight(ctx, write=False)
+    denylist = preflight(ctx, write=False)
+    # every build the hook starts carries the bundle identifier in its public run title
+    findings = text_findings(ctx.deps, bid, denylist, "bundle identifier")
+    if findings:
+        return _rejected(ctx, findings, denylist, "bundle identifier")
     hooks = hooks_dir(ctx, args.path)
     hook = os.path.join(hooks, HOOK_NAME)
     chained = os.path.join(hooks, CHAINED_NAME)
@@ -1164,12 +1241,9 @@ def cmd_doctor(args: argparse.Namespace, ctx: Ctx) -> int:
         info = _get_environment(ctx, environment)
         if info is None:
             return "missing (run alt register)"
-        policy = info.get("deployment_branch_policy")
-        if not isinstance(policy, dict):
-            return "every branch may use its secrets; allow %s only" % ENV_BRANCH
-        if policy.get("custom_branch_policies") is True and not any(
-                p.get("name") == ENV_BRANCH for p in _branch_policies(ctx, environment)):
-            return "%s is not an allowed branch" % ENV_BRANCH
+        problem = environment_problem(ctx, info, environment)
+        if problem:
+            return problem
         names = set(_secret_names(ctx, environment))
         missing = [n for n in (ENV_KEY_SECRET, ENV_APP_SECRET) if n not in names]
         return ("missing secret " + ", ".join(missing)) if missing else None

@@ -8,7 +8,9 @@
 #              ^v<semver>$), which yields the version
 #     publish  boolean, default true; false stops after the gate (no release)
 #     notes    optional release notes, at most 4000 characters, gated like the IPA
-#   The run title is "build <app> <ref>"; poll.yml looks runs up by it.
+#   The run title is "build <app> <ref>"; poll.yml looks runs up by it. It is public from the moment
+#   of the dispatch, before the app job validates the inputs, so bin/alt build (also run by the
+#   pre-push hook) and poll.yml apply the same input rules and the denylist before they dispatch.
 #
 # Configuration (ALIAS = bundle identifier upper-cased, every non-alphanumeric character as "_"):
 #   environment alt-<ALIAS>         one per app (bin/alt register), deployments from main only, with
@@ -28,12 +30,15 @@
 #            with the pinned host keys in .github/known_hosts, reads .alt.json at the tag and
 #            validates the merged configuration.
 #   build    (macOS runner named by the configuration, environment alt-<ALIAS>) fetches the private
-#            repository with its tags, removes the key, checks out the resolved commit (the tag's
-#            current commit when the runner withheld that output) and resolves the configuration again
-#            from it, selects /Applications/Xcode_<xcode>.app, installs allowlisted tools with brew,
-#            runs the build command (bash -eo pipefail) in the checkout with VERSION, ALT_OUT and the
-#            configured env set (in that step only), writing its output to a file only, and takes the
-#            single IPA matching ipa_glob (searched in ALT_OUT first, then in the checkout). The private
+#            repository with its tags into the generic directory $RUNNER_TEMP/src (paths compiled into
+#            the binaries never name the private repository), removes the key, checks out the resolved
+#            commit (the tag's current commit when the runner withheld that output) and resolves the
+#            configuration again from it, selects /Applications/Xcode_<xcode>.app, installs
+#            allowlisted tools with brew, runs the build command (bash -eo pipefail) in the checkout
+#            under env -i with an allowlisted environment (a few runner basics, VERSION, ALT_OUT and
+#            the configured env; no token, no ACTIONS_* or RUNNER_* variable, and the GITHUB_* file
+#            variables name throwaway files), writing its output to a file only, and takes the single
+#            IPA matching ipa_glob (searched in ALT_OUT first, then in the checkout). The private
 #            build command and its dependencies run on this runner as the same user as every later
 #            step, so the job holds no denylist and nothing it checks is trusted: it normalizes the
 #            IPA, encrypts it to ALT_PAYLOAD_RECIPIENT and uploads it as the "payload" artifact
@@ -389,6 +394,8 @@ jobs:
           export GIT_SSH_COMMAND="ssh -F /dev/null -i '$ssh_dir/key' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$GITHUB_WORKSPACE/.github/known_hosts' -o GlobalKnownHostsFile=/dev/null"
           export GIT_TERMINAL_PROMPT=0
           export GIT_LFS_SKIP_SMUDGE=1
+          # a generic path ($RUNNER_TEMP is /Users/runner/work/_temp on hosted runners): source paths
+          # that the compiler embeds in the binaries never contain the private repository name
           src="$RUNNER_TEMP/src"
           rm -rf "$src"
           git init -q "$src" >>"$diag/git.log" 2>&1
@@ -507,32 +514,55 @@ jobs:
         env:
           VERSION: ${{ steps.config.outputs.version }}
         run: |
+          # The command runs under "env -i" with an allowlisted environment: no token, no ACTIONS_*,
+          # RUNNER_* or GITHUB_ACTIONS variable, and none of the files through which a step writes to
+          # the job (step summary, outputs, env, path, state). Those variables name empty throwaway
+          # files instead, so a script that writes to them by accident still runs. This guards against
+          # accidents only: a hostile command runs as the runner user and can find the runner's files.
+          # Kept compatible with bash 3.2.
           work="$RUNNER_TEMP/alt-build"
-          python3 - "$work/config.json" "$work/command.sh" "$work/env.txt" <<'PY'
-          import json, sys
-          with open(sys.argv[1], encoding="utf-8") as fh:
+          out="$RUNNER_TEMP/out"
+          actions="$work/actions"
+          rm -rf "$out" "$actions"
+          mkdir -p "$out" "$actions"
+          # PYTHONCOERCECLOCALE=0: Python must not add LC_CTYPE to the environment it passes on
+          PYTHONCOERCECLOCALE=0 python3 - "$work/config.json" "$work/command.sh" "$work/env.list" "$out" \
+            "$actions" <<'PY'
+          import json, os, re, sys
+          config_path, command_path, env_path, out, actions = sys.argv[1:6]
+          with open(config_path, encoding="utf-8") as fh:
               config = json.load(fh)
-          with open(sys.argv[2], "w", encoding="utf-8") as fh:
+          with open(command_path, "w", encoding="utf-8") as fh:
               fh.write(config["command"] + "\n")
-          env = json.loads(config["env"])
-          with open(sys.argv[3], "w", encoding="utf-8") as fh:
+          passed = ("PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "SHELL", "LANG", "DEVELOPER_DIR")
+          env = {k: v for k, v in os.environ.items() if k in passed or re.fullmatch(r"LC_[A-Z_]+", k)}
+          env.setdefault("LANG", "en_US.UTF-8")
+          env["TERM"] = "dumb"
+          env.update(json.loads(config["env"]))  # resolve-build refused reserved names
+          env.update(VERSION=os.environ["VERSION"], ALT_OUT=out, CI="true")
+          for key in ("GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY"):
+              path = os.path.join(actions, key.lower())
+              open(path, "w").close()
+              env[key] = path
+          with open(env_path, "wb") as fh:
               for key in sorted(env):
-                  fh.write("%s=%s\n" % (key, env[key]))
+                  if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and "\0" not in env[key]:
+                      fh.write(("%s=%s" % (key, env[key])).encode("utf-8", "surrogateescape") + b"\0")
           PY
           env_args=()
-          while IFS= read -r line; do
-            env_args+=("$line")
-          done < "$work/env.txt"
-          out="$RUNNER_TEMP/out"
-          rm -rf "$out"
-          mkdir -p "$out"
+          while IFS= read -r -d '' item; do
+            env_args+=("$item")
+          done < "$work/env.list"
+          rm -f "$work/env.list"
+          bash_bin=$(command -v bash)
           log="$RUNNER_TEMP/diag/build.log"
           start=$(date +%s)
           set +e
-          (cd "$RUNNER_TEMP/src" && exec env "${env_args[@]}" VERSION="$VERSION" ALT_OUT="$out" \
-            bash -eo pipefail "$work/command.sh") </dev/null >"$log" 2>&1
+          (cd "$RUNNER_TEMP/src" && exec env -i "${env_args[@]}" "$bash_bin" -eo pipefail "$work/command.sh") \
+            </dev/null >"$log" 2>&1
           code=$?
           set -e
+          rm -rf "$actions"
           minutes=$(( ($(date +%s) - start + 59) / 60 ))
           if [ "$code" -ne 0 ]; then
             echo "build failed, exit $code, $minutes minutes"

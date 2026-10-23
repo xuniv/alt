@@ -40,17 +40,18 @@ route 3  IPA at an https URL ----+
 ```
 
 - **stage** is the pre-publication gate. It re-packs the IPA deterministically and scans it for leaks
-  and signing material. Only then does it upload the IPA to a draft release and publish it. Nothing is
-  public before the gate passes.
+  and signing material. Only then does it upload the IPA to a draft release and publish it. On these
+  three routes nothing is public before the gate passes.
 - **sync** rebuilds every derived file from the full list of published releases and commits the
   result. It gates every published IPA it has not checked before (all of them on a rescan) and takes
   down any release that fails. Pages is deployed after a sync that committed a change, and on pushes
   and manual runs of the catalog workflow.
 
-A release published directly on GitHub skips stage: sync gates it after publication. If the IPA
-passes but was not re-packed, sync replaces it with the normalized form under the same name and
-publishes the release again. Route 2 builds new private tags when they are pushed, through an optional
-local pre-push hook.
+A release published directly on GitHub skips stage and its draft, so it has no pre-publication
+protection: it is public at once, and sync gates it only afterwards. Sync takes it down if it fails,
+and if the IPA passes but was not re-packed, sync replaces it with the normalized form and publishes
+the release again. Neither undoes what was public in between. Route 2 builds new private tags when
+they are pushed, through an optional local pre-push hook.
 
 Release tags follow `<bundleId>-v<semver>`, for example `io.example.demo-v1.4.0`.
 

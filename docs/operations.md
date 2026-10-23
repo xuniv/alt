@@ -4,7 +4,7 @@
 
 | Name | Kind | Used by | Content |
 |---|---|---|---|
-| `ALT_DENYLIST` | repository secret | every step that scans: `stage.yml`, the gate job of `build.yml`, `ingest.yml`, `catalog.yml` (never the macOS build job) | denylist terms, one per line |
+| `ALT_DENYLIST` | repository secret | every step that scans: `stage.yml`, the gate job of `build.yml`, `ingest.yml`, `catalog.yml`, and `poll.yml` for the run titles it would create (never the macOS build job) | denylist terms, one per line |
 | `ALT_PAYLOAD_IDENTITY` | repository secret | the gate job of `build.yml` | `age` identity that decrypts the payload artifact |
 | `ALT_PAYLOAD_RECIPIENT` | variable | the build job of `build.yml` | its `age` recipient; the built IPA is encrypted to it before it is uploaded |
 | `ALT_LOG_RECIPIENT` | variable | `build.yml` | `age` recipient that build logs are encrypted to |
@@ -17,11 +17,11 @@
 [onboarding.md](onboarding.md).
 
 Every secret is referenced by a fixed name, so a job receives only the secrets it names. The per-app
-secrets sit in one environment per app (deployments from `main` only, used with `deployment: false`),
-so the macOS runner that runs a private build gets only that app's `ALT_KEY` and `ALT_APP`: no denylist,
-no payload identity and nothing of other apps. Repository secrets named `ALT_KEY_<ALIAS>` or
-`ALT_APP_<ALIAS>` come from an earlier version and are not read any more; `bin/alt register --rotate`
-removes them.
+secrets sit in one environment per app (with exactly one deployment branch policy, `main`, and used
+with `deployment: false`), so the macOS runner that runs a private build gets only that app's
+`ALT_KEY` and `ALT_APP`: no denylist, no payload identity and nothing of other apps. Repository
+secrets named `ALT_KEY_<ALIAS>` or `ALT_APP_<ALIAS>` come from an earlier version and are not read any
+more; `bin/alt register --rotate` removes them.
 
 The workflows need no personal token: they use the job's `GITHUB_TOKEN`, and each job is granted only
 the permissions it needs. Releases created with `GITHUB_TOKEN` trigger no `release` events, so
@@ -138,7 +138,14 @@ timing, logs and artifacts. That is why `build.yml` uploads the built IPA only e
 `ALT_PAYLOAD_RECIPIENT`) and deletes it after the gate job, and its logs only encrypted (to
 `ALT_LOG_RECIPIENT`). The workflows mask private values such as the private repository name, the
 build command and dispatch URLs. Masking does not cover run titles, step names or anything you type
-into notes, commit messages or other inputs, so keep private data out of them.
+into notes, commit messages or other inputs, so keep private data out of them. A build's run title
+(`build <bundleId> <ref>`) is public as soon as the build is dispatched; `bin/alt build`, the pre-push
+hook and `poll.yml` refuse a ref that `build.yml` would reject or a title with a denylist term or a
+home path (see [routes.md](routes.md#what-the-public-can-see)).
+
+Only the routes that stage a draft protect an IPA before it is public. A release published directly on
+GitHub is public at once; `sync` checks it afterwards and takes it down or normalizes it, which cannot
+undo the time it was public (see [routes.md](routes.md#publishing-a-release-directly)).
 
 Do not use the GitHub web editor for commits: it records the browser's time zone in the author date.
 Use `git` or the tools.
@@ -271,6 +278,10 @@ there when the gate job rejected the IPA; it is kept for 3 days. The gate's find
 log of the gate job, as rule ids, counts and paths inside the IPA. After fixing the cause, run
 `bin/alt build BID REF` again, or tag a new version. `poll.yml` does not retry a tag that had a build
 run in the last 30 days.
+
+The build command runs under `env -i` (see [routes.md](routes.md#the-build-environment)). A script that
+reads runner variables (`RUNNER_TEMP`, `GITHUB_WORKSPACE`, `JAVA_HOME` and the like) finds them unset:
+use `ALT_OUT` or `TMPDIR` for scratch files and pass anything else through the `env` build setting.
 
 If the gate job says `the payload could not be decrypted`, `ALT_PAYLOAD_RECIPIENT` does not belong to
 `ALT_PAYLOAD_IDENTITY` (for example after an interrupted rotation): run `bin/alt payload-key --rotate`

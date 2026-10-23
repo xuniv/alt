@@ -13,6 +13,9 @@
 #   release <bid>-v<version> (drafts are not listed for a read-only token) and no build.yml run titled
 #   "build <bid> <tag>" was created in the last 30 days, whatever its state. At most two builds per app
 #   are dispatched, newest version first. Job names carry no matrix values and the log shows counts only.
+#   The run title is public as soon as a build is dispatched, so a tag that build.yml would refuse as
+#   its ref, or whose run title holds a denylist term or a home path (repository secret ALT_DENYLIST,
+#   required), is never dispatched; it is only counted as refused.
 name: poll
 
 on:
@@ -157,6 +160,7 @@ jobs:
           ALT_REPO: ${{ github.repository }}
           BID: ${{ matrix.app.bid }}
           DRY_RUN: ${{ inputs.dry_run }}
+          ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}
           ALT_APP_CONFIG: ${{ secrets.ALT_APP }}
           ALT_DEPLOY_KEY: ${{ secrets.ALT_KEY }}
         run: |
@@ -196,12 +200,29 @@ jobs:
           import datetime, json, os, re, sys
           from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
           from altsource.gh import GhError, GitHub
+          from altsource.leaks import GateError, load_denylist, scan_text
           from altsource.stage import Toolkit, parse_semver
 
           MAX_PER_APP = 2
+          # the rules of build.yml's ref input
+          REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
           deps = Toolkit()
           bid = os.environ["BID"]
           dry_run = os.environ.get("DRY_RUN") == "true"
+          try:
+              denylist = load_denylist()
+          except GateError:
+              print("::error::secret ALT_DENYLIST is missing or empty")
+              sys.exit(1)
+
+
+          def refused(name):
+              if (not REF_RE.fullmatch(name) or ".." in name or "//" in name or "/." in name
+                      or name.endswith(("/", ".", ".lock"))):
+                  return True
+              return bool(scan_text("build %s %s" % (bid, name), denylist))
+
+
           try:
               with open(os.path.join("apps", bid, "app.json"), encoding="utf-8") as fh:
                   private = json.load(fh).get("privateBuild") or {}
@@ -213,6 +234,7 @@ jobs:
               sys.exit(1)
 
           versions = {}
+          refusals = set()
           with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
               for line in fh:
                   ref = line.rstrip("\n").partition("\t")[2]
@@ -226,6 +248,9 @@ jobs:
                   try:
                       tag = deps.make_tag(bid, version)
                   except Exception:
+                      continue
+                  if refused(name):
+                      refusals.add(name)
                       continue
                   versions.setdefault(version, (name, tag))
 
@@ -247,6 +272,7 @@ jobs:
           except GhError as exc:
               print("::error::" + str(exc))
               sys.exit(1)
-          print("matching tags: %d, candidates: %d, %s: %d" % (
-              len(versions), len(candidates), "would dispatch" if dry_run else "dispatched", len(chosen)))
+          print("matching tags: %d, refused: %d, candidates: %d, %s: %d" % (
+              len(versions), len(refusals), len(candidates), "would dispatch" if dry_run else "dispatched",
+              len(chosen)))
           PY
