@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "tag": "io.github.xuniv.alt.selftest-v0.0.3",
+  "bundleIdentifier": "io.github.xuniv.alt.selftest",
+  "semver": "0.0.3",
+  "version": "0.0.3",
+  "buildVersion": "003",
+  "prerelease": false,
+  "date": "2026-10-23T12:28:06Z",
+  "localizedDescription": "Self-test of the staged release route.",
+  "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.xuniv.alt.selftest-v0.0.3/Selftest-0.0.3.ipa",
+  "size": 20950,
+  "sha256": "e15c9992372e861033920efeab69f577effa122459989b86c1f95f402a7c8d91",
+  "minOSVersion": "17.0",
+  "releaseId": 421815875,
+  "assetId": 669058474,
+  "assetDigest": "sha256:e15c9992372e861033920efeab69f577effa122459989b86c1f95f402a7c8d91",
+  "name": "Selftest",
+  "privacy": {
+    "NSCameraUsageDescription": "Declared to exercise source permission generation."
+  },
+  "entitlements": []
+}
