@@ -1,0 +1,83 @@
+# poll-watch: start the poll loop (poll.yml with loop=true) again when no loop run is active, for
+# example after GitHub cancelled a run or the loop was stopped by hand.
+#
+# Triggers
+#   schedule           41 * * * * (UTC). GitHub starts scheduled runs of this repository hours late,
+#                      which is fine for a watchdog. It disables the schedule after 60 days without
+#                      repository activity; the loop itself has no schedule and keeps running.
+#                      bin/alt build (and so the pre-push hook) enables the schedule again, and
+#                      bin/alt doctor reports it.
+#   workflow_dispatch  no inputs.
+#
+# A loop run is active while a poll.yml run titled "poll loop" is not completed (the job "next" waits
+# for the wait timer of alt-poll-timer meanwhile). To stop the loop for good, disable this workflow,
+# cancel the active loop run and delete the environment alt-poll-timer; while that environment has a
+# wait timer, bin/alt build (and so the pre-push hook) starts the loop again.
+name: poll-watch
+
+on:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: alt-poll-watch
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start the loop if it stopped
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::poll-watch only runs on main"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os, sys, time
+          from altsource.gh import GhError, GitHub
+
+          LOOP_TITLE = "poll loop"
+          try:
+              gh = GitHub()
+              listed = gh.api("GET", "repos/%s/actions/workflows/poll.yml/runs" % gh.repo, fields={"per_page": 30})
+              runs = listed.get("workflow_runs") if isinstance(listed, dict) else None
+              if not isinstance(runs, list):
+                  raise GhError("unexpected run listing")
+              if any(isinstance(r, dict) and r.get("display_title") == LOOP_TITLE and r.get("status") != "completed"
+                     for r in runs):
+                  print("the poll loop is running")
+                  sys.exit(0)
+              for attempt in range(3):  # a POST is not retried by the client
+                  try:
+                      gh.dispatch_workflow("poll.yml", "main", {"loop": "true"})
+                      break
+                  except GhError:
+                      if attempt == 2:
+                          raise
+                      time.sleep(int(os.environ.get("ALT_RETRY_SECONDS") or 20) * (attempt + 1))
+          except GhError as exc:
+              print("::error::the poll loop could not be checked or started: %s" % exc)
+              sys.exit(1)
+          print("the poll loop was not running; started it")
+          PY

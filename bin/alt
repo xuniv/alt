@@ -75,8 +75,15 @@ DEFAULT_OWNER = "xuniv"
 DEFAULT_REPO = "xuniv/alt"
 KEY_TITLE = "alt-build"
 STATUS_WORKFLOWS = ("build.yml", "ingest.yml", "stage.yml", "catalog.yml")
-REQUIRED_WORKFLOWS = ("catalog.yml", "stage.yml", "build.yml", "ingest.yml", "poll.yml", "ci.yml")
-SCHEDULED_WORKFLOWS = ("poll.yml", "stage.yml", "catalog.yml")
+REQUIRED_WORKFLOWS = ("catalog.yml", "stage.yml", "build.yml", "ingest.yml", "poll.yml", "poll-watch.yml",
+                      "ci.yml")
+SCHEDULED_WORKFLOWS = ("poll-watch.yml", "stage.yml", "catalog.yml")
+# poll.yml with loop=true: its last job waits for the wait timer of POLL_TIMER_ENV, then starts the next run
+POLL_TIMER_ENV = "alt-poll-timer"
+POLL_LOOP_TITLE = "poll loop"
+POLL_MINUTES = 15
+POLL_MINUTES_MIN = 5  # the next job refuses to dispatch sooner
+POLL_MINUTES_MAX = 1440
 REQUIRED_SECRETS = ("ALT_DENYLIST", "ALT_PAYLOAD_IDENTITY")
 REQUIRED_VARIABLES = ("ALT_LOG_RECIPIENT", "ALT_PAYLOAD_RECIPIENT")
 # per-app secrets live in the GitHub environment alt-<ALIAS> under fixed names, so that a workflow job
@@ -661,6 +668,7 @@ def cmd_build(args: argparse.Namespace, ctx: Ctx) -> int:
         if reason:
             ctx.print("no build started: %s %s %s" % (bid, ref, reason))
             revive_schedules(ctx)
+            keep_poll_loop(ctx)
             return EXIT_OK
     publish = "false" if args.no_publish else "true"
     inputs = ["-f", "app=" + bid, "-f", "ref=" + ref, "-f", "publish=" + publish]
@@ -672,6 +680,7 @@ def cmd_build(args: argparse.Namespace, ctx: Ctx) -> int:
                   % (bid, ref, publish, " force=true" if args.force else ""))
         _echo(ctx, proc)
     revive_schedules(ctx)
+    keep_poll_loop(ctx)
     return EXIT_OK
 
 
@@ -705,6 +714,73 @@ def known_build(ctx: Ctx, bid: str, ref: str, title: str) -> Optional[str]:
     except (OpError, ValueError):
         ctx.warn("existing builds could not be checked; starting the build")
     return None
+
+
+def wait_timer_of(info: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """The wait timer (minutes) among an environment's protection rules, or None."""
+    rules = info.get("protection_rules") if isinstance(info, Mapping) else None
+    for rule in rules or []:
+        if isinstance(rule, dict) and rule.get("type") == "wait_timer":
+            minutes = rule.get("wait_timer")
+            if isinstance(minutes, int) and not isinstance(minutes, bool):
+                return minutes
+    return None
+
+
+def poll_loop_active(ctx: Ctx) -> Optional[bool]:
+    """Whether a poll.yml run titled "poll loop" is not completed yet (None: unknown)."""
+    try:
+        data = ctx.gh.json(["api", "repos/%s/actions/workflows/poll.yml/runs?per_page=30" % ctx.settings.repo],
+                           check=False)
+    except OpError:
+        return None
+    runs = data.get("workflow_runs") if isinstance(data, dict) else None
+    if not isinstance(runs, list):
+        return None
+    return any(isinstance(r, dict) and r.get("display_title") == POLL_LOOP_TITLE and r.get("status") != "completed"
+               for r in runs)
+
+
+def start_poll_loop(ctx: Ctx) -> None:
+    ctx.gh(["workflow", "run", "poll.yml", "-R", ctx.settings.repo, "-f", "loop=true"], write=True)
+    if not ctx.dry_run:
+        ctx.print("started the poll loop")
+
+
+def keep_poll_loop(ctx: Ctx) -> None:
+    """Start the poll loop when it is known to have stopped and its timer environment is set up.
+
+    Best effort, like :func:`revive_schedules`: a failure is only a warning.
+    """
+    try:
+        minutes = wait_timer_of(_get_environment(ctx, POLL_TIMER_ENV))
+    except OpError:
+        return
+    if minutes is None or minutes < POLL_MINUTES_MIN or poll_loop_active(ctx) is not False:
+        return
+    try:
+        start_poll_loop(ctx)
+    except OpError:
+        ctx.warn("the poll loop has stopped and could not be started; run alt poller")
+
+
+def cmd_poller(args: argparse.Namespace, ctx: Ctx) -> int:
+    minutes = args.minutes
+    if not POLL_MINUTES_MIN <= minutes <= POLL_MINUTES_MAX:
+        raise OpError("--minutes must be between %d and %d" % (POLL_MINUTES_MIN, POLL_MINUTES_MAX))
+    preflight(ctx)
+    ensure_environment(ctx, POLL_TIMER_ENV, wait_timer=minutes)
+    if not ctx.dry_run:
+        ctx.print("environment %s waits %d minute(s) between polls" % (POLL_TIMER_ENV, minutes))
+    active = poll_loop_active(ctx)
+    if active is None:
+        raise OpError("the runs of poll.yml could not be listed; start the loop with "
+                      "gh workflow run poll.yml -R %s -f loop=true" % ctx.settings.repo)
+    if active:
+        ctx.print("the poll loop is running; the new interval applies from its next wait")
+        return EXIT_OK
+    start_poll_loop(ctx)
+    return EXIT_OK
 
 
 def revive_schedules(ctx: Ctx) -> None:
@@ -1097,13 +1173,15 @@ def _is_main_policy(policy: Dict[str, Any]) -> bool:
     return policy.get("name") == ENV_BRANCH and policy.get("type", "branch") == "branch"
 
 
-def ensure_environment(ctx: Ctx, environment: str) -> None:
+def ensure_environment(ctx: Ctx, environment: str, wait_timer: Optional[int] = None) -> None:
     """Create or update ``environment`` so that only ``main`` may use its secrets.
 
     The deployment policies end up as exactly one branch policy ``main``: other branch policies (such as
-    ``*``) and every tag policy of an earlier setup are deleted.
+    ``*``) and every tag policy of an earlier setup are deleted. ``wait_timer`` (minutes) is set when given.
     """
-    body = {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
+    body: Dict[str, Any] = {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
+    if wait_timer is not None:
+        body["wait_timer"] = wait_timer
     ctx.gh(["api", "--method", "PUT", _env_path(ctx, environment), "--input", "-"],
            input=json.dumps(body).encode("utf-8"), write=True)
     if ctx.dry_run and _get_environment(ctx, environment) is None:
@@ -1816,6 +1894,22 @@ def cmd_doctor(args: argparse.Namespace, ctx: Ctx) -> int:
         environment = env_name(alias)
         report.check("environment %s" % environment, lambda e=environment: environment_check(e))
 
+    def poll_timer() -> Optional[str]:
+        info = _get_environment(ctx, POLL_TIMER_ENV)
+        if info is None:
+            return "missing (run alt poller)"
+        minutes = wait_timer_of(info)
+        if minutes is None or minutes < POLL_MINUTES_MIN:
+            return "needs a wait timer of at least %d minutes (run alt poller)" % POLL_MINUTES_MIN
+        problem = environment_problem(ctx, info, POLL_TIMER_ENV)
+        if problem:
+            return problem.replace("run alt register", "run alt poller")
+        if poll_loop_active(ctx) is False:
+            report.warn("the poll loop is not running; poll-watch.yml starts it within hours, alt poller at once")
+        return None
+
+    report.check("environment %s (poll loop)" % POLL_TIMER_ENV, poll_timer)
+
     def pages() -> Optional[str]:
         proc = ctx.gh(["api", "repos/%s/pages" % repo], check=False)
         if proc.returncode != 0:
@@ -1911,6 +2005,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--build-json", metavar="F", help="build configuration stored with the registration")
     p.add_argument("--rotate", action="store_true", help="replace an existing alt-build deploy key")
     p.set_defaults(func=cmd_register)
+
+    p = sub.add_parser("poller", parents=[common],
+                       help="set the interval of the poll loop (environment %s) and start the loop" % POLL_TIMER_ENV)
+    p.add_argument("--minutes", type=int, default=POLL_MINUTES, metavar="N",
+                   help="minutes between polls, %d to %d (default %d)" % (POLL_MINUTES_MIN, POLL_MINUTES_MAX,
+                                                                       POLL_MINUTES))
+    p.set_defaults(func=cmd_poller)
 
     p = sub.add_parser("unregister", parents=[common], help="remove the deploy key and the environment of an app")
     p.add_argument("bid", metavar="BID")

@@ -411,17 +411,18 @@ up.
   - The hook never passes `--force`: pushing a tag of a withdrawn version again builds nothing, while
     a tag of a new version builds as usual.
   - For a tag that is new on the remote, the hook passes `--if-new`: a tag that already has a
-    published release, or whose build is queued or running (for example one the scheduled `poll.yml`
-    started), starts no second build. A push that moves an existing tag (`git push -f`) always starts
+    published release, or whose build is queued or running (for example one the poll loop started),
+    starts no second build. A push that moves an existing tag (`git push -f`) always starts
     a build of the new commit. After deleting a tag and pushing it again while its first build is
     still running, start the build with `bin/alt build` once that run has ended.
   - The hook stores the absolute path of `bin/alt`; after moving this checkout, run `hook install`
     again. Installing twice with the same options changes nothing. `hook install` refuses a
     repository that sets `core.hooksPath`.
   - Remove it with `bin/alt hook uninstall <path-to-private-clone>`, which restores a chained hook.
-- **Polling:** `poll.yml` runs every 15 minutes (at minutes 4, 19, 34 and 49, UTC), so a tag pushed
-  without the hook, from another machine or created on GitHub, is built by the next run. Start it by
-  hand with `gh workflow run poll.yml -R xuniv/alt [-f app=BID] [-f dry_run=true]`. It checks only
+- **Polling:** `poll.yml` runs as a loop every 15 minutes (see
+  [operations.md](operations.md#the-poll-loop)), so a tag pushed without the hook, from another
+  machine or created on GitHub, is built by the next run. Start one poll by hand with
+  `gh workflow run poll.yml -R xuniv/alt [-f app=BID] [-f dry_run=true]`. It checks only
   registered apps: every app whose `app.json` enables `privateBuild` (or only `app`), each through the
   read-only deploy key of its own environment, which reaches that one repository and nothing else.
   It lists the private tags with `git ls-remote` and keeps those that match `tagPattern` and are not
@@ -432,9 +433,9 @@ up.
   first, after a 60 second pause and a second look at the run titles, so a tag that the hook started
   at the same moment is not built twice. Tags that `build.yml` would refuse, or whose run title
   contains a denylist term or a home path, are only counted as refused. With `dry_run` it only counts
-  them; scheduled runs are never dry runs.
+  them; loop runs are never dry runs.
 
-A tag whose build failed is not retried by `poll.yml` for 30 days; after that the schedule tries it
+A tag whose build failed is not retried by `poll.yml` for 30 days; after that the loop tries it
 once more every 30 days while it has no release. Start it again with `bin/alt build` once the cause is
 fixed, or delete the tag or raise `minVersion` to stop the retries.
 

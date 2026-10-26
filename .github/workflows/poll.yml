@@ -2,14 +2,19 @@
 # for them. It is the backstop for tags that no pre-push hook announced (pushed from another machine
 # or created on GitHub); the hook stays the fast path.
 #
-# Triggers
-#   schedule           4,19,34,49 * * * * (UTC, every 15 minutes, off the full hour that GitHub delays
-#                      most): every app whose app.json enables privateBuild, never a dry run. GitHub
-#                      disables the schedule after 60 days without repository activity; bin/alt build
-#                      (and so the pre-push hook) enables it again, and bin/alt doctor reports it.
-#   workflow_dispatch  inputs:
+# Trigger
+#   workflow_dispatch, inputs:
 #     app      bundle identifier (optional); empty checks every app whose app.json enables privateBuild
 #     dry_run  boolean, default false; count the candidates without dispatching builds
+#     loop     boolean, default false; keep polling: the run ends with the job "next", which waits for
+#              the wait timer of the environment alt-poll-timer (no runner is held meanwhile; set by
+#              bin/alt poller, default 15 minutes) and then dispatches poll.yml with loop=true again.
+#              Run title "poll loop". GitHub starts scheduled runs of this repository hours late, so
+#              the loop replaces a schedule; poll-watch.yml restarts it when it stopped.
+#   next refuses to dispatch when a newer loop run is active (two loops become one), and when this run
+#   started less than 5 minutes ago (the wait timer is missing); it tries the dispatch three times.
+#   Cancelling a loop run stops the loop until poll-watch.yml, bin/alt poller or bin/alt build starts it
+#   again; to stop it for good, also disable poll-watch.yml and delete the environment alt-poll-timer.
 #
 # Only registered apps are polled: apps/<bid>/app.json enables privateBuild, and the app's environment
 # holds the repository and a read-only deploy key for that repository alone (bin/alt register). The
@@ -34,10 +39,9 @@
 #   its ref, or whose run title holds a denylist term or a home path (repository secret ALT_DENYLIST,
 #   required), is never dispatched; it is only counted as refused.
 name: poll
+run-name: ${{ inputs.loop && 'poll loop' || 'poll' }}
 
 on:
-  schedule:
-    - cron: "4,19,34,49 * * * *"
   workflow_dispatch:
     inputs:
       app:
@@ -49,12 +53,12 @@ on:
         description: Count candidates without dispatching builds
         type: boolean
         default: false
+      loop:
+        description: Start the next run after the wait timer of environment alt-poll-timer
+        type: boolean
+        default: false
 
 permissions: {}
-
-concurrency:
-  group: alt-poll
-  cancel-in-progress: false
 
 defaults:
   run:
@@ -74,7 +78,6 @@ jobs:
       - name: Validate inputs
         env:
           APP: ${{ inputs.app }}
-          # a scheduled run has no inputs: never a dry run
           DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
           export LC_ALL=C
@@ -153,6 +156,11 @@ jobs:
       max-parallel: 4
       matrix:
         app: ${{ fromJSON(needs.list.outputs.apps) }}
+    # one check per app at a time, so two runs never both decide to build the same tag
+    concurrency:
+      group: alt-poll-${{ matrix.app.alias }}
+      cancel-in-progress: false
+      queue: max
     environment:
       name: alt-${{ matrix.app.alias }}
       deployment: false
@@ -331,4 +339,73 @@ jobs:
                 "started meanwhile: %d, %s: %d" % (
                     len(versions), len(older), len(refusals), len(skipped), len(candidates), len(late),
                     "would dispatch" if dry_run else "dispatched", len(chosen)))
+          PY
+
+  next:
+    needs: [list, check]
+    # whatever this run found; a cancelled run stops the loop
+    if: ${{ !cancelled() && inputs.loop }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    environment:
+      name: alt-poll-timer
+      deployment: false
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start the next run
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::the poll loop only runs on main"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import datetime, os, sys, time
+          from altsource.gh import GhError, GitHub
+
+          LOOP_TITLE = "poll loop"
+          MIN_MINUTES = 5
+          me = int(os.environ["RUN_ID"])
+          try:
+              gh = GitHub()
+              run = gh.api("GET", "repos/%s/actions/runs/%d" % (gh.repo, me))
+              started = datetime.datetime.strptime(run["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                  tzinfo=datetime.timezone.utc)
+              age = datetime.datetime.now(datetime.timezone.utc) - started
+              if age < datetime.timedelta(minutes=MIN_MINUTES):
+                  print("::error::this run started %d s ago: the environment alt-poll-timer needs a wait timer "
+                        "of at least %d minutes (bin/alt poller); the loop stops here"
+                        % (age.total_seconds(), MIN_MINUTES))
+                  sys.exit(1)
+              listed = gh.api("GET", "repos/%s/actions/workflows/poll.yml/runs" % gh.repo, fields={"per_page": 30})
+              runs = listed.get("workflow_runs") if isinstance(listed, dict) else None
+              if not isinstance(runs, list):
+                  raise GhError("unexpected run listing")
+              newer = [r for r in runs if isinstance(r, dict) and isinstance(r.get("id"), int) and r["id"] > me
+                       and r.get("display_title") == LOOP_TITLE and r.get("status") != "completed"]
+              if newer:
+                  print("a newer poll loop run is active; this loop ends here")
+                  sys.exit(0)
+              for attempt in range(3):  # a POST is not retried by the client; one failure would end the loop
+                  try:
+                      gh.dispatch_workflow("poll.yml", "main", {"loop": "true"})
+                      break
+                  except GhError:
+                      if attempt == 2:
+                          raise
+                      time.sleep(int(os.environ.get("ALT_RETRY_SECONDS") or 20) * (attempt + 1))
+          except (GhError, KeyError, TypeError, ValueError) as exc:
+              print("::error::the next poll could not be started: %s" % exc)
+              sys.exit(1)
+          print("next poll started")
           PY

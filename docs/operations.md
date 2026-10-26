@@ -63,14 +63,15 @@ Local files used only by `bin/alt` (never by CI):
 | `stage.yml` | manual (optional `tag`); scheduled windows | gate and publish pending drafts (without `tag`: not those of a [withdrawn version](#withdraw-a-version)); `catalog.yml` when something was published; then a `report` job fails the run when a draft was rejected or failed |
 | `build.yml` | manual (`app`, `ref`, `publish`, `notes`, `force`); started by `bin/alt build`, the pre-push hook and `poll.yml` | route 2 build, gate, publish, then `catalog.yml`; refuses a [withdrawn version](#withdraw-a-version) in its first job unless `force` is true |
 | `ingest.yml` | `repository_dispatch` type `ingest`; manual (`url`, `sha256`, `semver`, `notes`, `bundle_id`, `allow_home_paths`) | route 3 fetch, gate, publish, then `catalog.yml` |
-| `poll.yml` | every 15 minutes; manual (optional `app`, `dry_run`) | start `build.yml` for private tags from `privateBuild.minVersion` on that have no release yet; withdrawn versions are skipped |
+| `poll.yml` | manual (optional `app`, `dry_run`, `loop`); with `loop`, each run starts the next one after the wait timer of the environment `alt-poll-timer` (15 minutes) | start `build.yml` for private tags from `privateBuild.minVersion` on that have no release yet; withdrawn versions are skipped |
+| `poll-watch.yml` | hourly at minute 41; manual | start the poll loop when no loop run is active |
 | `ci.yml` | push, pull request | unit tests and `validate`; `generate --check` on pull requests only; both catalog checks are skipped until `source.json` exists; no secrets |
 
 The scheduled windows of `stage.yml` are `17 1,7,13,19 * * *`: 01:17, 07:17, 13:17 and 19:17 UTC. They
-only finalize pending drafts. `poll.yml` runs at minutes 4, 19, 34 and 49 of every hour (UTC). It builds
-the tags that no pre-push hook announced, such as tags pushed from another machine or created on
-GitHub, usually 15 to 30 minutes after the push; the hook starts a build at once. GitHub may start
-scheduled runs late, most of all around the full hour. Only the `sync` job of `catalog.yml` uses the
+only finalize pending drafts. GitHub starts the scheduled runs of this repository late, so far by two
+to five hours. `poll.yml` therefore has no schedule: it runs as a loop (see [The poll loop](#the-poll-loop)),
+which builds the tags that no pre-push hook announced, such as tags pushed from another machine or
+created on GitHub, within about 15 minutes of the push; the hook starts a build at once. Only the `sync` job of `catalog.yml` uses the
 concurrency group `alt-catalog`; the jobs that create releases in `stage.yml`, `build.yml` and
 `ingest.yml` share the group `alt-release`, and the Pages deploys share `alt-pages`. Queued runs are
 never cancelled. Each `sync` rebuilds everything from the full release list and each deploy publishes
@@ -396,7 +397,7 @@ normalize output), without writing them to disk. The build job uploads it on eve
 there when the gate job rejected the IPA; it is kept for 3 days. The gate's findings are in the public
 log of the gate job, as rule ids, counts and paths inside the IPA. After fixing the cause, run
 `bin/alt build BID REF` again, or tag a new version. `poll.yml` does not retry a tag that had a build
-run in the last 30 days, nor a [withdrawn version](#withdraw-a-version). After 30 days a scheduled run
+run in the last 30 days, nor a [withdrawn version](#withdraw-a-version). After 30 days the poll loop
 tries a tag without a release again; to stop that, delete the tag in the private repository or raise
 `privateBuild.minVersion` above it. Withdrawing does not help here: a version that `source.json` never
 listed gets no entry in `retracted.json`.
@@ -420,16 +421,32 @@ that `main` may deploy, then re-run the catalog with `gh workflow run catalog.ym
 
 GitHub disables scheduled workflows in public repositories after 60 days without activity. A disabled
 workflow cannot be started by hand either. `bin/alt doctor` reports this, and `bin/alt build` (so also
-the pre-push hook) enables `poll.yml`, `stage.yml` and `catalog.yml` again when GitHub disabled them
-for inactivity. To do it by hand:
+the pre-push hook) enables `poll-watch.yml`, `stage.yml` and `catalog.yml` again when GitHub disabled
+them for inactivity. The poll loop has no schedule and keeps running meanwhile. To do it by hand:
 
 ```sh
-gh workflow enable poll.yml -R xuniv/alt
+gh workflow enable poll-watch.yml -R xuniv/alt
 gh workflow enable stage.yml -R xuniv/alt
 gh workflow enable catalog.yml -R xuniv/alt
 ```
 
-Until then, tags pushed without the hook are not built.
+### The poll loop
+
+`poll.yml` with `loop=true` ends with the job `next`. That job waits for the wait timer of the
+environment `alt-poll-timer`, without holding a runner, and then starts `poll.yml` with `loop=true`
+again. Its runs are titled `poll loop`. `next` starts nothing when a newer loop run is active (two
+loops become one), and stops the loop when its run started less than 5 minutes before, which means
+the environment has no wait timer. `poll-watch.yml` runs hourly and starts the loop when no loop run
+is active, and so does `bin/alt build` (and so the pre-push hook) when the environment is set up.
+
+```sh
+bin/alt poller [--minutes 15]   # set the wait timer (5 to 1440 minutes) and start the loop if it stopped
+gh workflow run poll.yml -R xuniv/alt [-f app=BID] [-f dry_run=true]   # one poll now, outside the loop
+```
+
+`bin/alt doctor` checks the environment and reports a stopped loop. To stop the loop, disable
+`poll-watch.yml` and cancel the active `poll loop` run; `bin/alt build` starts it again unless the
+environment is deleted as well. Each loop run takes about a minute of runner time.
 
 ### Generated `source.json` failed validation
 

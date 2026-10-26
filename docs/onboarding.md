@@ -70,6 +70,16 @@ secret `ALT_PAYLOAD_IDENTITY` and its recipient as the variable `ALT_PAYLOAD_REC
 the temporary copy. Nothing is kept locally. `bin/alt payload-key --rotate` replaces the pair; do it
 while no build is running.
 
+### Poll loop
+
+```sh
+bin/alt poller
+```
+
+This creates the environment `alt-poll-timer` with a wait timer of 15 minutes (`--minutes N` for
+another interval, 5 to 1440), lets only `main` use it, and starts the poll loop that builds private
+tags pushed without the hook (see [operations.md](operations.md#the-poll-loop)).
+
 ### Check
 
 ```sh
@@ -82,7 +92,7 @@ bin/alt doctor
 - the `gh` login and push access to the repository; if these fail, the remote checks are skipped;
 - that GitHub Actions is enabled (and warns if the default `GITHUB_TOKEN` permissions are not
   read-only);
-- that all six workflows exist and are enabled;
+- that all seven workflows exist and are enabled;
 - that the secrets `ALT_DENYLIST` and `ALT_PAYLOAD_IDENTITY` and the variables `ALT_LOG_RECIPIENT`
   and `ALT_PAYLOAD_RECIPIENT` are set (and warns about per-app repository secrets of an earlier
   version, `ALT_KEY_<ALIAS>` and `ALT_APP_<ALIAS>`, which no workflow reads any more);
@@ -90,6 +100,8 @@ bin/alt doctor
   `alt-<ALIAS>` exists, lets only `main` use its secrets (selected branches only, with exactly one
   deployment policy: the branch `main`; any other branch or tag policy is reported), and holds
   `ALT_KEY` and `ALT_APP`;
+- that the environment `alt-poll-timer` exists with a wait timer of at least 5 minutes and lets only
+  `main` use it (and warns when the poll loop is not running);
 - that Pages is built by GitHub Actions;
 - that `ssh-keygen`, `age`, `age-keygen`, `git` and the log identity are available locally (warnings
   only).
@@ -158,7 +170,7 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
    - makes sure `apps/io.example.demo/app.json` in your checkout enables `privateBuild`, and tells you
      to commit it. It never commits by itself;
    - sets `privateBuild.minVersion` to the newest version tag of the repository, unless you pass
-     `--min-version` or `app.json` already has one. The scheduled `poll.yml` never builds older tags,
+     `--min-version` or `app.json` already has one. The poll loop (`poll.yml`) never builds older tags,
      so the history of the repository is not published. A repository without version tags gets no
      floor: every version tag pushed later is built. `app.json` becomes public, so register refuses a
      floor that contains a denylist term (pass `--min-version` then).
@@ -182,8 +194,8 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
    ```
 
    Run `PYTHONPATH=tools python3 -m altsource validate`, then commit and push to `main`. From then on
-   the scheduled `poll.yml` builds and publishes every tag from `minVersion` on that has no release,
-   at the latest about 15 to 30 minutes later. To try a build first, start it right after the push
+   the poll loop builds and publishes every tag from `minVersion` on that has no release, within about
+   15 minutes. To try a build first, start it right after the push
    (step 5): `poll.yml` skips a tag that already has a build run. To publish only future tags, pass the
    lowest pre-release of the next version, for example `--min-version 1.4.1-0` when the newest tag is
    `v1.4.0` (`1.4.1` would skip `v1.4.1-rc.1`).
@@ -210,8 +222,8 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
    Every tag you push that matches the glob then starts `bin/alt build` in the background, once the
    tag has reached the remote; see [routes.md](routes.md#triggers) for the details. Check
    `~/.cache/xuniv-alt/hook.log` if no build appears. The hook is optional: without it (for example
-   when you push from another machine), the scheduled `poll.yml` builds the tag within about 15 to 30
-   minutes. Start it at once with `gh workflow run poll.yml -R xuniv/alt` (optionally
+   when you push from another machine), the poll loop builds the tag within about 15 minutes. Start a
+   poll at once with `gh workflow run poll.yml -R xuniv/alt` (optionally
    `-f app=io.example.demo -f dry_run=true`). It skips a version below `minVersion`, one that already
    has a published release or a build run in the last 30 days, and one that was withdrawn (see
    [operations.md](operations.md#withdraw-a-version)).

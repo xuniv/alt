@@ -9,6 +9,7 @@ Nothing touches the network or a real GitHub repository.
 from __future__ import annotations
 
 import base64
+import datetime
 import importlib.machinery
 import importlib.util
 import io
@@ -36,6 +37,8 @@ ALIAS = "IO_EXAMPLE_DEMO"
 ENV = "alt-" + ALIAS
 ENV_PATH = "repos/xuniv/alt/environments/" + ENV
 POLICIES_PATH = ENV_PATH + "/deployment-branch-policies"
+TIMER_PATH = "repos/xuniv/alt/environments/alt-poll-timer"
+TIMER_POLICIES_PATH = TIMER_PATH + "/deployment-branch-policies"
 PRIVATE = "someone/private-app"
 TAG = "io.example.demo-v1.2.3"
 ZERO = "0" * 40
@@ -579,17 +582,38 @@ class BuildTests(OperatorCase):
     def test_a_schedule_disabled_for_inactivity_is_enabled_again(self):
         self.app_json({"privateBuild": {"enabled": True}})
         self.set_rules({"match": ["api", "repos/xuniv/alt/actions/workflows?per_page=100"], "stdout": {"workflows": [
-            {"path": ".github/workflows/poll.yml", "state": "disabled_inactivity"},
+            {"path": ".github/workflows/poll-watch.yml", "state": "disabled_inactivity"},
             {"path": ".github/workflows/stage.yml", "state": "active"},
-            {"path": ".github/workflows/ci.yml", "state": "disabled_inactivity"},  # no schedule
+            {"path": ".github/workflows/poll.yml", "state": "disabled_inactivity"},  # no schedule
             {"path": ".github/workflows/ingest.yml", "state": "disabled_manually"}]}})
         code, out, err = self.run_alt("build", BID, "v1.2.3")
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.writes()[1:], [["workflow", "enable", "poll.yml", "-R", "xuniv/alt"]])
-        self.assertIn("enabled poll.yml again", out)
+        self.assertEqual(self.writes()[1:], [["workflow", "enable", "poll-watch.yml", "-R", "xuniv/alt"]])
+        self.assertIn("enabled poll-watch.yml again", out)
         code, out, _ = self.run_alt("--dry-run", "build", BID, "v1.2.3")
         self.assertEqual(code, 0)
-        self.assertIn("+ gh workflow enable poll.yml -R xuniv/alt\n", out)
+        self.assertIn("+ gh workflow enable poll-watch.yml -R xuniv/alt\n", out)
+
+    def test_build_starts_a_stopped_poll_loop(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        loop_start = ["workflow", "run", "poll.yml", "-R", "xuniv/alt", "-f", "loop=true"]
+        for timer, runs, started in ((15, [], True), (15, [{"display_title": "poll loop", "status": "waiting"}], False),
+                                     (15, [{"display_title": "poll loop", "status": "completed"}], True),
+                                     (None, [], False), (2, [], False)):
+            rules = [{"match": ["api", "repos/xuniv/alt/actions/workflows/poll.yml/runs?per_page=30"],
+                      "stdout": {"workflow_runs": runs}}]
+            if timer is not None:
+                rules.append({"match": ["api", TIMER_PATH], "stdout": {"name": "alt-poll-timer", "protection_rules": [
+                    {"id": 1, "type": "wait_timer", "wait_timer": timer}]}})
+            else:
+                rules.append(dict(NOT_FOUND, match=["api", TIMER_PATH]))
+            self.set_rules(*rules)
+            calls = os.path.join(self.state, "calls.jsonl")
+            if os.path.exists(calls):
+                os.unlink(calls)
+            code, out, err = self.run_alt("build", BID, "v1.2.3")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(loop_start in self.writes(), started, (timer, runs))
 
     def test_a_failed_revival_only_warns(self):
         self.app_json({"privateBuild": {"enabled": True}})
@@ -1798,19 +1822,30 @@ class StatusDiagDoctorTests(OperatorCase):
         self.assertIn("empty", self.run_alt("diag", "123")[2])
 
     def doctor_rules(self, secrets=("ALT_DENYLIST", "ALT_PAYLOAD_IDENTITY"), env_secrets=("ALT_KEY", "ALT_APP"),
-                     pages_code=0, state="active", branch_policy=True, policies=None):
+                     pages_code=0, state="active", branch_policy=True, policies=None, timer=15, loop="waiting"):
         workflows = [{"path": ".github/workflows/%s" % w, "state": state if w == "build.yml" else "active"}
-                     for w in ("catalog.yml", "stage.yml", "build.yml", "ingest.yml", "poll.yml", "ci.yml")]
+                     for w in ("catalog.yml", "stage.yml", "build.yml", "ingest.yml", "poll.yml", "poll-watch.yml",
+                               "ci.yml")]
+        timer_rules = [{"match": ["api", TIMER_PATH], "stdout": {
+                           "name": "alt-poll-timer", "deployment_branch_policy": {
+                               "protected_branches": False, "custom_branch_policies": True},
+                           "protection_rules": [{"id": 1, "type": "wait_timer", "wait_timer": timer}]}}
+                       if timer is not None else dict(NOT_FOUND, match=["api", TIMER_PATH]),
+                       {"match": ["api", TIMER_POLICIES_PATH + "?per_page=100"],
+                        "stdout": {"total_count": 1, "branch_policies": [{"id": 1, "name": "main", "type": "branch"}]}},
+                       {"match": ["api", "repos/xuniv/alt/actions/workflows/poll.yml/runs?per_page=30"],
+                        "stdout": {"workflow_runs": [{"display_title": "poll loop", "status": loop}]}}]
         if branch_policy is True:
             policy = {"protected_branches": False, "custom_branch_policies": True}
         else:
             policy = branch_policy or None
         policies = [{"id": 1, "name": "main", "type": "branch"}] if policies is None else policies
-        self.set_rules({"match": ["api", "repos/xuniv/alt/actions/permissions"], "stdout": {"enabled": True}},
+        self.set_rules(*timer_rules,
+                       {"match": ["api", "repos/xuniv/alt/actions/permissions"], "stdout": {"enabled": True}},
                        {"match": ["api", "repos/xuniv/alt/actions/permissions/workflow"],
                         "stdout": {"default_workflow_permissions": "read"}},
                        {"match": ["api", "repos/xuniv/alt/actions/workflows?per_page=100"],
-                        "stdout": {"total_count": 6, "workflows": workflows}},
+                        "stdout": {"total_count": len(workflows), "workflows": workflows}},
                        {"match": ["api", ENV_PATH], "stdout": {"name": ENV, "deployment_branch_policy": policy}},
                        {"match": ["api", POLICIES_PATH + "?per_page=100"],
                         "stdout": {"total_count": len(policies), "branch_policies": policies}},
@@ -1847,6 +1882,21 @@ class StatusDiagDoctorTests(OperatorCase):
         self.assertIn("FAIL  GitHub Pages deployed by Actions", out)
         self.assertIn("warn  denylist file is readable by other users", out)
         self.assertIn("4 problem(s)", out)
+
+    def test_doctor_checks_the_poll_loop(self):
+        os.chmod(self.denylist, 0o600)
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.write(os.path.join(self.config, "log-identity.txt"), "AGE-SECRET-KEY-PLACEHOLDER\n")
+        self.doctor_rules(timer=None)
+        code, out, _ = self.run_alt("doctor")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL  environment alt-poll-timer (poll loop): missing (run alt poller)", out)
+        self.doctor_rules(timer=1)
+        self.assertIn("needs a wait timer of at least 5 minutes", self.run_alt("doctor")[1])
+        self.doctor_rules(loop="completed")
+        code, out, _ = self.run_alt("doctor")
+        self.assertEqual(code, 0, out)
+        self.assertIn("warn  the poll loop is not running", out)
 
     def test_doctor_wants_an_environment_limited_to_main(self):
         os.chmod(self.denylist, 0o600)
@@ -2074,6 +2124,7 @@ class BuildStepTests(unittest.TestCase):
 
 
 POLL_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "poll.yml")
+POLL_WATCH_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "poll-watch.yml")
 CATALOG_WORKFLOW = os.path.join(ROOT, ".github", "workflows", "catalog.yml")
 TOOLS = os.path.join(ROOT, "tools")
 
@@ -2367,17 +2418,39 @@ class GateMainCheckTests(WithdrawnWorkflowCase):
 
 
 class PollTriggerTests(unittest.TestCase):
-    """poll.yml runs on a schedule as well as by hand; a scheduled run has no inputs."""
+    """poll.yml is started by hand or by its own loop (no schedule); poll-watch.yml restarts the loop."""
 
     def setUp(self):
         with open(POLL_WORKFLOW, encoding="utf-8") as fh:
             self.text = fh.read()
         self.lines = self.text.splitlines()
 
-    def test_schedule_and_manual_dispatch(self):
+    def test_no_schedule_and_a_loop_input(self):
         start = self.lines.index("on:")
-        self.assertEqual(self.lines[start + 1:start + 4],
-                         ["  schedule:", '    - cron: "4,19,34,49 * * * *"', "  workflow_dispatch:"])
+        self.assertEqual(self.lines[start + 1], "  workflow_dispatch:")
+        self.assertNotIn("schedule:", self.text)
+        self.assertNotIn("cron:", self.text)
+        self.assertIn("run-name: ${{ inputs.loop && 'poll loop' || 'poll' }}", self.lines)
+        at = self.lines.index("      loop:")
+        self.assertEqual(self.lines[at + 2:at + 4], ["        type: boolean", "        default: false"])
+
+    def test_the_next_job_waits_on_the_timer_environment(self):
+        first, end = job_lines(POLL_WORKFLOW, "next")
+        job = self.lines[first:end]
+        self.assertIn("    needs: [list, check]", job)
+        self.assertIn("    if: ${{ !cancelled() && inputs.loop }}", job)
+        at = job.index("    environment:")
+        self.assertEqual(job[at + 1:at + 3], ["      name: alt-poll-timer", "      deployment: false"])
+        self.assertNotIn("secrets.", "\n".join(job))
+        self.assertNotRegex(self.text, r"\nconcurrency:")  # a waiting loop run must not hold back other runs
+        first, end = job_lines(POLL_WORKFLOW, "check")
+        self.assertIn("      group: alt-poll-${{ matrix.app.alias }}", self.lines[first:end])
+
+    def test_poll_watch_runs_hourly_and_by_hand(self):
+        with open(POLL_WATCH_WORKFLOW, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        start = lines.index("on:")
+        self.assertEqual(lines[start + 1:start + 4], ["  schedule:", '    - cron: "41 * * * *"', "  workflow_dispatch:"])
 
     def test_scheduled_runs_are_never_dry_runs(self):
         self.assertNotIn("${{ inputs.dry_run }}", self.text)
@@ -2393,6 +2466,162 @@ class PollTriggerTests(unittest.TestCase):
             proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
                                   env=env, stdin=subprocess.DEVNULL, capture_output=True)
             self.assertEqual(proc.returncode, expected, (app, dry_run, proc.stdout))
+
+
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+class PollLoopTests(OperatorCase):
+    """The job "next" of a loop run and poll-watch.yml start at most one further loop run."""
+
+    RUNS = "repos/xuniv/alt/actions/workflows/poll.yml/runs?per_page=30"
+
+    def run_script(self, workflow, step, job, runs, age_minutes=20, ref="refs/heads/main"):
+        created = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.timedelta(minutes=age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.set_rules({"match": ["api", "repos/xuniv/alt/actions/runs/500"], "stdout": {"id": 500, "created_at": created}},
+                       {"match": ["api", self.RUNS], "stdout": {"total_count": len(runs), "workflow_runs": runs}})
+        script = step_script(workflow, step, job=job)
+        env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
+               "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt", "RUN_ID": "500", "GITHUB_REF": ref,
+               "GITHUB_ACTIONS": "true", "ALT_RETRY_SECONDS": "0"}
+        proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=self.root,
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True)
+        return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
+
+    def next_run(self, runs, **kwargs):
+        return self.run_script(POLL_WORKFLOW, "Start the next run", "next", runs, **kwargs)
+
+    def watch(self, runs):
+        return self.run_script(POLL_WATCH_WORKFLOW, "Start the loop if it stopped", "watch", runs)
+
+    def dispatched(self):
+        return [json.loads(c["stdin"]) for c in self.calls()
+                if "repos/xuniv/alt/actions/workflows/poll.yml/dispatches" in c["argv"]]
+
+    @staticmethod
+    def loop(run_id, status):
+        return {"id": run_id, "display_title": "poll loop", "status": status}
+
+    def test_the_next_run_starts_after_the_wait(self):
+        code, out, err = self.next_run([self.loop(500, "in_progress"), self.loop(499, "completed"),
+                                        {"id": 501, "display_title": "poll", "status": "queued"}])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("next poll started", out)
+        self.assertEqual(self.dispatched(), [{"ref": "main", "inputs": {"loop": "true"}}])
+
+    def test_a_newer_active_loop_ends_this_one(self):
+        code, out, err = self.next_run([self.loop(502, "waiting"), self.loop(500, "in_progress")])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("a newer poll loop run is active", out)
+        self.assertEqual(self.dispatched(), [])
+        code, out, err = self.next_run([self.loop(502, "completed"), self.loop(500, "in_progress")])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(self.dispatched()), 1)
+
+    def test_a_missing_wait_timer_stops_the_loop(self):
+        code, out, _ = self.next_run([], age_minutes=1)
+        self.assertEqual(code, 1)
+        self.assertIn("::error::this run started", out)
+        self.assertIn("needs a wait timer of at least 5 minutes", out)
+        self.assertEqual(self.dispatched(), [])
+
+    def test_the_loop_only_runs_on_main(self):
+        code, out, _ = self.next_run([], ref="refs/heads/other")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.dispatched(), [])
+
+    def test_a_failed_listing_starts_nothing(self):
+        self.set_rules()
+        script = step_script(POLL_WORKFLOW, "Start the next run", job="next")
+        env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
+               "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt", "RUN_ID": "500", "GITHUB_REF": "refs/heads/main"}
+        proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=self.root,
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("::error::the next poll could not be started", proc.stdout.decode())
+        self.assertEqual(self.dispatched(), [])
+
+    def test_the_dispatch_is_tried_three_times(self):
+        for workflow, step, job in ((POLL_WORKFLOW, "Start the next run", "next"),
+                                    (POLL_WATCH_WORKFLOW, "Start the loop if it stopped", "watch")):
+            calls = os.path.join(self.state, "calls.jsonl")
+            if os.path.exists(calls):
+                os.unlink(calls)
+            created = (datetime.datetime.now(datetime.timezone.utc)
+                       - datetime.timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.set_rules({"match": ["repos/xuniv/alt/actions/workflows/poll.yml/dispatches"], "code": 1,
+                            "stderr": "HTTP 502: Bad Gateway\n"},
+                           {"match": ["api", "repos/xuniv/alt/actions/runs/500"], "stdout": {"created_at": created}},
+                           {"match": ["api", self.RUNS], "stdout": {"workflow_runs": []}})
+            script = step_script(workflow, step, job=job)
+            env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
+                   "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt", "RUN_ID": "500", "GITHUB_REF": "refs/heads/main",
+                   "ALT_RETRY_SECONDS": "0"}
+            proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=self.root,
+                                  env=env, stdin=subprocess.DEVNULL, capture_output=True)
+            self.assertEqual(proc.returncode, 1, workflow)
+            self.assertEqual(len(self.dispatched()), 3, workflow)
+
+    def test_poll_watch_starts_a_stopped_loop_only(self):
+        code, out, err = self.watch([self.loop(500, "waiting")])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("the poll loop is running", out)
+        self.assertEqual(self.dispatched(), [])
+        code, out, err = self.watch([self.loop(500, "completed"), {"id": 501, "display_title": "poll",
+                                                                   "status": "in_progress"}])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("the poll loop was not running; started it", out)
+        self.assertEqual(self.dispatched(), [{"ref": "main", "inputs": {"loop": "true"}}])
+
+
+class PollerTests(OperatorCase):
+    """bin/alt poller: the wait timer environment of the poll loop, and the loop itself."""
+
+    LOOP = ["workflow", "run", "poll.yml", "-R", "xuniv/alt", "-f", "loop=true"]
+
+    def rules(self, runs=(), *extra):
+        self.set_rules(*extra, {"match": ["api", "repos/xuniv/alt/actions/workflows/poll.yml/runs?per_page=30"],
+                                "stdout": {"workflow_runs": list(runs)}},
+                       {"match": ["api", TIMER_POLICIES_PATH + "?per_page=100"],
+                        "stdout": {"total_count": 0, "branch_policies": []}})
+
+    def test_poller_sets_the_timer_and_starts_the_loop(self):
+        self.rules()
+        code, out, err = self.run_alt("poller")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes(), [["api", "--method", "PUT", TIMER_PATH, "--input", "-"],
+                                         ["api", "--method", "POST", TIMER_POLICIES_PATH, "-f", "name=main",
+                                          "-f", "type=branch"], self.LOOP])
+        self.assertEqual(json.loads(self.call("api", "--method", "PUT")["stdin"]), {
+            "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True},
+            "wait_timer": 15})
+        self.assertIn("environment alt-poll-timer waits 15 minute(s) between polls", out)
+        self.assertIn("started the poll loop", out)
+
+    def test_a_running_loop_is_not_started_twice(self):
+        self.rules([{"display_title": "poll loop", "status": "waiting"}])
+        code, out, err = self.run_alt("poller", "--minutes", "30")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(self.call("api", "--method", "PUT")["stdin"])["wait_timer"], 30)
+        self.assertNotIn(self.LOOP, self.writes())
+        self.assertIn("the poll loop is running", out)
+
+    def test_minutes_are_validated_before_gh(self):
+        for minutes in ("4", "1441", "0"):
+            self.assertEqual(self.run_alt("poller", "--minutes", minutes)[0], 1, minutes)
+        self.assertEqual(self.calls(), [])
+
+    def test_dry_run_and_an_unlistable_loop(self):
+        self.rules()
+        code, out, err = self.run_alt("--dry-run", "poller")
+        self.assertEqual(code, 0, err)
+        self.assertIn("+ gh workflow run poll.yml -R xuniv/alt -f loop=true\n", out)
+        self.assertEqual(self.writes(), [])
+        self.set_rules({"match": ["api", TIMER_POLICIES_PATH + "?per_page=100"],
+                        "stdout": {"total_count": 0, "branch_policies": []}})
+        code, _, err = self.run_alt("poller")
+        self.assertEqual(code, 1)
+        self.assertIn("gh workflow run poll.yml -R xuniv/alt -f loop=true", err)
+        self.assertNotIn(self.LOOP, self.writes())
 
 
 class CatalogTriggerTests(unittest.TestCase):
