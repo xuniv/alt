@@ -59,6 +59,7 @@ from altsource.stage import (  # noqa: E402
     WITHDRAWN_MARK,
     Toolkit,
     check_app_json_text,
+    is_semver,
     parse_semver,
     semver_prerelease,
     text_findings,
@@ -75,6 +76,7 @@ DEFAULT_REPO = "xuniv/alt"
 KEY_TITLE = "alt-build"
 STATUS_WORKFLOWS = ("build.yml", "ingest.yml", "stage.yml", "catalog.yml")
 REQUIRED_WORKFLOWS = ("catalog.yml", "stage.yml", "build.yml", "ingest.yml", "poll.yml", "ci.yml")
+SCHEDULED_WORKFLOWS = ("poll.yml", "stage.yml", "catalog.yml")
 REQUIRED_SECRETS = ("ALT_DENYLIST", "ALT_PAYLOAD_IDENTITY")
 REQUIRED_VARIABLES = ("ALT_LOG_RECIPIENT", "ALT_PAYLOAD_RECIPIENT")
 # per-app secrets live in the GitHub environment alt-<ALIAS> under fixed names, so that a workflow job
@@ -101,6 +103,8 @@ RETRACTED_FILE = "retracted.json"  # apps/<bid>/retracted.json: withdrawn versio
 RETRACT_LOG = "retract.log"  # local record of bin/alt retract, in the cache directory
 REASON_MAX_CHARS = 200
 RELEASE_PAGES_MAX = 100
+RUN_PAGES_MAX = 10
+TAG_PAGES_MAX = 50
 
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 BID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
@@ -652,6 +656,12 @@ def cmd_build(args: argparse.Namespace, ctx: Ctx) -> int:
         ctx.warn("apps/%s/app.json in this checkout does not enable privateBuild; the build will refuse "
                  "it unless main does" % bid)
     check_build_withdrawn(ctx, bid, ref, args.force)
+    if args.if_new:
+        reason = known_build(ctx, bid, ref, title)
+        if reason:
+            ctx.print("no build started: %s %s %s" % (bid, ref, reason))
+            revive_schedules(ctx)
+            return EXIT_OK
     publish = "false" if args.no_publish else "true"
     inputs = ["-f", "app=" + bid, "-f", "ref=" + ref, "-f", "publish=" + publish]
     if args.force:  # only when given: the input defaults to false
@@ -661,7 +671,65 @@ def cmd_build(args: argparse.Namespace, ctx: Ctx) -> int:
         ctx.print("dispatched build.yml: app=%s ref=%s publish=%s%s"
                   % (bid, ref, publish, " force=true" if args.force else ""))
         _echo(ctx, proc)
+    revive_schedules(ctx)
     return EXIT_OK
+
+
+def known_build(ctx: Ctx, bid: str, ref: str, title: str) -> Optional[str]:
+    """Why ``--if-new`` starts no build: the tag has a published release, or a build run with the same
+    title is still queued or running (for example one that the scheduled poll.yml started). A failed or
+    finished run does not count, so pushing a tag again retries it. Lookup errors count as new."""
+    repo = ctx.settings.repo
+    version = ref_version(ctx, bid, ref)
+    try:
+        if version:
+            tag = release_tag(ctx, bid, version)
+            proc = ctx.gh(["api", "repos/%s/releases/tags/%s" % (repo, urllib.parse.quote(tag, safe=""))],
+                          check=False)
+            if proc.returncode == 0:
+                release = json.loads((proc.stdout or b"").decode("utf-8", "replace") or "null")
+                if isinstance(release, dict) and release.get("tag_name") == tag and release.get("draft") is False:
+                    return "has a published release"
+        since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+        for page in range(1, RUN_PAGES_MAX + 1):
+            data = ctx.gh.json(["api", "repos/%s/actions/workflows/build.yml/runs?created=%s&per_page=100&page=%d"
+                                % (repo, urllib.parse.quote(">=" + since, safe=""), page)])
+            runs = data.get("workflow_runs") if isinstance(data, dict) else None
+            if not isinstance(runs, list):
+                break
+            if any(isinstance(r, dict) and r.get("display_title") == title and r.get("status") != "completed"
+                   for r in runs):
+                return "is already being built"
+            if len(runs) < 100:
+                break
+    except (OpError, ValueError):
+        ctx.warn("existing builds could not be checked; starting the build")
+    return None
+
+
+def revive_schedules(ctx: Ctx) -> None:
+    """Enable the scheduled workflows again that GitHub disabled after 60 days without activity.
+
+    Best effort: the build is already dispatched, so a failure here is only a warning.
+    """
+    repo = ctx.settings.repo
+    try:
+        data = ctx.gh.json(["api", "repos/%s/actions/workflows?per_page=100" % repo], check=False)
+    except OpError:
+        return
+    listed = data.get("workflows") if isinstance(data, dict) else None
+    for workflow in listed or []:
+        name = os.path.basename(str(workflow.get("path", ""))) if isinstance(workflow, dict) else ""
+        if name not in SCHEDULED_WORKFLOWS or workflow.get("state") != "disabled_inactivity":
+            continue
+        try:
+            ctx.gh(["workflow", "enable", name, "-R", repo], write=True)
+        except OpError:
+            ctx.warn("GitHub disabled the schedule of %s after 60 days without activity; enable it with "
+                     "gh workflow enable %s -R %s" % (name, name, repo))
+            continue
+        if not ctx.dry_run:
+            ctx.print("enabled %s again (GitHub disables schedules after 60 days without activity)" % name)
 
 
 def check_url(url: str) -> str:
@@ -1124,7 +1192,8 @@ def _shred(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _planned_app_json(ctx: Ctx, bid: str, tag_pattern: Optional[str]) -> Tuple[Dict[str, Any], bool]:
+def _planned_app_json(ctx: Ctx, bid: str, tag_pattern: Optional[str],
+                      min_version: Optional[str] = None) -> Tuple[Dict[str, Any], bool]:
     """(new app.json object, whether it changes) with privateBuild enabled."""
     path = app_json_path(ctx, bid)
     app: Dict[str, Any] = {}
@@ -1139,11 +1208,37 @@ def _planned_app_json(ctx: Ctx, bid: str, tag_pattern: Optional[str]) -> Tuple[D
     pb["enabled"] = True
     if tag_pattern:
         pb["tagPattern"] = tag_pattern
+    if min_version:
+        pb["minVersion"] = min_version
     new["privateBuild"] = pb
     errors = validate_app_json(new)
     if errors:
         raise OpError("apps/%s/app.json: %s" % (bid, errors[0]))
     return new, new != app or not os.path.exists(path)
+
+
+def newest_tag_version(ctx: Ctx, repo: str, pattern: str) -> Optional[str]:
+    """The highest version among the tags of ``repo`` that match ``pattern`` (None without any)."""
+    best: Optional[Tuple[Any, str]] = None
+    for page in range(1, TAG_PAGES_MAX + 1):
+        data = ctx.gh.json(["api", "repos/%s/tags?per_page=100&page=%d" % (repo, page)], check=False)
+        if not isinstance(data, list):
+            raise OpError("the tags of %s could not be listed; pass --min-version" % repo)
+        for item in data:
+            name = item.get("name") if isinstance(item, dict) else None
+            match = re.fullmatch(pattern, name) if isinstance(name, str) else None
+            version = match.group("version") if match else None
+            if not version or not is_semver(version):  # what app.json accepts as minVersion
+                continue
+            try:
+                key = parse_semver(ctx.deps, version)
+            except (TypeError, ValueError):
+                continue
+            if best is None or key > best[0]:
+                best = (key, version)
+        if len(data) < 100:
+            return best[1] if best else None
+    raise OpError("%s has more than %d pages of tags; pass --min-version" % (repo, TAG_PAGES_MAX))
 
 
 def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
@@ -1156,6 +1251,8 @@ def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
             raise OpError("--tag-pattern is not a valid regular expression") from None
         if "version" not in compiled.groupindex:
             raise OpError("--tag-pattern needs a named group 'version'")
+    if args.min_version is not None and not is_semver(args.min_version):
+        raise OpError("--min-version must be a semantic version such as 1.2.3")
     config: Dict[str, Any] = {"repo": repo}
     if args.build_json:
         build = validate_build_config(load_json_file(args.build_json, "build config", altcli.BUILD_CONFIG_MAX_BYTES))
@@ -1164,8 +1261,28 @@ def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
     config_json = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(config_json) > SECRET_MAX_BYTES:
         raise OpError("the build configuration is too large for a secret")
-    app, app_changed = _planned_app_json(ctx, bid, args.tag_pattern)
-    preflight(ctx)
+    app, app_changed = _planned_app_json(ctx, bid, args.tag_pattern, args.min_version)
+    denylist = preflight(ctx)
+    floor_note = ""
+    derived = False
+    if "minVersion" not in app["privateBuild"]:
+        # without a floor, the scheduled poll.yml would build every older tag of the repository
+        newest = newest_tag_version(ctx, repo, app["privateBuild"].get("tagPattern") or altcli.DEFAULT_TAG_PATTERN)
+        if newest:
+            app, app_changed = _planned_app_json(ctx, bid, args.tag_pattern, newest)
+            floor_note = "; minVersion %s is its newest tag, so older tags are not built" % newest
+            derived = True
+        else:
+            ctx.print("%s has no version tag yet: poll.yml builds every version tag pushed from now on" % repo)
+    # app.json becomes public once committed: a floor taken from a private tag must not carry a private word
+    _, findings = check_app_json_text(ctx.deps, dumps_json(app), denylist)
+    if findings:
+        if derived and text_findings(ctx.deps, app["privateBuild"]["minVersion"], denylist, "minVersion"):
+            ctx.warn("the newest tag of %s does not fit the public app.json; pass --min-version" % repo)
+        else:
+            ctx.warn("apps/%s/app.json would contain a denylist term; check its fields, --tag-pattern and "
+                     "--min-version" % bid)
+        return _rejected(ctx, findings, denylist, "apps/%s/app.json" % bid)
     alias = ctx.deps.alias_for(bid)
     environment = env_name(alias)
     alt_repo = ctx.settings.repo
@@ -1188,7 +1305,9 @@ def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
         for name in legacy:
             ctx.plan("gh secret delete %s -R %s" % (name, alt_repo))
         if app_changed:
-            ctx.plan("write apps/%s/app.json with privateBuild.enabled" % bid)
+            ctx.plan("write apps/%s/app.json with privateBuild.enabled%s"
+                     % (bid, ", minVersion " + app["privateBuild"]["minVersion"]
+                        if "minVersion" in app["privateBuild"] else ""))
         return EXIT_OK
 
     with private_tempdir("alt-key-", shred=True) as tmp:
@@ -1236,7 +1355,8 @@ def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fh:
             fh.write(dumps_json(app))
-        ctx.print("%s now enables privateBuild; review it and commit it to main (not done automatically)" % rel)
+        ctx.print("%s now enables privateBuild%s; review it and commit it to main (not done automatically)"
+                  % (rel, floor_note))
     else:
         ctx.print("%s already enables privateBuild" % rel)
     return EXIT_OK
@@ -1649,6 +1769,9 @@ def cmd_doctor(args: argparse.Namespace, ctx: Ctx) -> int:
             problems.append("missing " + ", ".join(missing))
         if inactive:
             problems.append("not enabled " + ", ".join(inactive))
+        if any(states[w] == "disabled_inactivity" for w in inactive):
+            problems.append("GitHub disabled a schedule after 60 days without activity; alt build enables it "
+                            "again, or run gh workflow enable <workflow> -R %s" % repo)
         return "; ".join(problems) or None
 
     report.check("workflows enabled (%s)" % ", ".join(REQUIRED_WORKFLOWS), workflows)
@@ -1756,6 +1879,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("ref", metavar="REF")
     p.add_argument("--no-publish", action="store_true", help="build and gate only")
     p.add_argument("--force", action="store_true", help="build a withdrawn version (listed in retracted.json)")
+    p.add_argument("--if-new", action="store_true",
+                   help="start nothing when the tag has a published release or a build of it is running "
+                        "(the pre-push hook passes this)")
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("ingest", parents=[common], help="dispatch an ingest of an https IPA URL")
@@ -1780,6 +1906,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("repo", metavar="OWNER/REPO")
     p.add_argument("--bid", required=True)
     p.add_argument("--tag-pattern", metavar="RE", help="regex with a named group 'version' (stored in app.json)")
+    p.add_argument("--min-version", metavar="VERSION",
+                   help="lowest version poll.yml builds (stored in app.json; default: the newest existing tag)")
     p.add_argument("--build-json", metavar="F", help="build configuration stored with the registration")
     p.add_argument("--rotate", action="store_true", help="replace an existing alt-build deploy key")
     p.set_defaults(func=cmd_register)

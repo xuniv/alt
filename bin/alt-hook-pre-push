@@ -10,7 +10,10 @@
 # status still decides the push. Output of the background job, and a line for each skipped invalid
 # tag, goes to ${ALT_CACHE_DIR:-~/.cache/xuniv-alt}/hook.log. The hook never passes --force, so
 # pushing a tag of a withdrawn version (apps/<bid>/retracted.json on main) again builds nothing:
-# "alt build" and build.yml refuse it. A tag of a new version builds as usual.
+# "alt build" and build.yml refuse it. A tag of a new version builds as usual. For a tag that is new
+# on the remote it passes --if-new, so a tag that already has a published release, or that the
+# scheduled poll.yml is already building, starts no second build; a push that moves an existing tag
+# always starts a build of the new commit.
 
 ALT_BIN=@ALT_BIN@
 ALT_BID=@ALT_BID@
@@ -52,7 +55,8 @@ log_dir=${ALT_CACHE_DIR:-${HOME:-/nonexistent}/.cache/xuniv-alt}
 alnum=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 
 # runs detached: $1 alt, $2 bundle id, $3 tag, $4 remote, $5 timeout, $6 interval, $7 pushed object
-# id (for an annotated tag the tag object, which ls-remote also lists for refs/tags/<tag>)
+# id (for an annotated tag the tag object, which ls-remote also lists for refs/tags/<tag>), $8 "new"
+# when the remote had no such tag
 waiter='
 line=$(printf "%s\trefs/tags/%s" "$7" "$3")
 waited=0
@@ -66,6 +70,9 @@ until git ls-remote "$4" "refs/tags/$3" 2>/dev/null | grep -qxF "$line"; do
     waited=$((waited + $6))
 done
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) tag $3 pushed; starting alt build"
+if [ "$8" = new ]; then
+    exec "$1" build --if-new "$2" "$3"
+fi
 exec "$1" build "$2" "$3"
 '
 
@@ -83,6 +90,10 @@ printf '%s\n' "$refs" | while read -r local_ref local_sha remote_ref remote_sha;
         $ALT_TAG_GLOB) ;;
         *) continue ;;
     esac
+    case "$remote_sha" in
+        *[!0]*) state=moved ;;  # the push moves a tag that the remote already has
+        *) state=new ;;
+    esac
     mkdir -p "$log_dir" 2>/dev/null || continue
     # the rules of build.yml's ref input: the run title "build <bid> <tag>" is public as soon as a
     # build is dispatched (alt build checks them again and also refuses denylist terms)
@@ -96,6 +107,6 @@ printf '%s\n' "$refs" | while read -r local_ref local_sha remote_ref remote_sha;
         continue
     fi
     nohup sh -c "$waiter" alt-pre-push "$ALT_BIN" "$ALT_BID" "$tag" "$remote" "$timeout" "$interval" \
-        "$local_sha" </dev/null >>"$log_dir/hook.log" 2>&1 &
+        "$local_sha" "$state" </dev/null >>"$log_dir/hook.log" 2>&1 &
 done
 exit 0

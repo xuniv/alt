@@ -141,7 +141,7 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
 
    ```sh
    bin/alt register owner/private-repo --bid io.example.demo \
-     [--tag-pattern '^release-(?P<version>\d+\.\d+\.\d+)$'] [--build-json build.json]
+     [--tag-pattern '^release-(?P<version>\d+\.\d+\.\d+)$'] [--min-version 1.4.0] [--build-json build.json]
    ```
 
    This:
@@ -156,7 +156,12 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
    - deletes the repository secrets `ALT_KEY_IO_EXAMPLE_DEMO` and `ALT_APP_IO_EXAMPLE_DEMO` of an
      earlier version, if they exist;
    - makes sure `apps/io.example.demo/app.json` in your checkout enables `privateBuild`, and tells you
-     to commit it. It never commits by itself.
+     to commit it. It never commits by itself;
+   - sets `privateBuild.minVersion` to the newest version tag of the repository, unless you pass
+     `--min-version` or `app.json` already has one. The scheduled `poll.yml` never builds older tags,
+     so the history of the repository is not published. A repository without version tags gets no
+     floor: every version tag pushed later is built. `app.json` becomes public, so register refuses a
+     floor that contains a denylist term (pass `--min-version` then).
 
    Each app has its own environment, and the workflows name the secrets `ALT_KEY` and `ALT_APP`
    directly. A job then receives only the secrets of the one environment it uses, so a private build
@@ -172,11 +177,16 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
      "developerName": "Example Developer",
      "localizedDescription": "What the app does.",
      "category": "utilities",
-     "privateBuild": {"enabled": true}
+     "privateBuild": {"enabled": true, "minVersion": "1.4.0"}
    }
    ```
 
-   Run `PYTHONPATH=tools python3 -m altsource validate`, then commit and push to `main`.
+   Run `PYTHONPATH=tools python3 -m altsource validate`, then commit and push to `main`. From then on
+   the scheduled `poll.yml` builds and publishes every tag from `minVersion` on that has no release,
+   at the latest about 15 to 30 minutes later. To try a build first, start it right after the push
+   (step 5): `poll.yml` skips a tag that already has a build run. To publish only future tags, pass the
+   lowest pre-release of the next version, for example `--min-version 1.4.1-0` when the newest tag is
+   `v1.4.0` (`1.4.1` would skip `v1.4.1-rc.1`).
 
 5. **Try a build without publishing,** then publish:
 
@@ -199,10 +209,11 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
 
    Every tag you push that matches the glob then starts `bin/alt build` in the background, once the
    tag has reached the remote; see [routes.md](routes.md#triggers) for the details. Check
-   `~/.cache/xuniv-alt/hook.log` if no build appears. `poll.yml` has no schedule; start it with
-   `gh workflow run poll.yml -R xuniv/alt` (optionally `-f app=io.example.demo -f dry_run=true`) to
-   catch up on tags the hook missed. It skips a version that already has a published release or a
-   build run in the last 30 days, and a version that was withdrawn (see
+   `~/.cache/xuniv-alt/hook.log` if no build appears. The hook is optional: without it (for example
+   when you push from another machine), the scheduled `poll.yml` builds the tag within about 15 to 30
+   minutes. Start it at once with `gh workflow run poll.yml -R xuniv/alt` (optionally
+   `-f app=io.example.demo -f dry_run=true`). It skips a version below `minVersion`, one that already
+   has a published release or a build run in the last 30 days, and one that was withdrawn (see
    [operations.md](operations.md#withdraw-a-version)).
 
 To rotate the deploy key, run `bin/alt register` again with the same `--build-json` plus `--rotate`. It

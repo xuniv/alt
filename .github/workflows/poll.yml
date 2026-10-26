@@ -1,27 +1,43 @@
 # poll: find tags in the private source repositories that have no release yet and dispatch build.yml
-# for them. Manual repair only; there is no schedule.
+# for them. It is the backstop for tags that no pre-push hook announced (pushed from another machine
+# or created on GitHub); the hook stays the fast path.
 #
-# Trigger
-#   workflow_dispatch, inputs:
+# Triggers
+#   schedule           4,19,34,49 * * * * (UTC, every 15 minutes, off the full hour that GitHub delays
+#                      most): every app whose app.json enables privateBuild, never a dry run. GitHub
+#                      disables the schedule after 60 days without repository activity; bin/alt build
+#                      (and so the pre-push hook) enables it again, and bin/alt doctor reports it.
+#   workflow_dispatch  inputs:
 #     app      bundle identifier (optional); empty checks every app whose app.json enables privateBuild
 #     dry_run  boolean, default false; count the candidates without dispatching builds
+#
+# Only registered apps are polled: apps/<bid>/app.json enables privateBuild, and the app's environment
+# holds the repository and a read-only deploy key for that repository alone (bin/alt register). The
+# workflow has no other access to private repositories.
 #
 # Per app (environment alt-<ALIAS>: secret ALT_APP names the repository, ALT_KEY holds its deploy key;
 # each check job references only its own app's environment, so it receives no other app's secrets):
 #   tags come from git ls-remote over SSH with the pinned host keys in .github/known_hosts, and versions
-#   from privateBuild.tagPattern (default ^v<semver>$). A version is a candidate when the token sees no
+#   from privateBuild.tagPattern (default ^v<semver>$). Versions below privateBuild.minVersion are never
+#   built by this workflow (bin/alt build and the hook may still build them). A version is a candidate
+#   when the token sees no
 #   release <bid>-v<version> (drafts are not listed for a read-only token) and no build.yml run titled
 #   "build <bid> <tag>" was created in the last 30 days, whatever its state, and the version is not
 #   listed in apps/<bid>/retracted.json (a withdrawn version; a file that cannot be read fails the job
 #   before anything is dispatched, and build.yml refuses a withdrawn version as well, since poll never
-#   sets its force input). At most two builds per app are dispatched, newest version first. Job names
-#   carry no matrix values and the log shows counts only.
+#   sets its force input) nor has a record apps/<bid>/versions/<version>.json (a withdrawal that sync
+#   has not committed yet). At most two builds per app are dispatched, newest version first, after a
+#   60 second pause and a second look at the run titles, so a build that a pre-push hook started at
+#   the same moment is not started twice. Job names carry no matrix values and the log shows counts
+#   only.
 #   The run title is public as soon as a build is dispatched, so a tag that build.yml would refuse as
 #   its ref, or whose run title holds a denylist term or a home path (repository secret ALT_DENYLIST,
 #   required), is never dispatched; it is only counted as refused.
 name: poll
 
 on:
+  schedule:
+    - cron: "4,19,34,49 * * * *"
   workflow_dispatch:
     inputs:
       app:
@@ -58,7 +74,8 @@ jobs:
       - name: Validate inputs
         env:
           APP: ${{ inputs.app }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          # a scheduled run has no inputs: never a dry run
+          DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
           export LC_ALL=C
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
@@ -162,7 +179,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ALT_REPO: ${{ github.repository }}
           BID: ${{ matrix.app.bid }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ inputs.dry_run == true }}
           ALT_DENYLIST: ${{ secrets.ALT_DENYLIST }}
           ALT_APP_CONFIG: ${{ secrets.ALT_APP }}
           ALT_DEPLOY_KEY: ${{ secrets.ALT_KEY }}
@@ -200,7 +217,7 @@ jobs:
           fi
           rm -rf "$ssh_dir"
           python3 - "$RUNNER_TEMP/tags.txt" <<'PY'
-          import datetime, json, os, re, sys
+          import datetime, json, os, re, sys, time
           from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
           from altsource.gh import GhError, GitHub
           from altsource.leaks import GateError, load_denylist, scan_text
@@ -208,6 +225,7 @@ jobs:
           from altsource.stage import Toolkit, parse_semver
 
           MAX_PER_APP = 2
+          SETTLE_SECONDS = int(os.environ.get("ALT_POLL_SETTLE_SECONDS") or 60)
           # the rules of build.yml's ref input
           REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
           deps = Toolkit()
@@ -232,9 +250,14 @@ jobs:
                   private = json.load(fh).get("privateBuild") or {}
               pattern = re.compile(private.get("tagPattern") or DEFAULT_TAG_PATTERN)
           except (OSError, ValueError, AttributeError, TypeError, re.error):
-              pattern = None
+              private, pattern = {}, None
           if pattern is None or "version" not in pattern.groupindex:
               print("::error::privateBuild.tagPattern is not usable")
+              sys.exit(1)
+          try:
+              floor = parse_semver(deps, private["minVersion"]) if "minVersion" in private else None
+          except (TypeError, ValueError):
+              print("::error::privateBuild.minVersion is not a semver")
               sys.exit(1)
           try:
               withdrawn = load_withdrawn(".", bid)  # a missing file lists nothing
@@ -243,6 +266,7 @@ jobs:
               sys.exit(1)
 
           versions = {}
+          older = set()
           refusals = set()
           with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
               for line in fh:
@@ -258,32 +282,53 @@ jobs:
                       tag = deps.make_tag(bid, version)
                   except Exception:
                       continue
+                  if floor is not None and parse_semver(deps, version) < floor:
+                      older.add(version)
+                      continue
                   if refused(name):
                       refusals.add(name)
                       continue
                   versions.setdefault(version, (name, tag))
 
-          try:
-              gh = GitHub()
-              released = {r.get("tag_name") for r in gh.list_releases()}
+          def build_titles(gh):
               since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
               runs = gh.api("GET", "repos/%s/actions/workflows/build.yml/runs" % gh.repo,
                             fields={"created": ">=" + since}, paginate=True)
-              titles = {r.get("display_title") for r in runs if isinstance(r, dict)}
+              return {r.get("display_title") for r in runs if isinstance(r, dict)}
+
+
+          def withdrawing(version):
+              # a version record without a published release: sync has not yet committed a withdrawal
+              # (or a takedown); the commit that drops the record adds the tombstone
+              return os.path.exists(os.path.join("apps", bid, "versions", version + ".json"))
+
+
+          late = []
+          try:
+              gh = GitHub()
+              released = {r.get("tag_name") for r in gh.list_releases()}
+              titles = build_titles(gh)
               candidates = [v for v, (name, tag) in versions.items()
                             if tag not in released and "build %s %s" % (bid, name) not in titles]
-              skipped = [v for v in candidates if v in withdrawn]
+              skipped = [v for v in candidates if v in withdrawn or withdrawing(v)]
               candidates = [v for v in candidates if v not in skipped]
               candidates.sort(key=lambda v: parse_semver(deps, v), reverse=True)
               chosen = candidates[:MAX_PER_APP]
-              if not dry_run:
+              if chosen and not dry_run:
+                  # a pre-push hook may have started the same tag a moment ago, and its run is listed only
+                  # a few seconds later: look again before starting a second build
+                  time.sleep(SETTLE_SECONDS)
+                  titles = build_titles(gh)
+                  late = [v for v in chosen if "build %s %s" % (bid, versions[v][0]) in titles]
+                  chosen = [v for v in chosen if v not in late]
                   for version in chosen:
                       gh.dispatch_workflow("build.yml", "main",
                                            {"app": bid, "ref": versions[version][0], "publish": "true"})
           except GhError as exc:
               print("::error::" + str(exc))
               sys.exit(1)
-          print("matching tags: %d, refused: %d, withdrawn: %d, candidates: %d, %s: %d" % (
-              len(versions), len(refusals), len(skipped), len(candidates),
-              "would dispatch" if dry_run else "dispatched", len(chosen)))
+          print("matching tags: %d, below minVersion: %d, refused: %d, withdrawn: %d, candidates: %d, "
+                "started meanwhile: %d, %s: %d" % (
+                    len(versions), len(older), len(refusals), len(skipped), len(candidates), len(late),
+                    "would dispatch" if dry_run else "dispatched", len(chosen)))
           PY

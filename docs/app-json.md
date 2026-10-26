@@ -88,6 +88,7 @@ App metadata, validated strictly: an unknown key is an error.
 |---|---|---|
 | `enabled` | boolean | `true` lets `build.yml` and `poll.yml` build this app from its private repository |
 | `tagPattern` | regex string with a named group `version` | which private tags are versions; default: `v` followed by a semver |
+| `minVersion` | semver string such as `1.4.0` | the lowest version `poll.yml` builds; it ignores older tags. Versions compare as SemVer, so a pre-release sorts below its release: `1.5.0` skips `v1.5.0-beta.1`, `1.5.0-0` admits it. `bin/alt build` and the pre-push hook still build an older tag on request. `bin/alt register` sets it to the repository's newest version tag unless `--min-version` is given or `app.json` already has one; a repository without version tags gets no floor |
 | `windowed` | boolean | optional; accepted by the validator but not read by the current tools |
 
 When an app gets its first published release and has no `app.json`, sync creates one. It sets `name`

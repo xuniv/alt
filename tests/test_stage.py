@@ -600,6 +600,14 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(errors), 8)
         self.assertEqual(stagemod.validate_app_json([]), ["app.json must be a JSON object"])
 
+    def test_private_build_min_version(self):
+        for good in ("0.2.1", "1.0.0-rc.1", "10.20.30"):
+            self.assertEqual(stagemod.validate_app_json({"privateBuild": {"enabled": True, "minVersion": good}}), [],
+                             good)
+        for bad in ("1.2", "v1.2.3", "01.2.3", "1.2.3-rc.01", "1.2.3+build", "", 1, None, True):
+            self.assertEqual(stagemod.validate_app_json({"privateBuild": {"enabled": True, "minVersion": bad}}),
+                             ["privateBuild.minVersion must be a semver such as 1.2.3"], bad)
+
     def test_toolkit_overrides_and_late_binding(self):
         kit = stagemod.Toolkit(inspect_ipa=lambda p: "fake")
         self.assertEqual(kit.inspect_ipa("x"), "fake")

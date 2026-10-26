@@ -51,8 +51,10 @@
 #            (retention 1 day; artifacts of a public repository can be downloaded by any signed-in
 #            user). The collected logs are uploaded as the "diag" artifact, encrypted to
 #            ALT_LOG_RECIPIENT (retention 3 days), on success and on failure.
-#   gate     (ubuntu) decrypts the payload on a clean runner, runs the full gate and publishes the
-#            release; with publish=false it runs the gate only (stage --dry-run).
+#   gate     (ubuntu) decrypts the payload on a clean runner, checks main again for a withdrawal that
+#            landed during the build (a tombstone, or a version record without a published release;
+#            skipped when force is set), runs the full gate and publishes the release; with
+#            publish=false it runs the gate only (stage --dry-run).
 #   cleanup  (ubuntu) deletes the payload artifact after the gate job, also when it failed, was
 #            skipped or the run was cancelled.
 #   catalog  regenerates the catalog and deploys the site (catalog.yml); only when publishing.
@@ -835,6 +837,65 @@ jobs:
             exit 1
           fi
           echo "payload decrypted"
+
+      - name: Check the version on main
+        # the app job read retracted.json at the commit the run started from; a withdrawal can reach
+        # main while the IPA is built, so look again just before publishing
+        if: inputs.publish && !inputs.force
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+          APP: ${{ inputs.app }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          export LC_ALL=C
+          main="$RUNNER_TEMP/alt-main"
+          rm -rf "$main"
+          mkdir -p "$main/apps/$APP/versions"
+          if ! git fetch --quiet --no-tags --depth=1 origin main 2>/dev/null; then
+            echo "::error::main could not be fetched to check for a withdrawal"
+            exit 1
+          fi
+          for file in "retracted.json" "versions/$VERSION.json"; do
+            if git cat-file -e "FETCH_HEAD:apps/$APP/$file" 2>/dev/null; then
+              git show "FETCH_HEAD:apps/$APP/$file" > "$main/apps/$APP/$file"
+            fi
+          done
+          # exit 0: withdrawn, 4: not withdrawn, anything else: the file could not be read
+          python3 -m altsource retracted --root "$main" --bid "$APP" --version "$VERSION" && code=0 || code=$?
+          case "$code" in
+            4) ;;
+            0)
+              echo "::error::version $VERSION was withdrawn while it was being built; dispatch the build" \
+                "with force=true (bin/alt build --force) to publish it anyway"
+              exit 1
+              ;;
+            *)
+              echo "::error::apps/$APP/retracted.json on main could not be checked (exit $code)"
+              exit 1
+              ;;
+          esac
+          if [ -f "$main/apps/$APP/versions/$VERSION.json" ]; then
+            # main lists the version, so it must still have a published release; if not, a withdrawal
+            # is on its way to main (sync drops the record and adds the tombstone in one commit)
+            python3 - <<'PY'
+          import os, sys
+          from altsource.gh import GhError, GitHub
+          try:
+              release = GitHub().get_release_by_tag(os.environ["TAG"])
+          except GhError as exc:
+              print("::error::the release could not be checked: %s" % exc)
+              sys.exit(1)
+          if not release or release.get("draft"):
+              print("::error::version %s is being withdrawn (main lists it, but it has no published release); "
+                    "dispatch the build with force=true (bin/alt build --force) to publish it anyway"
+                    % os.environ["VERSION"])
+              sys.exit(1)
+          PY
+          fi
+          echo "version $VERSION: not withdrawn on main"
 
       - name: Gate the IPA
         env:

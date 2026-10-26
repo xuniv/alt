@@ -4,6 +4,7 @@
   "localizedDescription": "A media browser for remote file servers. It opens WebDAV remotes, HTTP directory indexes and rclone remotes that hold tens of thousands of images and videos in nested folders: instant thumbnails from a persisted index, pinch-to-resize columns, a full-screen viewer, slideshow, and a metadata panel for AI-generated images. Read-only: it never uploads, renames or deletes anything on a remote. Requires iOS 27.",
   "category": "photo-video",
   "privateBuild": {
-    "enabled": true
+    "enabled": true,
+    "minVersion": "0.2.1"
   }
 }

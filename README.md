@@ -51,7 +51,8 @@ A release published directly on GitHub skips stage and its draft, so it has no p
 protection: it is public at once, and sync gates it only afterwards. Sync takes it down if it fails,
 and if the IPA passes but was not re-packed, sync replaces it with the normalized form and publishes
 the release again. Neither undoes what was public in between. Route 2 builds new private tags when
-they are pushed, through an optional local pre-push hook.
+they are pushed, through an optional local pre-push hook, and a scheduled poll every 15 minutes picks
+up tags that no hook announced.
 
 Release tags follow `<bundleId>-v<semver>`, for example `io.example.demo-v1.4.0`.
 

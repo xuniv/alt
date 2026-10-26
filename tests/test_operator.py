@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -174,7 +175,8 @@ class Untouchable:
 def is_write(argv):
     if argv[:1] == ["api"]:
         return "--method" in argv and argv[argv.index("--method") + 1] != "GET"
-    return argv[:2] in (["workflow", "run"], ["secret", "set"], ["secret", "delete"], ["variable", "set"])
+    return argv[:2] in (["workflow", "run"], ["workflow", "enable"], ["secret", "set"], ["secret", "delete"],
+                        ["variable", "set"])
 
 
 class OperatorCase(unittest.TestCase):
@@ -537,6 +539,69 @@ class BuildTests(OperatorCase):
                                           "-f", "ref=v1.2.3", "-f", "publish=true"]])
         self.assertEqual(err, "")
         self.assertIn("dispatched build.yml", out)
+
+    def test_if_new_skips_a_published_or_running_build(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        release = {"match": ["api", "repos/xuniv/alt/releases/tags/%s-v1.2.3" % BID],
+                   "stdout": {"id": 4, "tag_name": BID + "-v1.2.3", "draft": False}}
+        runs = r"^repos/xuniv/alt/actions/workflows/build\.yml/runs\?created=%3E%3D\d{4}-\d\d-\d\d&per_page=100&page=1$"
+
+        def listing(status):
+            return {"match": ["api"], "pattern": [runs], "stdout": {"workflow_runs": [
+                {"display_title": "build %s v1.2.3" % BID, "status": status},
+                {"display_title": "build %s v1.2.4" % BID, "status": "in_progress"}]}}
+
+        for rules, started in (((release,), False), ((listing("queued"),), False), ((listing("in_progress"),), False),
+                               ((listing("completed"),), True), ((), True)):
+            self.set_rules(*rules)
+            calls = os.path.join(self.state, "calls.jsonl")
+            if os.path.exists(calls):
+                os.unlink(calls)
+            code, out, err = self.run_alt("build", "--if-new", BID, "v1.2.3")
+            self.assertEqual(code, 0, err)
+            dispatched = [w for w in self.writes() if w[:3] == ["workflow", "run", "build.yml"]]
+            self.assertEqual(bool(dispatched), started, (rules, out))
+            if not started:
+                self.assertRegex(out, r"no build started: %s v1\.2\.3 (has a published release|is already being built)"
+                                 % re.escape(BID))
+        self.set_rules(release)  # without --if-new an explicit build always starts
+        self.assertEqual(self.run_alt("build", BID, "v1.2.3")[0], 0)
+        self.assertTrue([w for w in self.writes() if w[:3] == ["workflow", "run", "build.yml"]])
+
+    def test_if_new_starts_the_build_when_the_lookup_fails(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.set_rules({"match": ["api"], "pattern": [r"actions/workflows/build\.yml/runs"], "stdout": "not json"})
+        code, out, err = self.run_alt("build", "--if-new", BID, "v1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("existing builds could not be checked; starting the build", err)
+        self.assertIn("dispatched build.yml", out)
+
+    def test_a_schedule_disabled_for_inactivity_is_enabled_again(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.set_rules({"match": ["api", "repos/xuniv/alt/actions/workflows?per_page=100"], "stdout": {"workflows": [
+            {"path": ".github/workflows/poll.yml", "state": "disabled_inactivity"},
+            {"path": ".github/workflows/stage.yml", "state": "active"},
+            {"path": ".github/workflows/ci.yml", "state": "disabled_inactivity"},  # no schedule
+            {"path": ".github/workflows/ingest.yml", "state": "disabled_manually"}]}})
+        code, out, err = self.run_alt("build", BID, "v1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes()[1:], [["workflow", "enable", "poll.yml", "-R", "xuniv/alt"]])
+        self.assertIn("enabled poll.yml again", out)
+        code, out, _ = self.run_alt("--dry-run", "build", BID, "v1.2.3")
+        self.assertEqual(code, 0)
+        self.assertIn("+ gh workflow enable poll.yml -R xuniv/alt\n", out)
+
+    def test_a_failed_revival_only_warns(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.set_rules({"match": ["workflow", "enable"], "code": 1, "stderr": "HTTP 403\n"},
+                       {"match": ["api", "repos/xuniv/alt/actions/workflows?per_page=100"], "stdout": {"workflows": [
+                           {"path": ".github/workflows/stage.yml", "state": "disabled_inactivity"}]}})
+        code, out, err = self.run_alt("build", BID, "v1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("dispatched build.yml", out)
+        self.assertIn("gh workflow enable stage.yml -R xuniv/alt", err)
+        self.set_rules({"match": ["api", "repos/xuniv/alt/actions/workflows?per_page=100"], "stdout": "not json"})
+        self.assertEqual(self.run_alt("build", BID, "v1.2.3")[0], 0)
 
     def test_no_publish_and_missing_private_build_warning(self):
         code, _, err = self.run_alt("build", BID, "release/2.0.0", "--no-publish")
@@ -972,7 +1037,15 @@ class RegisterTests(OperatorCase):
         self.set_rules(*extra, {"match": ["api", "repos/%s/keys?per_page=100" % PRIVATE], "stdout": list(keys)},
                        {"match": ["api", "--method", "POST", "repos/%s/keys" % PRIVATE], "stdout": created},
                        {"match": ["api", POLICIES_PATH + "?per_page=100"],
-                        "stdout": {"total_count": 0, "branch_policies": []}})
+                        "stdout": {"total_count": 0, "branch_policies": []}},
+                       self.tags_rule([]))
+
+    @staticmethod
+    def tags_rule(names, page=1, **kwargs):
+        rule = {"match": ["api", "repos/%s/tags?per_page=100&page=%d" % (PRIVATE, page)],
+                "stdout": [{"name": n, "commit": {"sha": "a" * 40}} for n in names]}
+        rule.update(kwargs)
+        return rule
 
     def keygen(self):
         path = os.path.join(self.state, "ssh-keygen.json")
@@ -1145,6 +1218,88 @@ class RegisterTests(OperatorCase):
         self.assertEqual(self.read_app_json(), {"name": "Demo", "privateBuild": {"enabled": True, "windowed": True}})
         self.assertIn("already enables", self.run_alt("register", PRIVATE, "--bid", BID, "--rotate")[1])
 
+    def test_min_version_defaults_to_the_newest_version_tag(self):
+        self.rules((), None, self.tags_rule(["v1.2.3", "v1.10.0", "release-9.9.9", "v1.9.9", "v2.0.0-rc.01", "x"]))
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_app_json(), {"privateBuild": {"enabled": True, "minVersion": "1.10.0"}})
+        self.assertIn("minVersion 1.10.0 is its newest tag, so older tags are not built", out)
+        tag_calls = [a for a in self.argvs() if any("/tags?" in x for x in a)]
+        self.assertEqual(len(tag_calls), 1)
+        self.assertLess(self.argvs().index(tag_calls[0]), self.argvs().index(self.writes()[0]))  # before any write
+
+    def test_min_version_follows_the_tag_pattern_and_all_pages(self):
+        pattern = r"^release-(?P<version>\d+\.\d+\.\d+)$"
+        first = ["v9.%d.0" % i for i in range(99)] + ["release-1.0.0"]
+        self.rules((), None, self.tags_rule(first), self.tags_rule(["release-1.4.0", "release-1.3.9"], page=2))
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID, "--tag-pattern", pattern)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_app_json(), {"privateBuild": {"enabled": True, "tagPattern": pattern,
+                                                                 "minVersion": "1.4.0"}})
+
+    def test_explicit_or_existing_min_version_skips_the_tag_listing(self):
+        self.rules()
+        code, _, err = self.run_alt("register", PRIVATE, "--bid", BID, "--min-version", "0.0.0")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_app_json(), {"privateBuild": {"enabled": True, "minVersion": "0.0.0"}})
+        self.app_json({"name": "Demo", "privateBuild": {"enabled": True, "minVersion": "0.5.0"}})
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID, "--rotate")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_app_json(), {"name": "Demo", "privateBuild": {"enabled": True,
+                                                                                 "minVersion": "0.5.0"}})
+        self.assertIn("already enables", out)
+        self.assertFalse(any("/tags?" in a for argv in self.argvs() for a in argv))
+
+    def test_a_repository_without_version_tags_gets_no_floor(self):
+        self.rules((), None, self.tags_rule(["latest", "nightly"]))
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_app_json(), {"privateBuild": {"enabled": True}})
+        self.assertIn("has no version tag yet", out)
+
+    def test_a_floor_with_a_private_word_is_never_written(self):
+        self.rules((), None, self.tags_rule(["v1.0.0", "v2.0.0-leakyuser0"]))
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID)
+        self.assertEqual(code, 2)
+        self.assertIn("gate rejected: apps/%s/app.json" % BID, err)
+        self.assertIn("pass --min-version", err)
+        self.assertNotIn("leakyuser0", out + err)
+        self.assertEqual(self.writes(), [])
+        self.assertIsNone(self.keygen())
+        self.assertFalse(os.path.exists(os.path.join(self.root, "apps", BID)))
+        self.rules()
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID, "--min-version", "1.0.0-leakyuser0")
+        self.assertEqual(code, 2)
+        self.assertNotIn("leakyuser0", out + err)
+        self.assertEqual(self.writes(), [])
+
+    def test_a_private_word_elsewhere_in_app_json_is_not_blamed_on_the_floor(self):
+        pattern = r"^leakyuser0-v(?P<version>\d+\.\d+\.\d+)$"
+        self.rules((), None, self.tags_rule(["leakyuser0-v1.2.0"]))
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID, "--tag-pattern", pattern)
+        self.assertEqual(code, 2)
+        self.assertNotIn("pass --min-version", err)
+        self.assertIn("apps/%s/app.json would contain a denylist term" % BID, err)
+        self.assertNotIn("leakyuser0", out + err)
+        self.assertEqual(self.writes(), [])
+
+    def test_unlistable_tags_stop_before_any_write(self):
+        for rule in (self.tags_rule([], **NOT_FOUND), self.tags_rule([], stdout="")):
+            self.rules((), None, rule)
+            code, _, err = self.run_alt("register", PRIVATE, "--bid", BID)
+            self.assertEqual(code, 1)
+            self.assertIn("the tags of %s could not be listed; pass --min-version" % PRIVATE, err)
+        self.assertEqual(self.writes(), [])
+        self.assertIsNone(self.keygen())
+        self.assertFalse(os.path.exists(os.path.join(self.root, "apps", BID)))
+
+    def test_dry_run_shows_the_floor(self):
+        self.rules((), None, self.tags_rule(["v0.2.1"]))
+        code, out, err = self.run_alt("--dry-run", "register", PRIVATE, "--bid", BID)
+        self.assertEqual(code, 0, err)
+        self.assertIn("write apps/%s/app.json with privateBuild.enabled, minVersion 0.2.1" % BID, out)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "apps", BID)))
+
     def test_inputs_are_validated_before_gh(self):
         def build(obj):
             return self.write(os.path.join(self.dir, "b.json"), json.dumps(obj))
@@ -1160,6 +1315,9 @@ class RegisterTests(OperatorCase):
             ("register", PRIVATE, "--bid", BID, "--build-json", build({"ipa_glob": "../x.ipa"})),
             ("register", PRIVATE, "--bid", BID, "--build-json", build(["not", "an", "object"])),
             ("register", PRIVATE, "--bid", BID, "--build-json", os.path.join(self.dir, "missing.json")),
+            ("register", PRIVATE, "--bid", BID, "--min-version", "1.2"),
+            ("register", PRIVATE, "--bid", BID, "--min-version", "v1.2.3"),
+            ("register", PRIVATE, "--bid", BID, "--min-version", "1.2.3-rc.01"),
         ]
         for argv in cases:
             self.assertEqual(self.run_alt(*argv)[0], 1, argv)
@@ -1422,6 +1580,34 @@ class HookTests(OperatorCase):
         self.assertEqual(self.builds(), [["workflow", "run", "build.yml", "-R", "xuniv/alt", "-f", "app=" + BID,
                                           "-f", "ref=v1.2.3", "-f", "publish=true"]])
         self.assertIn("tag v1.2.3 pushed; starting alt build", self.log_text())
+
+    def test_a_tag_that_is_already_published_starts_no_second_build(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.set_rules({"match": ["api", "repos/xuniv/alt/releases/tags/%s-v1.2.3" % BID],
+                        "stdout": {"id": 4, "tag_name": BID + "-v1.2.3", "draft": False}})
+        self.assertEqual(self.install()[0], 0)
+        self.assertIn('exec "$1" build --if-new "$2" "$3"', self.read(self.hook))
+        self.git("tag", "v1.2.3")
+        self.git("push", "-q", "origin", "v1.2.3")
+        self.assertTrue(self.wait_for(lambda: "no build started" in self.log_text()), self.log_text())
+        self.assertIn("has a published release", self.log_text())
+        self.assertEqual(self.builds(), [])
+
+    def test_a_moved_tag_is_built_even_while_its_first_build_runs(self):
+        self.app_json({"privateBuild": {"enabled": True}})
+        self.set_rules({"match": ["api"], "pattern": [r"actions/workflows/build\.yml/runs\?created="],
+                        "stdout": {"workflow_runs": [{"display_title": "build %s v1.2.3" % BID,
+                                                      "status": "in_progress"}]}})
+        self.assertEqual(self.install()[0], 0)
+        self.git("tag", "v1.2.3")
+        self.git("push", "-q", "origin", "v1.2.3")
+        self.assertTrue(self.wait_for(lambda: "is already being built" in self.log_text()), self.log_text())
+        self.assertEqual(self.builds(), [])
+        self.git("commit", "-q", "--allow-empty", "-m", "fix")
+        self.git("tag", "-f", "v1.2.3")
+        self.git("push", "-q", "-f", "origin", "v1.2.3")
+        self.assertTrue(self.wait_for(lambda: self.builds() and "dispatched" in self.log_text()), self.log_text())
+        self.assertEqual([a[-3] for a in self.builds()], ["ref=v1.2.3"])
 
     def test_pushing_a_tag_of_a_withdrawn_version_builds_nothing(self):
         self.app_json({"privateBuild": {"enabled": True}})
@@ -2006,7 +2192,8 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
                        {"pattern": [self.RUNS], "stdout": {"total_count": 0, "workflow_runs": []}})
         env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
                "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt",
-               "BID": BID, "DRY_RUN": dry_run, "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true"}
+               "BID": BID, "DRY_RUN": dry_run, "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true",
+               "ALT_POLL_SETTLE_SECONDS": "0"}
         proc = subprocess.run([sys.executable, program, listing], cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                               capture_output=True)
         return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
@@ -2019,7 +2206,8 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         self.retract("1.3.0", "1.2.3")
         code, out, err = self.run_poll(["v1.2.3", "v1.2.4", "v1.3.0", "v1.1.0"], released=["io.example.demo-v1.1.0"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("matching tags: 4, refused: 0, withdrawn: 2, candidates: 1, dispatched: 1", out)
+        self.assertIn("matching tags: 4, below minVersion: 0, refused: 0, withdrawn: 2, candidates: 1, "
+                      "started meanwhile: 0, dispatched: 1", out)
         self.assertEqual(self.dispatched(), [{"ref": "main", "inputs": {"app": BID, "ref": "v1.2.4",
                                                                         "publish": "true"}}])
         self.assertNotIn("1.3.0", out + err)  # counts only
@@ -2027,7 +2215,59 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
     def test_without_withdrawn_versions_and_in_a_dry_run(self):
         code, out, _ = self.run_poll(["v1.2.3", "v1.2.4", "v1.3.0"], dry_run="true")
         self.assertEqual(code, 0, out)
-        self.assertIn("withdrawn: 0, candidates: 3, would dispatch: 2", out)
+        self.assertIn("withdrawn: 0, candidates: 3, started meanwhile: 0, would dispatch: 2", out)
+        self.assertEqual(self.dispatched(), [])
+
+    def test_versions_below_min_version_are_never_dispatched(self):
+        self.app_json({"privateBuild": {"enabled": True, "minVersion": "1.2.4"}})
+        self.retract("1.3.0")
+        code, out, err = self.run_poll(["v1.0.0", "v1.2.3", "v1.2.4-rc.1", "v1.2.4", "v1.3.0", "v1.4.0"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("matching tags: 3, below minVersion: 3, refused: 0, withdrawn: 1, candidates: 2, "
+                      "started meanwhile: 0, dispatched: 2", out)
+        self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["v1.4.0", "v1.2.4"])
+        self.assertNotIn("1.2.3", out + err)  # counts only
+
+    def test_a_record_without_a_published_release_is_a_withdrawal_in_progress(self):
+        # sync drops the record and adds the tombstone in one commit; until then main still has the record
+        self.write(os.path.join(self.mkdir("altrepo", "apps", BID, "versions"), "1.2.4.json"), "{}\n")
+        code, out, err = self.run_poll(["v1.2.4", "v1.2.5"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("withdrawn: 1, candidates: 1", out)
+        self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["v1.2.5"])
+
+    def test_a_build_started_meanwhile_is_not_started_twice(self):
+        # the pre-push hook dispatched v1.2.5 while poll was deciding: poll's second look finds its run
+        script = heredoc(step_script(POLL_WORKFLOW, "Find new versions"), 'python3 - "$RUNNER_TEMP/tags.txt" <<\'PY\'')
+        program = self.write(os.path.join(self.dir, "poll.py"), script)
+        listing = self.write(os.path.join(self.dir, "tags.txt"),
+                             "".join("%s\trefs/tags/%s\n" % ("a" * 40, t) for t in ("v1.2.4", "v1.2.5")))
+        releases = {"match": ["repos/xuniv/alt/releases?per_page=100&page=1"], "stdout": []}
+        self.set_rules(releases, {"pattern": [self.RUNS], "stdout": {"total_count": 0, "workflow_runs": []}})
+        env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
+               "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt", "BID": BID, "DRY_RUN": "false",
+               "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true", "ALT_POLL_SETTLE_SECONDS": "5"}
+        proc = subprocess.Popen([sys.executable, program, listing], cwd=self.root, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 15
+            while not any(re.search(self.RUNS, a) for a in sum(self.argvs(), [])) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.set_rules(releases, {"pattern": [self.RUNS], "stdout": {"total_count": 1, "workflow_runs": [
+                {"display_title": "build %s v1.2.5" % BID, "status": "queued"}]}})
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertIn(b"candidates: 2, started meanwhile: 1, dispatched: 1", out)
+        self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["v1.2.4"])
+
+    def test_a_bad_min_version_dispatches_nothing(self):
+        self.app_json({"privateBuild": {"enabled": True, "minVersion": "1.2"}})
+        code, out, _ = self.run_poll(["v1.2.4"])
+        self.assertEqual(code, 1)
+        self.assertIn("::error::privateBuild.minVersion is not a semver", out)
         self.assertEqual(self.dispatched(), [])
 
     def test_an_unreadable_file_dispatches_nothing(self):
@@ -2036,6 +2276,123 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::apps/<app>/retracted.json could not be checked", out)
         self.assertEqual(self.dispatched(), [])
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("git"), "needs bash and git")
+class GateMainCheckTests(WithdrawnWorkflowCase):
+    """build.yml's gate job looks at main again before it publishes: a withdrawal can land during the build."""
+
+    TAG = BID + "-v1.2.3"
+
+    def setUp(self):
+        super().setUp()
+        self.genv = dict(self.env, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=self.write(
+            os.path.join(self.dir, "gitconfig"), ""), GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.invalid",
+            GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.invalid")
+        self.origin = self.mkdir("origin")
+        self.checkout = self.mkdir("checkout")
+        self.git(self.origin, "init", "-q", "-b", "main")
+        self.write(os.path.join(self.origin, "README"), "x\n")
+        self.commit()
+        self.git(self.checkout, "init", "-q")
+        self.git(self.checkout, "remote", "add", "origin", self.origin)
+
+    def git(self, cwd, *args):
+        proc = subprocess.run(["git"] + list(args), cwd=cwd, env=self.genv, capture_output=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def commit(self):
+        self.git(self.origin, "add", "-A")
+        self.git(self.origin, "commit", "-q", "--allow-empty", "-m", "change")
+
+    def on_main(self, rel, text):
+        path = os.path.join(self.origin, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.write(path, text)
+        self.commit()
+
+    def run_step(self, release=None):
+        rules = [{"match": ["api"], "pattern": [r"^repos/xuniv/alt/releases/tags/"],
+                  "stdout": release} if release is not None else
+                 dict(NOT_FOUND, match=["api"], pattern=[r"^repos/xuniv/alt/releases/tags/"]),
+                 {"match": ["repos/xuniv/alt/releases?per_page=100&page=1"], "stdout": []}]
+        self.set_rules(*rules)
+        script = step_script(BUILD_WORKFLOW, "Check the version on main", job="gate")
+        temp = self.mkdir("runner-temp")
+        env = dict(self.genv, PYTHONPATH=TOOLS, RUNNER_TEMP=temp, GH_TOKEN="placeholder", ALT_REPO="xuniv/alt",
+                   APP=BID, VERSION="1.2.3", TAG=self.TAG, GITHUB_ACTIONS="true")
+        proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=self.checkout,
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True)
+        return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
+
+    def test_a_new_version_passes(self):
+        code, out, err = self.run_step()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("version 1.2.3: not withdrawn on main", out)
+
+    def test_a_tombstone_that_reached_main_during_the_build_stops_it(self):
+        text = json.dumps({"schemaVersion": 1, "versions": {"1.2.3": {"date": "2026-10-22T07:13:00Z",
+                                                                      "reason": "deleted"}}}, sort_keys=True)
+        self.on_main("apps/%s/retracted.json" % BID, text + "\n")
+        code, out, _ = self.run_step()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::version 1.2.3 was withdrawn while it was being built", out)
+        self.on_main("apps/%s/retracted.json" % BID, '{"schemaVersion": 1, "versions": [')
+        code, out, _ = self.run_step()
+        self.assertEqual(code, 1)
+        self.assertIn("could not be checked", out)
+
+    def test_a_listed_version_without_a_published_release_is_being_withdrawn(self):
+        self.on_main("apps/%s/versions/1.2.3.json" % BID, "{}\n")
+        code, out, _ = self.run_step()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::version 1.2.3 is being withdrawn", out)
+        code, out, err = self.run_step(release={"id": 4, "tag_name": self.TAG, "draft": False})
+        self.assertEqual(code, 0, out + err)  # a rebuild of a published version
+
+    def test_main_that_cannot_be_fetched_stops_it(self):
+        shutil.rmtree(self.origin)
+        code, out, _ = self.run_step()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::main could not be fetched", out)
+
+    def test_the_step_runs_only_for_unforced_publishing_builds(self):
+        with open(BUILD_WORKFLOW, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        first, end = job_lines(BUILD_WORKFLOW, "gate")
+        names = [line.strip() for line in lines[first:end] if line.strip().startswith("- name: ")]
+        self.assertLess(names.index("- name: Check the version on main"), names.index("- name: Gate the IPA"))
+        at = lines.index("      - name: Check the version on main", first)
+        self.assertIn("        if: inputs.publish && !inputs.force", lines[at:at + 5])
+
+
+class PollTriggerTests(unittest.TestCase):
+    """poll.yml runs on a schedule as well as by hand; a scheduled run has no inputs."""
+
+    def setUp(self):
+        with open(POLL_WORKFLOW, encoding="utf-8") as fh:
+            self.text = fh.read()
+        self.lines = self.text.splitlines()
+
+    def test_schedule_and_manual_dispatch(self):
+        start = self.lines.index("on:")
+        self.assertEqual(self.lines[start + 1:start + 4],
+                         ["  schedule:", '    - cron: "4,19,34,49 * * * *"', "  workflow_dispatch:"])
+
+    def test_scheduled_runs_are_never_dry_runs(self):
+        self.assertNotIn("${{ inputs.dry_run }}", self.text)
+        self.assertEqual(self.text.count("DRY_RUN: ${{ inputs.dry_run == true }}"), 2)
+
+    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    def test_validate_inputs_accepts_a_run_without_inputs(self):
+        script = step_script(POLL_WORKFLOW, "Validate inputs", job="list")
+        for app, dry_run, expected in (("", "false", 0), ("", "true", 0), ("io.example.demo", "false", 0),
+                                       ("", "", 1), ("io.example.app-v2", "false", 1)):
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_REF": "refs/heads/main",
+                   "APP": app, "DRY_RUN": dry_run}
+            proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                                  env=env, stdin=subprocess.DEVNULL, capture_output=True)
+            self.assertEqual(proc.returncode, expected, (app, dry_run, proc.stdout))
 
 
 class CatalogTriggerTests(unittest.TestCase):

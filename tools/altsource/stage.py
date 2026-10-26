@@ -187,6 +187,19 @@ def parse_semver(deps: Any, text: str) -> Any:
     return parse(text) if callable(parse) else cls(text)
 
 
+def is_semver(text: Any) -> bool:
+    """Whether ``text`` is a version that a tag may carry (``MAJOR.MINOR.PATCH[-PRERELEASE]``)."""
+    from .tags import SemVer  # no Toolkit: app.json validation has no dependencies to replace
+
+    if not isinstance(text, str):
+        return False
+    try:
+        SemVer(text)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def semver_prerelease(deps: Any, text: str) -> bool:
     return bool(field(parse_semver(deps, text), "prerelease"))
 
@@ -350,11 +363,13 @@ def _validate_private_build(pb: Any) -> List[str]:
         return ["privateBuild must be an object"]
     errors = []
     for key in sorted(pb):
-        if key not in ("enabled", "tagPattern", "windowed"):
+        if key not in ("enabled", "tagPattern", "minVersion", "windowed"):
             errors.append("unknown key privateBuild.%s" % key)
     for key in ("enabled", "windowed"):
         if key in pb and not isinstance(pb[key], bool):
             errors.append("privateBuild.%s must be a boolean" % key)
+    if "minVersion" in pb and not is_semver(pb["minVersion"]):
+        errors.append("privateBuild.minVersion must be a semver such as 1.2.3")
     if "tagPattern" in pb:
         pattern = pb["tagPattern"]
         try:
