@@ -8,7 +8,9 @@ spanning read boundaries are found) and searches the raw bytes, decoding nothing
 - ``home-path``: user home directories in the same three encodings. ``/Users/<x>/`` blocks;
   ``/home/<x>/`` and ``C:\\Users\\<x>\\`` only warn (they mostly come from third-party help text, and
   the hosted Linux runners build under ``/home/runner``). Well-known CI accounts and generic
-  placeholder names (``user``, ``yourname``, ...) are not counted;
+  placeholder names (``user``, ``yourname``, ...) are not counted. ``GatePolicy.home_users`` (app.json
+  ``allowHomeUsers``) names the build accounts of prebuilt third-party code, such as ``videolanci``
+  for VideoLAN's MobileVLCKit: ``/Users/<that name>/`` only warns;
 - ``ci-workspace-path`` (warn): the workspace of a hosted runner, ``/Users/runner/work/`` and
   ``/home/runner/work/``, and Xcode's build folder on the macOS runners,
   ``/Users/runner/Library/Developer/Xcode/DerivedData/``. A build of a checked-out repository
@@ -35,6 +37,7 @@ never stored, returned or printed.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import os
 import re
@@ -126,10 +129,29 @@ class ScanError(ArchiveError):
     """The archive cannot be scanned (unsafe or damaged); treated as a gate rejection."""
 
 
+HOME_USER_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,%d}$" % (MAX_HOME_NAME - 1))
+MAX_HOME_USERS = 16
+
+
+def check_home_users(names: Any) -> Tuple[str, ...]:
+    """``names`` as a tuple of account names for ``GatePolicy.home_users``; raises ValueError."""
+    if not isinstance(names, (list, tuple)) or len(names) > MAX_HOME_USERS:
+        raise ValueError("home users must be a list of at most %d names" % MAX_HOME_USERS)
+    out = []
+    for name in names:
+        if not isinstance(name, str) or not HOME_USER_RE.match(name) or name in (".", ".."):
+            raise ValueError("a home user name must be 1 to %d letters, digits, '.', '_' or '-'" % MAX_HOME_NAME)
+        if name.lower() not in (n.lower() for n in out):
+            out.append(name)
+    return tuple(out)
+
+
 @dataclasses.dataclass(frozen=True)
 class GatePolicy:
     allow_home_paths: bool = False  # home paths become warnings (third-party ingest opt-in only)
     allow_empty_denylist: bool = False  # tests only
+    # build accounts of prebuilt third-party code: their /Users/<name>/ paths only warn
+    home_users: Tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -241,11 +263,13 @@ def _trie_regex(literals: Sequence[bytes]) -> Optional["re.Pattern[bytes]"]:
 
 # -- byte matchers ---------------------------------------------------------------------------------
 
-def _home_patterns() -> List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[bytes, int], bool]], int]]:
+def _home_patterns(home_users: Tuple[str, ...] = ()
+                   ) -> List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[bytes, int], bool]], int]]:
     """(counter key, pattern, accept, max length) for the home-path and ci-workspace-path rules.
 
     Each pattern starts with a literal so the regex engine can use its fast prefix search; the drive
-    letter before ``:\\Users\\`` is checked by ``accept`` instead of in the pattern.
+    letter before ``:\\Users\\`` is checked by ``accept`` instead of in the pattern. ``home_users``
+    leave the blocking ``/Users/`` pattern and get one that only warns.
     """
     out = []
     for enc in ("8", "le", "be"):
@@ -273,7 +297,12 @@ def _home_patterns() -> List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[
             key = HOME_PATH if prefix in BLOCK_HOME_PREFIXES else HOME_PATH_WARN
             accept = _drive_letter(enc) if prefix.startswith(":") else None
             size = (len(prefix) + MAX_HOME_NAME + 1) * width
-            out.append((key, re.compile(lit(prefix) + rest), accept, size))
+            own = rest
+            if home_users and key == HOME_PATH:
+                users = b"(?:" + b"|".join(lit(u, fold=True) for u in home_users) + b")" + sep
+                own = b"(?!" + users + b")" + rest
+                out.append((HOME_PATH_WARN, re.compile(lit(prefix) + users), None, size))
+            out.append((key, re.compile(lit(prefix) + own), accept, size))
         # runner accounts are allowed above; their workspace and build folders are counted on their own
         for prefixes, dirs in CI_PATH_RULES:
             own = b"(?!(?:" + b"|".join(lit(d + "/") for d in dirs) + b"))"
@@ -297,6 +326,12 @@ def _drive_letter(enc: str) -> Callable[[bytes, int], bool]:
 
 
 _HOME = _home_patterns()
+
+
+@functools.lru_cache(maxsize=32)
+def _home_patterns_for(home_users: Tuple[str, ...]
+                       ) -> List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[bytes, int], bool]], int]]:
+    return _home_patterns(home_users) if home_users else _HOME
 _CONTEXT = 2  # bytes kept before the scan window for the drive letter check
 
 
@@ -307,14 +342,15 @@ class Matcher:
     ``HOME_PATH_WARN``.
     """
 
-    def __init__(self, denylist: Sequence[str]):
+    def __init__(self, denylist: Sequence[str], home_users: Sequence[str] = ()):
         literals = denylist_literals(denylist)
         self.deny = _trie_regex(literals)
-        longest = max([len(x) for x in literals] + [size for _, _, _, size in _HOME])
+        home = _home_patterns_for(check_home_users(tuple(home_users)))
+        longest = max([len(x) for x in literals] + [size for _, _, _, size in home])
         self.overlap = longest + 8
         # (rule, pattern, accept, lowercase the data first)
         self.patterns: List[Tuple[str, "re.Pattern[bytes]", Optional[Callable[[bytes, int], bool]], bool]] = [
-            (key, rx, accept, False) for key, rx, accept, _ in _HOME]
+            (key, rx, accept, False) for key, rx, accept, _ in home]
         if self.deny is not None:
             self.patterns.append((DENYLIST, self.deny, None, True))
 
@@ -548,7 +584,7 @@ def scan_ipa(path: str, *, denylist: Sequence[str], policy: Any = None, info: An
         raise GateError("denylist-missing", "denylist is missing or empty")
     if info is None:
         info = _inspect(path)
-    matcher = Matcher(words)
+    matcher = Matcher(words, getattr(policy, "home_users", ()) or ())
     findings = _Findings()
     names: List[Tuple[str, bool]] = []
     with zip_library_errors(ScanError), zipfile.ZipFile(path) as zf:

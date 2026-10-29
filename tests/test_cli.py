@@ -205,6 +205,36 @@ class StageCommandTests(CliCase):
         rel = self.gh.releases[int(values["release_id"])]
         self.assertEqual(rel["body"], "Fixes")
 
+    def test_stage_reads_allow_home_users_from_the_checkout(self):
+        root = os.path.join(self.dir, "root")
+        os.makedirs(os.path.join(root, "apps", "io.example.demo"))
+        ipa = self.ipa(payload="/Users/thirdpartyci/build")
+        code, _, _ = self.run_cli("stage", ipa, "--bid", "io.example.demo", "--dry-run", "--root", root,
+                                  gh=Untouchable())
+        self.assertEqual(code, 2)
+        with open(os.path.join(root, "apps", "io.example.demo", "app.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"allowHomeUsers": ["thirdpartyci"]}\n')
+        code, out, err = self.run_cli("stage", ipa, "--bid", "io.example.demo", "--dry-run", "--root", root,
+                                      gh=Untouchable())
+        self.assertEqual(code, 0, err)
+        self.assertIn("warning: home-path warn 1", err)
+        code, _, _ = self.run_cli("stage", self.ipa(payload="/Users/leakyuser3/build"), "--bid", "io.example.demo",
+                                  "--dry-run", "--root", root, gh=Untouchable())
+        self.assertEqual(code, 2)
+        with open(os.path.join(root, "apps", "io.example.demo", "app.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"allowHomeUsers": "thirdpartyci"}\n')
+        code, _, err = self.run_cli("stage", ipa, "--bid", "io.example.demo", "--dry-run", "--root", root,
+                                    gh=Untouchable())
+        self.assertEqual(code, 1)
+        self.assertIn("allowHomeUsers in the app's app.json is not valid", err)
+
+    def test_scan_allow_home_user(self):
+        ipa = self.ipa(payload="/Users/thirdpartyci/build")
+        self.assertEqual(self.run_cli("scan", ipa)[0], 2)
+        code, _, err = self.run_cli("scan", ipa, "--allow-home-user", "thirdpartyci")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.run_cli("scan", ipa, "--allow-home-user", "a/b")[0], 1)
+
     def test_stage_dry_run_never_touches_github(self):
         code, out, _ = self.run_cli("stage", self.ipa(), "--dry-run", gh=Untouchable())
         self.assertEqual(code, 0)

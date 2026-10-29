@@ -225,6 +225,33 @@ class HomePathTests(GateCase):
         self.assertFalse(result.ok)
         self.assertEqual([f["rule"] for f in result.blocking], ["denylist"])
 
+    def test_home_users_only_warn_for_their_own_accounts(self):
+        policy = leaks.GatePolicy(home_users=("thirdpartyci",))
+        for codec in ENCODINGS:
+            with self.subTest(codec=codec):
+                data = b"\x07" + "/Users/thirdpartyci/vlc/src.c /Users/ThirdPartyCI/x".encode(codec) + b"\x07"
+                result = self.scan([entry(APP + "Demo.bin", data)], policy=policy)
+                self.assertTrue(result.ok)
+                self.assertEqual([(f["rule"], f["severity"], f["count"]) for f in result.findings],
+                                 [("home-path", "warn", 2)])
+                data = b"\x07" + "/Users/thirdpartyci2/a /Users/leakyuser9/b".encode(codec) + b"\x07"
+                result = self.scan([entry(APP + "Demo.bin", data)], policy=policy)
+                self.assertFalse(result.ok)
+                self.assertEqual([(f["rule"], f["severity"], f["count"]) for f in result.blocking],
+                                 [("home-path", "block", 2)])
+        result = self.scan([entry(APP + "a.txt", "/Users/thirdpartyci/" + WORD)], policy=policy)
+        self.assertEqual([f["rule"] for f in result.blocking], ["denylist"])  # the denylist still applies
+
+    def test_home_user_names_are_checked(self):
+        self.assertEqual(leaks.check_home_users(["videolanci", "VideoLanCI", "ci.build-1"]),
+                         ("videolanci", "ci.build-1"))
+        for bad in ("not-a-list", [""], [".."], ["a/b"], ["a b"], ["x" * 65], [1], ["n%d" % i for i in range(17)]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                leaks.check_home_users(bad)
+            if isinstance(bad, list):
+                with self.assertRaises(ValueError, msg=repr(bad)):
+                    leaks.Matcher([WORD], bad)
+
     def test_policy_is_a_replaceable_dataclass(self):
         policy = dataclasses.replace(leaks.GatePolicy(), allow_home_paths=True)
         self.assertTrue(policy.allow_home_paths)

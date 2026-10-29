@@ -61,6 +61,7 @@ class FakeTagError(ValueError):
 class FakePolicy:
     allow_home_paths: bool = False
     allow_empty_denylist: bool = False
+    home_users: tuple = ()
 
 
 class FakeSemVer:
@@ -166,10 +167,16 @@ class FakeToolkit:
         if hits:
             findings.append({"rule": "denylist", "severity": "block", "count": sum(hits.values()),
                              "paths": ["Payload/Demo.app/Demo"]})
+        users = {u.lower() for u in getattr(policy, "home_users", ()) or ()}
         homes = HOME_RE.findall(text.lower())
+        third_party = [h for h in homes if h[len("/users/"):-1] in users]
+        homes = [h for h in homes if h not in third_party]
         if homes:
             findings.append({"rule": "home-path", "severity": "warn" if policy.allow_home_paths else "block",
                              "count": len(homes), "paths": ["Payload/Demo.app/Demo"]})
+        if third_party:
+            findings.append({"rule": "home-path", "severity": "warn", "count": len(third_party),
+                             "paths": ["Payload/Demo.app/Demo"]})
         ok = not any(f["severity"] == "block" for f in findings)
         return types.SimpleNamespace(ok=ok, findings=findings)
 
@@ -1054,6 +1061,20 @@ class SyncTests(SyncCase):
         result = self.run_sync()
         self.assertEqual(result.blocked, [])
         self.assertEqual(result.versions, 1)
+
+    def test_allow_home_users_from_app_json(self):
+        self.git.seed({"apps/io.example.demo/app.json": b'{"allowHomeUsers": ["thirdpartyci"]}\n'})
+        self.publish("io.example.demo-v1.2.3", ipa_bytes(payload="/Users/thirdpartyci/build"))
+        result = self.run_sync()
+        self.assertEqual(result.blocked, [])
+        self.assertEqual(result.versions, 1)
+
+    def test_allow_home_users_covers_only_the_named_accounts(self):
+        self.git.seed({"apps/io.example.demo/app.json": b'{"allowHomeUsers": ["thirdpartyci"]}\n'})
+        self.publish("io.example.demo-v1.2.3", ipa_bytes(payload="/Users/thirdpartyci/a /Users/leakyuser3/b"))
+        result = self.run_sync()
+        self.assertTrue(any("blocked (home-path); unpublished" in e for e in result.errors), result.errors)
+        self.assertEqual(result.versions, 0)
 
     def test_allow_home_paths_opt_in_from_release_app_json(self):
         rel, _ = self.publish("io.example.demo-v1.2.3", ipa_bytes(payload="/Users/leakyuser3/build"))

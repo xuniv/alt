@@ -333,12 +333,18 @@ class _Run:
             app = _read_json(path)
         else:
             app = seed  # validated by read_seed; stage attaches the opt-in it was given
+        changes: Dict[str, Any] = {}
         if isinstance(app, dict) and app.get("allowHomePaths") is True:
-            try:
-                return dataclasses.replace(self.policy, allow_home_paths=True)
-            except TypeError:
-                return self.deps.GatePolicy(allow_home_paths=True)
-        return self.policy
+            changes["allow_home_paths"] = True
+        users = app.get("allowHomeUsers") if isinstance(app, dict) else None
+        if isinstance(users, list) and users:  # validated with the rest of app.json
+            changes["home_users"] = tuple(users)
+        if not changes:
+            return self.policy
+        try:
+            return dataclasses.replace(self.policy, **changes)
+        except TypeError:
+            return self.deps.GatePolicy(**changes)
 
     def remediate(self, rel: Dict[str, Any], tag: str, rules: Sequence[str], subject: str = "") -> None:
         """Take a published release that fails the gate out of public view.

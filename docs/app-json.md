@@ -80,6 +80,7 @@ App metadata, validated strictly: an unknown key is an error.
 | `maxVersions` | integer 1 to 100 | how many versions to list | `10` |
 | `hidden` | boolean | leave the app out of `source.json` | `false` |
 | `allowHomePaths` | boolean | accept `/Users/<name>/` home paths in this app's IPAs as warnings (third-party builds, route 3); the other home path forms are warnings anyway | `false` |
+| `allowHomeUsers` | list of up to 16 account names (letters, digits, `.`, `_`, `-`) | build accounts of prebuilt third-party code inside this app's IPAs, for example `videolanci`, the account VideoLAN builds MobileVLCKit under: `/Users/<name>/` paths of these accounts only warn, in the build gate, stage and sync alike. Every other home path and the denylist still block, so this is narrower than `allowHomePaths` | none |
 | `privateBuild` | object | route 2 settings, see below | none |
 
 `privateBuild`:

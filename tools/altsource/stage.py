@@ -320,7 +320,7 @@ _URL = re.compile(r"^https?://[^\s/?#]+[^\s]*$")
 _STR_KEYS = ("name", "developerName", "subtitle", "localizedDescription")
 _BOOL_KEYS = ("includePrereleases", "hidden", "allowHomePaths")
 APP_JSON_KEYS = frozenset(_STR_KEYS + _BOOL_KEYS + ("category", "tintColor", "iconURL", "screenshots",
-                                                    "maxVersions", "privateBuild"))
+                                                    "maxVersions", "privateBuild", "allowHomeUsers"))
 SEED_KEYS = ("name", "developerName", "subtitle", "localizedDescription", "category", "tintColor",
              "iconURL", "screenshots", "allowHomePaths")
 
@@ -355,6 +355,13 @@ def validate_app_json(obj: Any) -> List[str]:
             errors.append("maxVersions must be an integer between 1 and 100")
     if "privateBuild" in obj:
         errors.extend(_validate_private_build(obj["privateBuild"]))
+    if "allowHomeUsers" in obj:
+        from .leaks import check_home_users  # no Toolkit: app.json validation has no dependencies to replace
+
+        try:
+            check_home_users(obj["allowHomeUsers"])
+        except ValueError:
+            errors.append("allowHomeUsers must be a list of at most 16 account names (letters, digits, . _ -)")
     return errors
 
 

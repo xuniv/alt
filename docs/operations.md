@@ -402,6 +402,11 @@ tries a tag without a release again; to stop that, delete the tag in the private
 `privateBuild.minVersion` above it. Withdrawing does not help here: a version that `source.json` never
 listed gets no entry in `retracted.json`.
 
+If the gate rejects `home-path` hits inside a prebuilt third-party framework (for example
+`/Users/videolanci/` in MobileVLCKit), check that the paths name the vendor's build account and not
+yours (`python3 -m altsource scan IPA --allow-home-user NAME` shows the effect), then list the account
+in the app's `allowHomeUsers` ([app-json.md](app-json.md)).
+
 The build command runs under `env -i` (see [routes.md](routes.md#the-build-environment)). A script that
 reads runner variables (`RUNNER_TEMP`, `GITHUB_WORKSPACE`, `JAVA_HOME` and the like) finds them unset:
 use `ALT_OUT` or `TMPDIR` for scratch files and pass anything else through the `env` build setting.

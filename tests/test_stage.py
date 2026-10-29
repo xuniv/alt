@@ -600,6 +600,13 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(errors), 8)
         self.assertEqual(stagemod.validate_app_json([]), ["app.json must be a JSON object"])
 
+    def test_allow_home_users(self):
+        self.assertEqual(stagemod.validate_app_json({"allowHomeUsers": ["videolanci", "ci.build-1"]}), [])
+        for bad in ("videolanci", ["a/b"], [""], [7], ["n%d" % i for i in range(17)]):
+            self.assertEqual(stagemod.validate_app_json({"allowHomeUsers": bad}),
+                             ["allowHomeUsers must be a list of at most 16 account names (letters, digits, . _ -)"],
+                             bad)
+
     def test_private_build_min_version(self):
         for good in ("0.2.1", "1.0.0-rc.1", "10.20.30"):
             self.assertEqual(stagemod.validate_app_json({"privateBuild": {"enabled": True, "minVersion": good}}), [],

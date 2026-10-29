@@ -571,7 +571,8 @@ def _stage_environ(ctx: Ctx) -> Dict[str, str]:
 def publish_ipa(ctx: Ctx, ipa: str, *, semver: Optional[str], notes_file: Optional[str], defer: bool) -> int:
     """Local gate + draft upload through ``altsource stage --no-publish``, then dispatch stage.yml."""
     repo = ctx.settings.repo
-    argv = ["stage", ipa, "--no-publish", "--denylist-file", ctx.settings.denylist_file]
+    # --root: the gate reads the app's allowHomeUsers from this checkout
+    argv = ["stage", ipa, "--no-publish", "--denylist-file", ctx.settings.denylist_file, "--root", ctx.root]
     if semver:
         argv += ["--semver", semver]
     if notes_file:

@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 
 from . import retract as retractmod
 from .gh import GhError, write_outputs
+from .leaks import check_home_users
 from .stage import (
     ARCHIVE_ERRORS,
     BLOCKED_MARK,
@@ -187,10 +188,35 @@ def to_plain(obj: Any) -> Any:
     return dict(vars(obj))
 
 
-def _policy(ctx: Context, allow_home_paths: bool) -> Any:
+def _policy(ctx: Context, allow_home_paths: bool, home_users: Sequence[str] = ()) -> Any:
+    kwargs: Dict[str, Any] = {}
     if allow_home_paths:
-        return ctx.deps.GatePolicy(allow_home_paths=True)
-    return ctx.deps.GatePolicy()
+        kwargs["allow_home_paths"] = True
+    if home_users:
+        kwargs["home_users"] = tuple(home_users)
+    return ctx.deps.GatePolicy(**kwargs)
+
+
+def app_home_users(root: str, bid: Optional[str]) -> Tuple[str, ...]:
+    """``allowHomeUsers`` of ``apps/<bid>/app.json`` below ``root`` (none without the file)."""
+    if not bid or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", bid):
+        return ()
+    path = os.path.join(root, "apps", bid, "app.json")
+    if not os.path.isfile(path):
+        return ()
+    app = _read_json_limited(path, "app.json")
+    names = app.get("allowHomeUsers") if isinstance(app, dict) else None
+    if names is None:
+        return ()
+    try:
+        return check_home_users(names)
+    except ValueError:
+        raise CliError("allowHomeUsers in the app's app.json is not valid") from None
+
+
+def _app_policy(ctx: Context, args: Any, bid: Optional[str]) -> Any:
+    """--allow-home-paths, plus the app's ``allowHomeUsers`` from the checkout (``--root``)."""
+    return _policy(ctx, args.allow_home_paths, app_home_users(args.root, bid))
 
 
 def _stage_outputs(ctx: Context, result: Any) -> None:
@@ -257,7 +283,11 @@ def cmd_normalize(args, ctx: Context) -> int:
 def cmd_scan(args, ctx: Context) -> int:
     denylist = load_denylist(args.denylist_file, ctx.environ)
     try:
-        result = ctx.deps.scan_ipa(args.ipa, denylist=denylist, policy=_policy(ctx, args.allow_home_paths))
+        try:
+            users = check_home_users(args.allow_home_user or [])
+        except ValueError as exc:
+            raise CliError(str(exc)) from None
+        result = ctx.deps.scan_ipa(args.ipa, denylist=denylist, policy=_policy(ctx, args.allow_home_paths, users))
     except errors_of(ctx.deps, "IpaError") + ARCHIVE_ERRORS as exc:
         ctx.print("%s block 1" % rule_of(exc, "ipa-invalid"))
         return EXIT_REJECTED
@@ -279,7 +309,7 @@ def cmd_stage(args, ctx: Context) -> int:
         semver=args.semver,
         notes=notes,
         denylist=denylist,
-        policy=_policy(ctx, args.allow_home_paths),
+        policy=_app_policy(ctx, args, args.bid),
         publish=not args.no_publish,
         dry_run=args.dry_run,
         app_json=args.app_json,
@@ -387,7 +417,12 @@ def cmd_stage_draft(args, ctx: Context) -> int:
             worst = EXIT_ERROR
     for tag, label in drafts:
         try:
-            result = stage_existing_draft(tag, notes=notes, denylist=denylist, policy=policy,
+            try:
+                bid = ctx.deps.parse_tag(tag)[0]
+            except errors_of(ctx.deps, "TagError") + (ValueError, TypeError):
+                bid = None
+            draft_policy = _policy(ctx, args.allow_home_paths, app_home_users(args.root, bid)) if bid else policy
+            result = stage_existing_draft(tag, notes=notes, denylist=denylist, policy=draft_policy,
                                           publish=not args.no_publish, dry_run=args.dry_run,
                                           gh=ctx.gh, deps=ctx.deps)
         except Exception as exc:  # one bad draft must not stop the others
@@ -790,6 +825,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("scan", parents=[denylist], help="run the leak gate on an IPA")
     p.add_argument("ipa")
     p.add_argument("--allow-home-paths", action="store_true")
+    p.add_argument("--allow-home-user", action="append", metavar="NAME",
+                   help="build account of prebuilt third-party code whose /Users/<NAME>/ paths only warn")
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("stage", parents=[denylist, rooted], help="gate an IPA, then draft and publish it")
