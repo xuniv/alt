@@ -1,0 +1,7 @@
+{
+  "name": "Selftest",
+  "hidden": true,
+  "privateBuild": {
+    "enabled": true
+  }
+}
