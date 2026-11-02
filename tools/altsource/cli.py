@@ -19,7 +19,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 
 from . import retract as retractmod
 from .gh import GhError, write_outputs
-from .leaks import check_home_users
+from . import altjson, xcodes
+from .leaks import MAX_HOME_USERS, check_home_users
 from .stage import (
     ARCHIVE_ERRORS,
     BLOCKED_MARK,
@@ -68,7 +69,9 @@ RESERVED_ENV_PREFIXES = ("GITHUB_", "RUNNER_", "ACTIONS_", "ALT_", "GH_", "INPUT
                          "SSL_", "CURL_", "OPENSSL_", "SUDO_")
 # resolve-build outputs that may appear in job outputs and logs; command, env and ipa_glob come from
 # the private repository and are only written to --json-out
-PUBLIC_BUILD_OUTPUTS = ("runner", "xcode", "setup", "version", "tag")
+PUBLIC_BUILD_OUTPUTS = ("runner", "xcode", "setup", "version", "tag", "format", "home_users_count")
+# never an output: the names of gate.homeUsers go to --json-out, and build.yml encrypts them with the IPA
+COUNTED_OUTPUTS: Tuple[str, ...] = ()
 MASK_MIN_LENGTH = 3
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SEMVER_PATTERN = (r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -215,8 +218,17 @@ def app_home_users(root: str, bid: Optional[str]) -> Tuple[str, ...]:
 
 
 def _app_policy(ctx: Context, args: Any, bid: Optional[str]) -> Any:
-    """--allow-home-paths, plus the app's ``allowHomeUsers`` from the checkout (``--root``)."""
-    return _policy(ctx, args.allow_home_paths, app_home_users(args.root, bid))
+    """--allow-home-paths; the app's ``allowHomeUsers`` from the checkout (``--root``), plus any
+    --allow-home-user (``gate.homeUsers`` of a format 2 ``.alt.json``)."""
+    users = list(app_home_users(args.root, bid))
+    try:
+        extra = check_home_users(getattr(args, "allow_home_user", None) or [])
+    except ValueError as exc:
+        raise CliError(str(exc)) from None
+    users += [u for u in extra if u.lower() not in {x.lower() for x in users}]
+    if len(users) > MAX_HOME_USERS:
+        raise CliError("too many home users")
+    return _policy(ctx, args.allow_home_paths, users)
 
 
 def _stage_outputs(ctx: Context, result: Any) -> None:
@@ -664,6 +676,25 @@ def _validate_glob(pattern: Any) -> str:
     return pattern
 
 
+def provisional_version(ref: str, app_pattern: Optional[str] = None) -> Optional[str]:
+    """The version that build.yml takes from ``ref`` before it can read the tag's ``.alt.json``.
+
+    app.json ``privateBuild.tagPattern`` (format 1) applies strictly. Without it the default pattern
+    (``v<semver>``) applies, else the semver at the end of the ref: a format 2 ``scope.tagPattern``
+    lives in the private repository, and resolve-build checks the ref against it.
+    """
+    try:
+        if app_pattern:
+            match = re.fullmatch(app_pattern, ref)
+        else:
+            match = re.fullmatch(DEFAULT_TAG_PATTERN, ref) or \
+                re.search(r"(?:^|(?<=[^0-9A-Za-z.]))v?(?P<version>" + SEMVER_PATTERN + r")$", ref)
+    except (re.error, TypeError):
+        return None
+    version = match.group("version") if match and "version" in match.re.groupindex else None
+    return version if version and re.fullmatch(SEMVER_PATTERN, version) else None
+
+
 def resolve_build(bid: str, ref: str, checkout: str, *, root: str, config_json: Optional[str],
                   deps: Any, reveal_names: bool = False) -> Dict[str, Any]:
     """Merge ``.alt.json`` (checkout) with the registered build config and validate the result.
@@ -681,14 +712,41 @@ def resolve_build(bid: str, ref: str, checkout: str, *, root: str, config_json: 
     private = app.get("privateBuild") if isinstance(app, dict) else None
     if not isinstance(private, dict) or private.get("enabled") is not True:
         raise CliError("app.json does not enable privateBuild")
-    pattern = private.get("tagPattern") or DEFAULT_TAG_PATTERN
+
+    file_path = os.path.join(checkout, ".alt.json")
     try:
-        match = re.fullmatch(pattern, ref)
-    except re.error:
-        raise CliError("privateBuild.tagPattern is not a valid regex") from None
-    if not match or "version" not in match.re.groupindex:
-        raise CliError("ref does not match privateBuild.tagPattern")
-    version = match.group("version")
+        in_repo = altjson.load(file_path, reveal_names) if os.path.exists(file_path) else None
+    except altjson.AltJsonError as exc:
+        raise CliError(str(exc)) from None
+    v2 = in_repo is not None and in_repo.format == altjson.FORMAT_2
+
+    if v2:
+        # the tag's own scope.tagPattern if it has one, else the rule build.yml applies before it can read
+        # the file (app.json's pattern, the default, then the semver at the end of the ref); the two must
+        # agree, so that every job of the build takes the same version from the ref
+        app_pattern = private.get("tagPattern") or None
+        own = in_repo.scope.tag_pattern if in_repo.scope and in_repo.scope.tag_pattern else None
+        if own:
+            try:
+                match = re.fullmatch(own, ref)
+            except re.error:
+                raise CliError("scope.tagPattern is not a valid regex") from None
+            version = match.group("version") if match and "version" in match.re.groupindex else None
+            if not match:
+                raise CliError("ref does not match scope.tagPattern of the tag's .alt.json")
+        else:
+            version = provisional_version(ref, app_pattern)
+        if not version or provisional_version(ref, app_pattern) != version:
+            raise CliError("the version group of the tag pattern must be the semver at the end of the ref")
+    else:
+        pattern = private.get("tagPattern") or DEFAULT_TAG_PATTERN
+        try:
+            match = re.fullmatch(pattern, ref)
+        except re.error:
+            raise CliError("privateBuild.tagPattern is not a valid regex") from None
+        if not match or "version" not in match.re.groupindex:
+            raise CliError("ref does not match privateBuild.tagPattern")
+        version = match.group("version")
     if not re.fullmatch(SEMVER_PATTERN, version or ""):
         raise CliError("version taken from ref is not semver")
     try:
@@ -705,18 +763,25 @@ def resolve_build(bid: str, ref: str, checkout: str, *, root: str, config_json: 
     if not isinstance(config, dict) or not isinstance(config.get("repo"), str) \
             or not REPO_RE.match(config["repo"]):
         raise CliError("ALT_APP_CONFIG must contain repo as owner/name")
-    unknown = sorted(str(k) for k in config if k not in ("repo", "build"))
+    unknown = sorted(str(k) for k in config if k not in ("repo", "build", "policyRef"))
     if unknown:
         raise CliError("ALT_APP_CONFIG has %d unknown key(s)%s" % (len(unknown), _names(unknown, reveal_names)))
+    if "policyRef" in config:
+        try:
+            altjson.check_policy_ref(config["policyRef"])
+        except altjson.AltJsonError as exc:
+            raise CliError("ALT_APP_CONFIG: %s" % exc) from None
     registered = _build_section(config.get("build"), "ALT_APP_CONFIG build", reveal_names)
 
-    file_path = os.path.join(checkout, ".alt.json")
-    in_repo = _build_section(_read_json_limited(file_path, ".alt.json"), ".alt.json", reveal_names) \
-        if os.path.exists(file_path) else {}
+    if v2:
+        # the repository's file is complete: the registered build section is a format 1 fallback only
+        layers: Tuple[Dict[str, Any], ...] = (in_repo.build,)
+    else:
+        layers = (in_repo.build if in_repo is not None else {}, registered)  # the registered config wins
 
     merged: Dict[str, Any] = {"runner": DEFAULT_RUNNER, "xcode": "", "setup": [], "ipa_glob": DEFAULT_IPA_GLOB}
     env: Dict[str, Any] = {}
-    for layer in (in_repo, registered):  # the registered config wins
+    for layer in layers:
         for key, value in layer.items():
             if key == "env":
                 if not isinstance(value, dict):
@@ -731,6 +796,8 @@ def resolve_build(bid: str, ref: str, checkout: str, *, root: str, config_json: 
     xcode = merged["xcode"]
     if not isinstance(xcode, str) or (xcode and not XCODE_RE.match(xcode)):
         raise CliError("xcode must look like 27 or 27.0 or 27.0.1")
+    if v2 and xcode and not altjson.XCODE_MINOR_RE.match(xcode):
+        raise CliError("build.xcode must be major.minor, such as 27.2")
     setup = merged["setup"]
     if isinstance(setup, str):
         setup = setup.split()
@@ -748,6 +815,10 @@ def resolve_build(bid: str, ref: str, checkout: str, *, root: str, config_json: 
         "env": json.dumps(_validate_env(env, reveal_names), sort_keys=True, separators=(",", ":")),
         "version": version,
         "tag": tag,
+        "format": str(in_repo.format if in_repo is not None else 1),
+        "home_users": json.dumps(list(in_repo.home_users if v2 else ()), separators=(",", ":")),
+        "home_users_count": str(len(in_repo.home_users) if v2 else 0),
+        "registered_build_ignored": "true" if v2 and registered else "false",
         "repo": config["repo"],
     }
 
@@ -794,8 +865,25 @@ def cmd_resolve_build(args, ctx: Context) -> int:
             json.dump(private, fh, indent=2, sort_keys=True)
             fh.write("\n")
     for key in PUBLIC_BUILD_OUTPUTS:
-        ctx.print("%s=%s" % (key, resolved[key]))
+        if key not in COUNTED_OUTPUTS:
+            ctx.print("%s=%s" % (key, resolved[key]))
     ctx.print("env=%d variable(s)" % len(json.loads(resolved["env"])))
+    if resolved["registered_build_ignored"] == "true":
+        ctx.eprint("warning: .alt.json format 2 defines the build; the registered build section is ignored")
+    return EXIT_OK
+
+
+def cmd_xcode_resolve(args, ctx: Context) -> int:
+    """Outputs ``path`` (the app bundle), ``developer_dir``, ``version``, ``build`` and ``kind``."""
+    try:
+        app = xcodes.choose(xcodes.installed(args.applications), args.want)
+    except xcodes.XcodeError as exc:
+        raise CliError(str(exc)) from None
+    values = {"path": app.path, "developer_dir": os.path.join(app.path, "Contents", "Developer"),
+              "version": app.version, "build": app.build, "kind": app.kind}
+    ctx.outputs(values)
+    for key in ("path", "version", "build", "kind"):
+        ctx.print("%s=%s" % (key, values[key]))
     return EXIT_OK
 
 
@@ -838,6 +926,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-publish", action="store_true", help="leave the release as a draft")
     p.add_argument("--dry-run", action="store_true", help="run the gate only; no GitHub calls")
     p.add_argument("--allow-home-paths", action="store_true")
+    p.add_argument("--allow-home-user", action="append", metavar="NAME",
+                   help="build account of prebuilt third-party code (.alt.json gate.homeUsers); attached "
+                        "to the release")
     p.set_defaults(func=cmd_stage)
 
     p = sub.add_parser("stage-draft", parents=[denylist, rooted], help="gate and publish existing drafts")
@@ -894,8 +985,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ref", required=True)
     p.add_argument("--checkout", required=True, metavar="DIR")
     p.add_argument("--json-out", metavar="F", help="write the full configuration (command, env, ipa_glob) "
-                   "as JSON; outputs only carry runner, xcode, setup, version and tag")
+                   "as JSON; outputs only carry runner, xcode, setup, version, tag and the format 2 facts")
     p.set_defaults(func=cmd_resolve_build)
+
+    p = sub.add_parser("xcode-resolve", help="pick the Xcode for major.minor: the newest release, else its "
+                       "release candidate")
+    p.add_argument("--want", required=True, metavar="MAJOR.MINOR")
+    p.add_argument("--applications", default="/Applications", metavar="DIR")
+    p.set_defaults(func=cmd_xcode_resolve)
     return parser
 
 

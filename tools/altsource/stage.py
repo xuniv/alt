@@ -42,6 +42,7 @@ NOTES_PATH = "<release-notes>"
 TAG_PATH = "<release-tag>"
 TITLE_PATH = "<release-title>"
 TARGET_PATH = "<release-target>"
+HOME_USERS_PATH = "<gate-exceptions>"  # the account names of GatePolicy.home_users
 ASSET_NAME_PATH = "<asset-name>"
 ASSET_VERIFY_ATTEMPTS = 5
 # path rules that the home-path opt-in (app.json ``allowHomePaths``) turns into warnings for text
@@ -490,6 +491,9 @@ def _gate(ipa_path: str, tmp: str, *, expected_bid: Optional[str], semver: Optio
         findings += text_findings(deps, target, denylist, TARGET_PATH)
         findings += text_findings(deps, notes, denylist, NOTES_PATH)
         findings += info_findings(deps, info2, bid, denylist, relaxed=relaxed)
+        # an exception never covers a private word: the names themselves pass the denylist
+        home_users = tuple(getattr(policy, "home_users", ()) or ())
+        findings += text_findings(deps, "\n".join(home_users), denylist, HOME_USERS_PATH)
     except gate_errors as exc:
         raise StageError("gate unavailable (%s)" % rule_of(exc, "gate-error")) from None
     except ipa_errors as exc:  # the scanner reads every entry; inspection does not
@@ -516,6 +520,14 @@ def _gate(ipa_path: str, tmp: str, *, expected_bid: Optional[str], semver: Optio
         seed = dict(seed or {})
         seed["allowHomePaths"] = True
         seed_raw = (json.dumps(seed, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    if home_users and any(f["rule"] == "home-path" for f in findings):
+        # the same for named build accounts (.alt.json gate.homeUsers): sync reads them from the release
+        listed = list((seed or {}).get("allowHomeUsers") or [])
+        merged = list(merge_home_users(listed, home_users))
+        if merged != listed:
+            seed = dict(seed or {})
+            seed["allowHomeUsers"] = merged
+            seed_raw = (json.dumps(seed, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     extra: List[Tuple[str, str, str]] = []
     if seed_raw is not None:
         seed_path = os.path.join(tmp, "app.json")
@@ -784,6 +796,8 @@ def stage_existing_draft(
         if len(seeds) == 1 and int(seeds[0].get("size") or 0) <= APP_JSON_MAX_BYTES:
             app_json = os.path.join(tmp, "app.json")
             gh.download_asset(int(seeds[0]["id"]), app_json)
+            # the release's own gate exceptions (stage attached them from .alt.json gate.homeUsers)
+            policy = _with_seed_home_users(policy, app_json, deps)
         try:
             return stage(source, expected_bid=bid, semver=str(semver), notes=body, denylist=denylist,
                          policy=policy, publish=publish, dry_run=dry_run, target=target, app_json=app_json,
@@ -792,6 +806,37 @@ def stage_existing_draft(
             if rel.get("draft") and not dry_run:
                 mark_blocked(gh, rel, tag)
             raise
+
+
+def merge_home_users(*lists: Sequence[str]) -> Tuple[str, ...]:
+    """Names of several lists once (case-insensitively, first spelling kept); StageError above the limit."""
+    from .leaks import MAX_HOME_USERS
+
+    out: List[str] = []
+    for names in lists:
+        for name in names or ():
+            if isinstance(name, str) and name.lower() not in {n.lower() for n in out}:
+                out.append(name)
+    if len(out) > MAX_HOME_USERS:
+        raise StageError("more than %d home users" % MAX_HOME_USERS)
+    return tuple(out)
+
+
+def _with_seed_home_users(policy: Any, app_json: str, deps: Any) -> Any:
+    try:
+        with open(app_json, "rb") as fh:
+            obj = json.loads(fh.read(APP_JSON_MAX_BYTES + 1).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return policy  # the gate rejects a seed it cannot read
+    listed = obj.get("allowHomeUsers") if isinstance(obj, dict) else None
+    if not isinstance(listed, list) or not listed:
+        return policy
+    policy = policy if policy is not None else deps.GatePolicy()
+    merged = merge_home_users(tuple(getattr(policy, "home_users", ()) or ()), listed)
+    try:
+        return dataclasses.replace(policy, home_users=merged)
+    except TypeError:
+        return deps.GatePolicy(allow_home_paths=bool(getattr(policy, "allow_home_paths", False)), home_users=merged)
 
 
 def mark_blocked(gh: Any, rel: Dict[str, Any], tag: str) -> None:

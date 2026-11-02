@@ -1069,6 +1069,29 @@ class SyncTests(SyncCase):
         self.assertEqual(result.blocked, [])
         self.assertEqual(result.versions, 1)
 
+    def test_allow_home_users_travel_with_the_release(self):
+        # .alt.json format 2: stage attaches gate.homeUsers to the release; app.json in alt does not list them
+        self.git.seed({"apps/io.example.demo/app.json": b'{"name": "Curated"}\n'})
+        rel, _ = self.publish("io.example.demo-v1.2.3", ipa_bytes(payload="/Users/thirdpartyci/build"))
+        self.gh.add_asset(rel, "app.json", b'{"allowHomeUsers": ["thirdpartyci"]}')
+        result = self.run_sync()
+        self.assertEqual(result.blocked, [])
+        self.assertEqual(result.versions, 1)
+        other, _ = self.publish("io.example.demo-v1.2.4", ipa_bytes(short_version="1.2.4", payload="/Users/thirdpartyci/build"))
+        result = self.run_sync()  # a release without the exception is not covered by another's
+        self.assertTrue(any("v1.2.4: blocked (home-path); unpublished" in e for e in result.errors), result.errors)
+
+    def test_too_many_home_users_keep_that_release_only(self):
+        names = ["a%d" % i for i in range(10)]
+        self.git.seed({"apps/io.example.demo/app.json": json.dumps({"allowHomeUsers": names}).encode()})
+        rel, _ = self.publish("io.example.demo-v1.2.3", ipa_bytes(payload="/Users/a0/build"))
+        self.gh.add_asset(rel, "app.json", json.dumps({"allowHomeUsers": ["b%d" % i for i in range(10)]}).encode())
+        self.publish("io.example.demo-v1.2.4", ipa_bytes(short_version="1.2.4"))
+        result = self.run_sync()
+        self.assertTrue(any("v1.2.3: more than 16 home users" in e for e in result.errors), result.errors)
+        self.assertEqual(result.versions, 1)  # the other release still syncs
+        self.assertNotIn(("unpublish", rel["id"]), [c[:2] for c in self.gh.calls])
+
     def test_allow_home_users_covers_only_the_named_accounts(self):
         self.git.seed({"apps/io.example.demo/app.json": b'{"allowHomeUsers": ["thirdpartyci"]}\n'})
         self.publish("io.example.demo-v1.2.3", ipa_bytes(payload="/Users/thirdpartyci/a /Users/leakyuser3/b"))

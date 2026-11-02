@@ -190,16 +190,15 @@ jobs:
           export LC_ALL=C
           python3 - "$RUNNER_TEMP/alt-version" <<'PY'
           import json, os, re, sys
-          from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
+          from altsource.cli import provisional_version
           bid, ref = os.environ["APP"], os.environ["REF"]
           try:
               with open(os.path.join("apps", bid, "app.json"), encoding="utf-8") as fh:
                   private = json.load(fh).get("privateBuild") or {}
-              match = re.fullmatch(private.get("tagPattern") or DEFAULT_TAG_PATTERN, ref)
-              version = match.group("version") if match and "version" in match.re.groupindex else None
-          except (OSError, ValueError, AttributeError, TypeError, re.error):
+              version = provisional_version(ref, private.get("tagPattern"))
+          except (OSError, ValueError, AttributeError, TypeError):
               version = None
-          if not version or not re.fullmatch(SEMVER_PATTERN, version):
+          if not version:
               print("::error::ref does not match privateBuild.tagPattern or yields no semver")
               sys.exit(1)
           with open(sys.argv[1], "w", encoding="utf-8") as fh:
@@ -387,6 +386,10 @@ jobs:
     environment:
       name: alt-${{ needs.app.outputs.alias }}
       deployment: false
+    outputs:
+      # .alt.json format 2: how many build accounts of prebuilt third-party code (gate.homeUsers) the
+      # tag names. The names travel in the encrypted payload: a step's env block is printed in the log.
+      home_users_count: ${{ steps.config.outputs.home_users_count }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -513,9 +516,30 @@ jobs:
       - name: Select Xcode
         env:
           XCODE: ${{ steps.config.outputs.xcode }}
+          FORMAT: ${{ steps.config.outputs.format }}
+          PYTHONPATH: ${{ github.workspace }}/tools
         run: |
           export LC_ALL=C
-          if [ -n "$XCODE" ]; then
+          if [ "$FORMAT" = "2" ] && [ -n "$XCODE" ]; then
+            # format 2: major.minor, the newest release of that minor (else its release candidate); the
+            # build command gets it as DEVELOPER_DIR, so a script that defaults DEVELOPER_DIR to
+            # /Applications/Xcode.app (the runner's default Xcode) builds with it too
+            if [[ ! "$XCODE" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::build.xcode must be major.minor"
+              exit 1
+            fi
+            GITHUB_OUTPUT="$RUNNER_TEMP/xcode.out" python3 -m altsource xcode-resolve --want "$XCODE" >/dev/null
+            developer_dir=$(sed -n 's/^developer_dir=//p' "$RUNNER_TEMP/xcode.out")
+            build=$(sed -n 's/^build=//p' "$RUNNER_TEMP/xcode.out")
+            kind=$(sed -n 's/^kind=//p' "$RUNNER_TEMP/xcode.out")
+            if [ ! -d "$developer_dir" ]; then
+              echo "::error::Xcode $XCODE could not be resolved"
+              exit 1
+            fi
+            sudo xcode-select --switch "$developer_dir"
+            echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+            echo "resolved: Xcode $XCODE -> build $build ($kind)"
+          elif [ -n "$XCODE" ]; then
             if [[ ! "$XCODE" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
               echo "::error::xcode must look like 27, 27.0 or 27.0.1"
               exit 1
@@ -697,21 +721,34 @@ jobs:
           payload="$RUNNER_TEMP/payload"
           rm -rf "$payload"
           mkdir -p "$payload"
+          # the gate exceptions of a format 2 .alt.json (an empty list otherwise) go with the IPA
+          python3 - "$work/config.json" "$work/home-users.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              users = json.loads(json.load(fh).get("home_users") or "[]")
+          with open(sys.argv[2], "w", encoding="utf-8") as fh:
+              json.dump(users, fh)
+          PY
           age -r "$RECIPIENT" -o "$payload/payload.ipa.age" "$work/payload.ipa"
-          rm -f "$work/payload.ipa"
+          age -r "$RECIPIENT" -o "$payload/home-users.json.age" "$work/home-users.json"
+          rm -f "$work/payload.ipa" "$work/home-users.json"
           # an artifact of a public repository is readable by any signed-in user: never upload plaintext
-          if [ "$(head -n 1 "$payload/payload.ipa.age")" != "age-encryption.org/v1" ]; then
-            echo "::error::the payload is not age-encrypted"
-            rm -f "$payload/payload.ipa.age"
-            exit 1
-          fi
+          for file in payload.ipa.age home-users.json.age; do
+            if [ "$(head -n 1 "$payload/$file")" != "age-encryption.org/v1" ]; then
+              echo "::error::the payload is not age-encrypted"
+              rm -f "$payload/payload.ipa.age" "$payload/home-users.json.age"
+              exit 1
+            fi
+          done
           echo "payload encrypted"
 
       - name: Upload the payload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: payload
-          path: ${{ runner.temp }}/payload/payload.ipa.age
+          path: |
+            ${{ runner.temp }}/payload/payload.ipa.age
+            ${{ runner.temp }}/payload/home-users.json.age
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
@@ -781,17 +818,16 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os, re, sys
-          from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
+          from altsource.cli import provisional_version
           from altsource.stage import Toolkit
           bid, ref = os.environ["APP"], os.environ["REF"]
           try:
               with open(os.path.join("apps", bid, "app.json"), encoding="utf-8") as fh:
                   private = json.load(fh).get("privateBuild") or {}
-              match = re.fullmatch(private.get("tagPattern") or DEFAULT_TAG_PATTERN, ref)
-              version = match.group("version") if match and "version" in match.re.groupindex else None
-          except (OSError, ValueError, AttributeError, TypeError, re.error):
+              version = provisional_version(ref, private.get("tagPattern"))
+          except (OSError, ValueError, AttributeError, TypeError):
               version = None
-          if not version or not re.fullmatch(SEMVER_PATTERN, version):
+          if not version:
               print("::error::the ref does not yield a version")
               sys.exit(1)
           tag = Toolkit().make_tag(bid, version)
@@ -811,11 +847,16 @@ jobs:
         run: |
           export LC_ALL=C
           payload="$RUNNER_TEMP/payload"
-          if [ "$(find "$payload" -mindepth 1 | wc -l)" -ne 1 ] || [ ! -f "$payload/payload.ipa.age" ] \
-              || [ -L "$payload/payload.ipa.age" ]; then
-            echo "::error::the payload artifact must hold exactly one encrypted IPA"
+          if [ "$(find "$payload" -mindepth 1 | wc -l)" -ne 2 ]; then
+            echo "::error::the payload artifact must hold exactly the encrypted IPA and gate exceptions"
             exit 1
           fi
+          for file in payload.ipa.age home-users.json.age; do
+            if [ ! -f "$payload/$file" ] || [ -L "$payload/$file" ]; then
+              echo "::error::the payload artifact must hold exactly the encrypted IPA and gate exceptions"
+              exit 1
+            fi
+          done
           if [ -z "$IDENTITY" ]; then
             echo "::error::secret ALT_PAYLOAD_IDENTITY is missing"
             exit 1
@@ -832,7 +873,8 @@ jobs:
           (umask 077 && mkdir "$keys" && printf '%s\n' "$IDENTITY" > "$keys/identity")
           mkdir -p "$RUNNER_TEMP/alt-ipa"
           if ! age -d -i "$keys/identity" -o "$RUNNER_TEMP/alt-ipa/payload.ipa" "$payload/payload.ipa.age" \
-              2>/dev/null; then
+              2>/dev/null || ! age -d -i "$keys/identity" -o "$RUNNER_TEMP/alt-ipa/home-users.json" \
+              "$payload/home-users.json.age" 2>/dev/null; then
             echo "::error::the payload could not be decrypted with ALT_PAYLOAD_IDENTITY"
             exit 1
           fi
@@ -907,7 +949,28 @@ jobs:
           PUBLISH: ${{ inputs.publish }}
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
+          HOME_USERS_COUNT: ${{ needs.build.outputs.home_users_count }}
         run: |
+          # gate.homeUsers of a format 2 .alt.json, decrypted from the payload; stage checks the names
+          # against the denylist and attaches them to the release (app.json asset), so that sync applies
+          # the same exception. The log shows their number only.
+          python3 - "$RUNNER_TEMP/alt-ipa/home-users.json" "$RUNNER_TEMP/home-users.args" <<'PY'
+          import json, os, sys
+          from altsource.leaks import check_home_users
+          count = os.environ.get("HOME_USERS_COUNT") or "0"
+          try:
+              with open(sys.argv[1], encoding="utf-8") as fh:
+                  users = check_home_users(json.load(fh))
+          except (OSError, ValueError):
+              users = None
+          if users is None or not count.isdigit() or int(count) != len(users):
+              print("::error::the gate exceptions of the build did not arrive intact")
+              sys.exit(1)
+          with open(sys.argv[2], "w", encoding="utf-8") as fh:
+              for user in users:
+                  fh.write("--allow-home-user\0%s\0" % user)
+          print("gate exceptions: %d home user(s)" % len(users))
+          PY
           python3 - "$RUNNER_TEMP/notes.txt" <<'PY'
           import json, os, sys
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
@@ -920,6 +983,9 @@ jobs:
           PY
           args=(stage "$RUNNER_TEMP/alt-ipa/payload.ipa" --bid "$APP" --semver "$VERSION"
                 --notes-file "$RUNNER_TEMP/notes.txt")
+          while IFS= read -r -d '' item; do
+            args+=("$item")
+          done < "$RUNNER_TEMP/home-users.args"
           if [ "$PUBLISH" != "true" ]; then
             args+=(--dry-run)  # publish=false: the gate only, no GitHub calls
           fi

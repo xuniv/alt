@@ -50,6 +50,7 @@ TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from altsource import altjson  # noqa: E402
 from altsource import cli as altcli  # noqa: E402
 from altsource.gh import GitHub  # noqa: E402
 from altsource.stage import (  # noqa: E402
@@ -466,22 +467,13 @@ def describe_retraction(entry: Mapping[str, Any]) -> str:
 def ref_version(ctx: Ctx, bid: str, ref: str) -> Optional[str]:
     """The version that build.yml takes from ``ref``: the ``version`` group of privateBuild.tagPattern
     (default ``v<semver>``) in this checkout's app.json, or None when the ref yields none."""
-    pattern = altcli.DEFAULT_TAG_PATTERN
     try:
         app = load_json_file(app_json_path(ctx, bid), "app.json")
     except OpError:
         app = None
     pb = app.get("privateBuild") if isinstance(app, dict) else None
-    if isinstance(pb, dict) and isinstance(pb.get("tagPattern"), str) and pb["tagPattern"]:
-        pattern = pb["tagPattern"]
-    try:
-        match = re.fullmatch(pattern, ref)
-    except re.error:
-        return None
-    if not match or "version" not in match.re.groupindex:
-        return None
-    version = match.group("version")
-    return version if version and re.fullmatch(altcli.SEMVER_PATTERN, version) else None
+    pattern = pb.get("tagPattern") if isinstance(pb, dict) and isinstance(pb.get("tagPattern"), str) else None
+    return altcli.provisional_version(ref, pattern or None)
 
 
 def check_build_withdrawn(ctx: Ctx, bid: str, ref: str, force: bool) -> None:
@@ -1296,6 +1288,21 @@ def _planned_app_json(ctx: Ctx, bid: str, tag_pattern: Optional[str],
     return new, new != app or not os.path.exists(path)
 
 
+def repository_scope(ctx: Ctx, repo: str, ref: Optional[str]) -> Optional["altjson.Scope"]:
+    """The ``scope`` of a format 2 ``.alt.json`` on the policy branch of ``repo``, or None."""
+    path = "repos/%s/contents/.alt.json" % repo + ("?ref=%s" % urllib.parse.quote(ref, safe="") if ref else "")
+    proc = ctx.gh(["api", path], check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads((proc.stdout or b"").decode("utf-8", "replace") or "null")
+        raw = base64.b64decode(data["content"]) if isinstance(data, dict) and data.get("encoding") == "base64" else None
+        parsed = altjson.loads(raw) if raw is not None else None
+    except (ValueError, KeyError, TypeError, altjson.AltJsonError):
+        return None
+    return parsed.scope if parsed is not None and parsed.format == altjson.FORMAT_2 else None
+
+
 def newest_tag_version(ctx: Ctx, repo: str, pattern: str) -> Optional[str]:
     """The highest version among the tags of ``repo`` that match ``pattern`` (None without any)."""
     best: Optional[Tuple[Any, str]] = None
@@ -1333,6 +1340,11 @@ def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
     if args.min_version is not None and not is_semver(args.min_version):
         raise OpError("--min-version must be a semantic version such as 1.2.3")
     config: Dict[str, Any] = {"repo": repo}
+    if args.policy_ref:
+        try:
+            config["policyRef"] = altjson.check_policy_ref(args.policy_ref)
+        except altjson.AltJsonError as exc:
+            raise OpError("--policy-ref: %s" % exc) from None
     if args.build_json:
         build = validate_build_config(load_json_file(args.build_json, "build config", altcli.BUILD_CONFIG_MAX_BYTES))
         if build:
@@ -1344,7 +1356,11 @@ def cmd_register(args: argparse.Namespace, ctx: Ctx) -> int:
     denylist = preflight(ctx)
     floor_note = ""
     derived = False
-    if "minVersion" not in app["privateBuild"]:
+    scope = repository_scope(ctx, repo, config.get("policyRef")) if "minVersion" not in app["privateBuild"] else None
+    if scope is not None and scope.min_version:
+        # .alt.json format 2 on the policy branch holds the floor; alt's app.json stays the switch only
+        ctx.print("%s keeps its scope in .alt.json format 2; app.json gets no minVersion" % repo)
+    elif "minVersion" not in app["privateBuild"]:
         # without a floor, the scheduled poll.yml would build every older tag of the repository
         newest = newest_tag_version(ctx, repo, app["privateBuild"].get("tagPattern") or altcli.DEFAULT_TAG_PATTERN)
         if newest:
@@ -2003,7 +2019,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tag-pattern", metavar="RE", help="regex with a named group 'version' (stored in app.json)")
     p.add_argument("--min-version", metavar="VERSION",
                    help="lowest version poll.yml builds (stored in app.json; default: the newest existing tag)")
-    p.add_argument("--build-json", metavar="F", help="build configuration stored with the registration")
+    p.add_argument("--build-json", metavar="F", help="build configuration stored with the registration (for "
+                   "tags without a format 2 .alt.json)")
+    p.add_argument("--policy-ref", metavar="BRANCH", help="branch whose .alt.json holds the scope (default: the "
+                   "repository's default branch)")
     p.add_argument("--rotate", action="store_true", help="replace an existing alt-build deploy key")
     p.set_defaults(func=cmd_register)
 

@@ -153,7 +153,8 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
 
    ```sh
    bin/alt register owner/private-repo --bid io.example.demo \
-     [--tag-pattern '^release-(?P<version>\d+\.\d+\.\d+)$'] [--min-version 1.4.0] [--build-json build.json]
+     [--tag-pattern '^release-(?P<version>\d+\.\d+\.\d+)$'] [--min-version 1.4.0] [--build-json build.json] \
+     [--policy-ref dev]
    ```
 
    This:
@@ -163,7 +164,10 @@ must be able to build an unsigned IPA from a tag on a GitHub-hosted macOS runner
    - creates an ed25519 key pair in a temporary directory;
    - adds the public key to the private repository as a **read-only** deploy key titled `alt-build`;
    - stores the private key as the environment secret `ALT_KEY`;
-   - stores `{"repo": "owner/private-repo", "build": {...}}` as the environment secret `ALT_APP`;
+   - stores `{"repo": "owner/private-repo", "build": {...}}` as the environment secret `ALT_APP`
+     (with `--policy-ref`, also the branch whose `.alt.json` holds the scope). With a format 2
+     `.alt.json` ([routes.md](routes.md#altjson-format-2)) in the private repository, leave out
+     `--build-json`, `--tag-pattern` and `--min-version`: the repository's file holds them;
    - shreds the temporary key;
    - deletes the repository secrets `ALT_KEY_IO_EXAMPLE_DEMO` and `ALT_APP_IO_EXAMPLE_DEMO` of an
      earlier version, if they exist;

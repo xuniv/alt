@@ -205,8 +205,15 @@ jobs:
               print("::error::secret ALT_APP of environment alt-<ALIAS> is missing or has no repo")
               sys.exit(1)
           print("::add-mask::" + repo)
+          ref = config.get("policyRef") or ""
+          if ref and (not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", ref)
+                      or ".." in ref or "//" in ref or ref.endswith(("/", ".", ".lock"))):
+              print("::error::secret ALT_APP has an invalid policyRef")
+              sys.exit(1)
           with open(sys.argv[1], "w", encoding="utf-8") as fh:
               fh.write(repo)
+          with open(sys.argv[1] + ".ref", "w", encoding="utf-8") as fh:
+              fh.write(ref)
           PY
           if [ -z "$ALT_DEPLOY_KEY" ]; then
             echo "::error::secret ALT_KEY of environment alt-<ALIAS> is missing"
@@ -223,12 +230,39 @@ jobs:
             echo "::error::the tags of the private repository could not be listed"
             exit 1
           fi
-          rm -rf "$ssh_dir"
+          # the repository's policy: .alt.json on policyRef (default: its default branch). A partial
+          # clone without blobs fetches the one file it reads, not the tree's contents.
+          policy="$RUNNER_TEMP/alt-policy"
+          rm -rf "$policy" "$RUNNER_TEMP/policy.json"
+          ref=$(cat "$RUNNER_TEMP/alt-repo.ref")
+          branch=()
+          if [ -n "$ref" ]; then
+            branch=(--branch "$ref")
+          fi
+          if ! git clone --quiet --depth=1 --filter=blob:none --no-checkout --single-branch "${branch[@]}" \
+              "git@github.com:$repo.git" "$policy" >/dev/null 2>&1; then
+            echo "::error::the policy branch of the private repository could not be fetched"
+            exit 1
+          fi
+          # whether the file exists comes from the tree, which the clone holds; its content is fetched now,
+          # and a failed fetch must not pass for a missing file (that would drop the repository's scope)
+          if ! present=$(git -C "$policy" ls-tree --name-only HEAD -- .alt.json 2>/dev/null); then
+            echo "::error::the policy branch of the private repository could not be read"
+            exit 1
+          fi
+          if [ -n "$present" ]; then
+            if ! git -C "$policy" cat-file blob "HEAD:.alt.json" > "$RUNNER_TEMP/policy.json" 2>/dev/null; then
+              echo "::error::.alt.json on the policy branch could not be fetched"
+              exit 1
+            fi
+          fi
+          rm -rf "$ssh_dir" "$policy"
           python3 - "$RUNNER_TEMP/tags.txt" <<'PY'
           import datetime, json, os, re, sys, time
-          from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN
+          from altsource.cli import DEFAULT_TAG_PATTERN, SEMVER_PATTERN, provisional_version
           from altsource.gh import GhError, GitHub
           from altsource.leaks import GateError, load_denylist, scan_text
+          from altsource import altjson
           from altsource.retract import RetractError, load as load_withdrawn
           from altsource.stage import Toolkit, parse_semver
 
@@ -253,20 +287,35 @@ jobs:
               return bool(scan_text("build %s %s" % (bid, name), denylist))
 
 
+          # the scope: .alt.json format 2 on the policy branch; without it, app.json privateBuild (format 1)
+          scope = None
+          policy_path = os.path.join(os.environ["RUNNER_TEMP"], "policy.json")
+          if os.path.exists(policy_path):
+              try:
+                  parsed = altjson.load(policy_path)
+              except altjson.AltJsonError as exc:
+                  print("::error::the policy .alt.json is not usable: %s" % exc)
+                  sys.exit(1)
+              if parsed.format == altjson.FORMAT_2 and parsed.scope is not None:
+                  scope = parsed.scope
           try:
               with open(os.path.join("apps", bid, "app.json"), encoding="utf-8") as fh:
                   private = json.load(fh).get("privateBuild") or {}
-              pattern = re.compile(private.get("tagPattern") or DEFAULT_TAG_PATTERN)
+              legacy = private.get("tagPattern") or DEFAULT_TAG_PATTERN
+              pattern = re.compile((scope.tag_pattern if scope and scope.tag_pattern else None) or legacy)
           except (OSError, ValueError, AttributeError, TypeError, re.error):
               private, pattern = {}, None
           if pattern is None or "version" not in pattern.groupindex:
-              print("::error::privateBuild.tagPattern is not usable")
+              print("::error::the tag pattern is not usable")
               sys.exit(1)
           try:
-              floor = parse_semver(deps, private["minVersion"]) if "minVersion" in private else None
+              floors = [parse_semver(deps, v) for v in (private.get("minVersion"), scope and scope.min_version) if v]
           except (TypeError, ValueError):
               print("::error::privateBuild.minVersion is not a semver")
               sys.exit(1)
+          floor = max(floors) if floors else None  # while both exist, the higher floor holds
+          skip_prereleases = scope is not None and scope.prereleases == "skip"
+          manual_only = scope is not None and not scope.auto
           try:
               withdrawn = load_withdrawn(".", bid)  # a missing file lists nothing
           except RetractError:
@@ -275,6 +324,7 @@ jobs:
 
           versions = {}
           older = set()
+          prereleases = set()
           refusals = set()
           with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
               for line in fh:
@@ -293,7 +343,12 @@ jobs:
                   if floor is not None and parse_semver(deps, version) < floor:
                       older.add(version)
                       continue
-                  if refused(name):
+                  if skip_prereleases and "-" in version:
+                      prereleases.add(version)
+                      continue
+                  # build.yml takes the version from the ref before it reads the tag's file; a pattern
+                  # whose version group is not that semver would build another version than polled
+                  if refused(name) or provisional_version(name, private.get("tagPattern") or None) != version:
                       refusals.add(name)
                       continue
                   versions.setdefault(version, (name, tag))
@@ -321,7 +376,7 @@ jobs:
               skipped = [v for v in candidates if v in withdrawn or withdrawing(v)]
               candidates = [v for v in candidates if v not in skipped]
               candidates.sort(key=lambda v: parse_semver(deps, v), reverse=True)
-              chosen = candidates[:MAX_PER_APP]
+              chosen = [] if manual_only else candidates[:MAX_PER_APP]
               if chosen and not dry_run:
                   # a pre-push hook may have started the same tag a moment ago, and its run is listed only
                   # a few seconds later: look again before starting a second build
@@ -335,10 +390,11 @@ jobs:
           except GhError as exc:
               print("::error::" + str(exc))
               sys.exit(1)
-          print("matching tags: %d, below minVersion: %d, refused: %d, withdrawn: %d, candidates: %d, "
-                "started meanwhile: %d, %s: %d" % (
-                    len(versions), len(older), len(refusals), len(skipped), len(candidates), len(late),
-                    "would dispatch" if dry_run else "dispatched", len(chosen)))
+          print("policy: %s%s" % ("format 2 scope" if scope else "app.json", ", manual builds only" if manual_only else ""))
+          print("matching tags: %d, below minVersion: %d, pre-releases skipped: %d, refused: %d, withdrawn: %d, "
+                "candidates: %d, started meanwhile: %d, %s: %d" % (
+                    len(versions), len(older), len(prereleases), len(refusals), len(skipped), len(candidates),
+                    len(late), "would dispatch" if dry_run else "dispatched", len(chosen)))
           PY
 
   next:

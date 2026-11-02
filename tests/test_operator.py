@@ -1324,6 +1324,33 @@ class RegisterTests(OperatorCase):
         self.assertIn("write apps/%s/app.json with privateBuild.enabled, minVersion 0.2.1" % BID, out)
         self.assertFalse(os.path.exists(os.path.join(self.root, "apps", BID)))
 
+    def test_policy_ref_is_stored_with_the_registration(self):
+        self.rules()
+        code, _, err = self.run_alt("register", PRIVATE, "--bid", BID, "--policy-ref", "dev", "--min-version", "1.0.0")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(self.call("secret", "set", "ALT_APP")["stdin"]), {"repo": PRIVATE, "policyRef": "dev"})
+        self.assertEqual(self.run_alt("register", PRIVATE, "--bid", BID, "--policy-ref", "../x", "--rotate")[0], 1)
+
+    def test_a_repository_scope_without_a_floor_still_gets_one(self):
+        content = base64.b64encode(json.dumps({"version": 2, "scope": {"prereleases": "skip"}}).encode()).decode()
+        self.rules((), None, {"match": ["api", "repos/%s/contents/.alt.json?ref=dev" % PRIVATE],
+                              "stdout": {"encoding": "base64", "content": content}},
+                   self.tags_rule(["v1.2.3"]))
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID, "--policy-ref", "dev")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_app_json(), {"privateBuild": {"enabled": True, "minVersion": "1.2.3"}})
+
+    def test_a_repository_scope_means_no_floor_in_app_json(self):
+        content = base64.b64encode(json.dumps({"version": 2, "scope": {"minVersion": "1.0.0"}}).encode()).decode()
+        self.rules((), None, {"match": ["api", "repos/%s/contents/.alt.json?ref=dev" % PRIVATE],
+                              "stdout": {"encoding": "base64", "content": content}},
+                   self.tags_rule(["v1.2.3"]))
+        code, out, err = self.run_alt("register", PRIVATE, "--bid", BID, "--policy-ref", "dev")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.read_app_json(), {"privateBuild": {"enabled": True}})
+        self.assertIn("keeps its scope in .alt.json format 2", out)
+        self.assertFalse(any("/tags?" in a for argv in self.argvs() for a in argv))
+
     def test_inputs_are_validated_before_gh(self):
         def build(obj):
             return self.write(os.path.join(self.dir, "b.json"), json.dumps(obj))
@@ -2233,7 +2260,18 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
 
     RUNS = r"^repos/xuniv/alt/actions/workflows/build\.yml/runs\?created=%3E%3D\d{4}-\d\d-\d\d&per_page=100&page=1$"
 
-    def run_poll(self, tags, dry_run="false", released=()):
+    def runner_temp(self, policy=None):
+        """RUNNER_TEMP of the poll step; ``policy`` is the .alt.json read from the policy branch."""
+        temp = self.mkdir("runner-temp")
+        path = os.path.join(temp, "policy.json")
+        if policy is None:
+            if os.path.exists(path):
+                os.unlink(path)
+        else:
+            self.write(path, policy if isinstance(policy, str) else json.dumps(policy))
+        return temp
+
+    def run_poll(self, tags, dry_run="false", released=(), policy=None):
         script = heredoc(step_script(POLL_WORKFLOW, "Find new versions"), 'python3 - "$RUNNER_TEMP/tags.txt" <<\'PY\'')
         program = self.write(os.path.join(self.dir, "poll.py"), script)
         listing = self.write(os.path.join(self.dir, "tags.txt"),
@@ -2244,7 +2282,7 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
                "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt",
                "BID": BID, "DRY_RUN": dry_run, "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true",
-               "ALT_POLL_SETTLE_SECONDS": "0"}
+               "ALT_POLL_SETTLE_SECONDS": "0", "RUNNER_TEMP": self.runner_temp(policy)}
         proc = subprocess.run([sys.executable, program, listing], cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                               capture_output=True)
         return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
@@ -2257,8 +2295,8 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         self.retract("1.3.0", "1.2.3")
         code, out, err = self.run_poll(["v1.2.3", "v1.2.4", "v1.3.0", "v1.1.0"], released=["io.example.demo-v1.1.0"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("matching tags: 4, below minVersion: 0, refused: 0, withdrawn: 2, candidates: 1, "
-                      "started meanwhile: 0, dispatched: 1", out)
+        self.assertIn("matching tags: 4, below minVersion: 0, pre-releases skipped: 0, refused: 0, withdrawn: 2, "
+                      "candidates: 1, started meanwhile: 0, dispatched: 1", out)
         self.assertEqual(self.dispatched(), [{"ref": "main", "inputs": {"app": BID, "ref": "v1.2.4",
                                                                         "publish": "true"}}])
         self.assertNotIn("1.3.0", out + err)  # counts only
@@ -2274,7 +2312,7 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         self.retract("1.3.0")
         code, out, err = self.run_poll(["v1.0.0", "v1.2.3", "v1.2.4-rc.1", "v1.2.4", "v1.3.0", "v1.4.0"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("matching tags: 3, below minVersion: 3, refused: 0, withdrawn: 1, candidates: 2, "
+        self.assertIn("matching tags: 3, below minVersion: 3, pre-releases skipped: 0, refused: 0, withdrawn: 1, candidates: 2, "
                       "started meanwhile: 0, dispatched: 2", out)
         self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["v1.4.0", "v1.2.4"])
         self.assertNotIn("1.2.3", out + err)  # counts only
@@ -2297,7 +2335,8 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         self.set_rules(releases, {"pattern": [self.RUNS], "stdout": {"total_count": 0, "workflow_runs": []}})
         env = {"PATH": self.env["PATH"], "HOME": self.home, "FAKE_GH_STATE": self.state, "GH_TOKEN": "placeholder",
                "PYTHONPATH": TOOLS, "ALT_REPO": "xuniv/alt", "BID": BID, "DRY_RUN": "false",
-               "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true", "ALT_POLL_SETTLE_SECONDS": "5"}
+               "ALT_DENYLIST": "leaky-host-0\n", "GITHUB_ACTIONS": "true", "ALT_POLL_SETTLE_SECONDS": "5",
+               "RUNNER_TEMP": self.runner_temp()}
         proc = subprocess.Popen([sys.executable, program, listing], cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
@@ -2313,6 +2352,65 @@ class PollWithdrawnTests(WithdrawnWorkflowCase):
         self.assertEqual(proc.returncode, 0, out + err)
         self.assertIn(b"candidates: 2, started meanwhile: 1, dispatched: 1", out)
         self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["v1.2.4"])
+
+    def test_the_format_2_scope_on_the_policy_branch(self):
+        self.app_json({"privateBuild": {"enabled": True, "minVersion": "1.0.0"}})
+        policy = {"version": 2, "scope": {"minVersion": "1.2.4", "prereleases": "skip"}}
+        tags = ["v1.0.0", "v1.2.3", "v1.2.4", "v1.3.0-rc.1", "v1.3.0"]
+        code, out, err = self.run_poll(tags, policy=policy)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("policy: format 2 scope\n", out)
+        self.assertIn("matching tags: 2, below minVersion: 2, pre-releases skipped: 1, refused: 0", out)
+        self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["v1.3.0", "v1.2.4"])
+        os.unlink(os.path.join(self.state, "calls.jsonl"))
+        policy["scope"]["prereleases"] = "build"
+        code, out, _ = self.run_poll(tags, policy=policy)
+        self.assertIn("matching tags: 3, below minVersion: 2, pre-releases skipped: 0", out)
+        self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["v1.3.0", "v1.3.0-rc.1"])
+
+    def test_the_higher_floor_holds_while_both_exist(self):
+        self.app_json({"privateBuild": {"enabled": True, "minVersion": "1.3.0"}})
+        code, out, _ = self.run_poll(["v1.2.4", "v1.3.0"], policy={"version": 2, "scope": {"minVersion": "1.0.0"}})
+        self.assertIn("matching tags: 1, below minVersion: 1", out)
+
+    def test_manual_only_scope_and_custom_tag_pattern(self):
+        policy = {"version": 2, "scope": {"auto": False}}
+        code, out, _ = self.run_poll(["v1.2.4"], policy=policy)
+        self.assertIn("policy: format 2 scope, manual builds only\n", out)
+        self.assertIn("candidates: 1, started meanwhile: 0, dispatched: 0", out)
+        self.assertEqual(self.dispatched(), [])
+        policy = {"version": 2, "scope": {"tagPattern": r"^release-(?P<version>\d+\.\d+\.\d+)$"}}
+        code, out, _ = self.run_poll(["v1.2.4", "release-1.2.5"], policy=policy)
+        self.assertEqual([d["inputs"]["ref"] for d in self.dispatched()], ["release-1.2.5"])
+
+    def test_policy_without_scope_or_format_1_keeps_app_json(self):
+        self.app_json({"privateBuild": {"enabled": True, "minVersion": "1.2.4"}})
+        for policy in ({"version": 2, "build": {"command": "make"}}, {"command": "make"}):
+            code, out, _ = self.run_poll(["v1.2.3", "v1.2.4"], dry_run="true", policy=policy)
+            self.assertEqual(code, 0, out)
+            self.assertIn("policy: app.json\n", out)
+            self.assertIn("matching tags: 1, below minVersion: 1", out)
+
+    def test_tags_whose_version_build_yml_would_derive_otherwise_are_refused(self):
+        policy = {"version": 2, "scope": {"tagPattern": r"^v(?P<version>\d+\.\d+\.\d+)-ios$"}}
+        code, out, _ = self.run_poll(["v1.3.0-ios"], policy=policy)
+        self.assertEqual(code, 0, out)
+        self.assertIn("refused: 1", out)
+        self.assertEqual(self.dispatched(), [])
+
+    def test_a_policy_fetch_failure_is_not_a_missing_file(self):
+        with open(POLL_WORKFLOW, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn('git -C "$policy" ls-tree --name-only HEAD -- .alt.json', text)
+        self.assertIn('git -C "$policy" cat-file blob "HEAD:.alt.json"', text)
+        self.assertNotIn("cat-file -e", text)
+
+    def test_an_unusable_policy_dispatches_nothing(self):
+        for policy in ("{", {"version": 2, "scope": {"minVersion": "1.2"}}, {"version": 9}):
+            code, out, _ = self.run_poll(["v1.2.4"], policy=policy)
+            self.assertEqual(code, 1, policy)
+            self.assertIn("::error::the policy .alt.json is not usable", out)
+        self.assertEqual(self.dispatched(), [])
 
     def test_a_bad_min_version_dispatches_nothing(self):
         self.app_json({"privateBuild": {"enabled": True, "minVersion": "1.2"}})
@@ -2415,6 +2513,58 @@ class GateMainCheckTests(WithdrawnWorkflowCase):
         self.assertLess(names.index("- name: Check the version on main"), names.index("- name: Gate the IPA"))
         at = lines.index("      - name: Check the version on main", first)
         self.assertIn("        if: inputs.publish && !inputs.force", lines[at:at + 5])
+
+
+class GateExceptionTests(unittest.TestCase):
+    """The gate job receives gate.homeUsers from the build job and passes them to stage intact or not at all."""
+
+    def run_args(self, users, count):
+        """``users``: the decrypted home-users.json (None: missing)."""
+        script = heredoc(step_script(BUILD_WORKFLOW, "Gate the IPA", job="gate"),
+                         'python3 - "$RUNNER_TEMP/alt-ipa/home-users.json" "$RUNNER_TEMP/home-users.args" <<\'PY\'')
+        with tempfile.TemporaryDirectory() as tmp:
+            program = os.path.join(tmp, "args.py")
+            with open(program, "w", encoding="utf-8") as fh:
+                fh.write(script)
+            source = os.path.join(tmp, "home-users.json")
+            if users is not None:
+                with open(source, "w", encoding="utf-8") as fh:
+                    fh.write(users)
+            out = os.path.join(tmp, "args")
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": TOOLS, "HOME_USERS_COUNT": count}
+            proc = subprocess.run([sys.executable, program, source, out], env=env, capture_output=True)
+            data = open(out, "rb").read() if os.path.exists(out) else None
+        return proc.returncode, proc.stdout.decode(), data
+
+    def test_names_become_stage_arguments(self):
+        code, out, data = self.run_args('["videolanci","ci.build-1"]', "2")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(data, b"--allow-home-user\0videolanci\0--allow-home-user\0ci.build-1\0")
+        self.assertIn("gate exceptions: 2 home user(s)", out)
+        self.assertNotIn("videolanci", out)
+        self.assertEqual(self.run_args("[]", "")[0:3:2], (0, b""))  # format 1: no exceptions
+
+    def test_a_dropped_or_damaged_output_fails(self):
+        for users, count in ((None, "0"), ("[]", "1"), ('["a"]', "2"), ("not json", "0"), ('[1]', "1"),
+                             ('["a"]', "x"), ('["a/b"]', "1")):
+            code, out, _ = self.run_args(users, count)
+            self.assertEqual(code, 1, (users, count))
+            self.assertIn("::error::the gate exceptions of the build did not arrive intact", out)
+
+    def test_the_build_job_exports_them(self):
+        first, end = job_lines(BUILD_WORKFLOW, "build")
+        with open(BUILD_WORKFLOW, encoding="utf-8") as fh:
+            job = fh.read().splitlines()[first:end]
+        self.assertIn("      home_users_count: ${{ steps.config.outputs.home_users_count }}", job)
+        with open(BUILD_WORKFLOW, encoding="utf-8") as fh:
+            text = fh.read()
+        # the names never pass through an output, an env block or an expression: the log prints those
+        self.assertNotIn("outputs.home_users }}", text)
+        self.assertNotIn("HOME_USERS:", text)
+        self.assertIn('age -r "$RECIPIENT" -o "$payload/home-users.json.age"', text)
+        self.assertIn("${{ runner.temp }}/payload/home-users.json.age", text)
+        self.assertIn("          FORMAT: ${{ steps.config.outputs.format }}", job)
+        self.assertIn('            echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"', job)
 
 
 class PollTriggerTests(unittest.TestCase):

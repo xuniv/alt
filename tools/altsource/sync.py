@@ -56,6 +56,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import retract as retractmod
+from .leaks import MAX_HOME_USERS
 from .stage import (
     APP_JSON_MAX_BYTES,
     ARCHIVE_ERRORS,
@@ -101,6 +102,11 @@ _PLAIN_KEY = re.compile(r"^[A-Za-z]{1,40}$")
 
 class SyncError(Exception):
     """Sync failed."""
+
+
+class PolicyError(SyncError):
+    """A release's gate policy cannot be built (for example too many home users); that release is kept as
+    it is and reported."""
 
 
 class SyncAborted(SyncError):
@@ -324,7 +330,9 @@ class _Run:
         return path
 
     def policy_for(self, bid: str, seed: Optional[Dict[str, Any]] = None) -> Any:
-        """Gate policy for ``bid``: the committed app.json decides; a new app uses the release's app.json."""
+        """Gate policy for ``bid``: the committed app.json decides ``allowHomePaths`` (a new app uses the
+        release's app.json); the build accounts of ``allowHomeUsers`` are those of the committed app.json
+        and of the release's own app.json (stage attaches ``.alt.json`` gate.homeUsers there)."""
         path = os.path.join(self.root, "apps", bid, "app.json")
         planned = self.desired.get("apps/%s/app.json" % bid)  # written for a new app by this run
         if planned is not None:
@@ -336,8 +344,15 @@ class _Run:
         changes: Dict[str, Any] = {}
         if isinstance(app, dict) and app.get("allowHomePaths") is True:
             changes["allow_home_paths"] = True
-        users = app.get("allowHomeUsers") if isinstance(app, dict) else None
-        if isinstance(users, list) and users:  # validated with the rest of app.json
+        users: List[str] = []
+        for source in (app, seed):  # validated with the rest of their app.json
+            listed = source.get("allowHomeUsers") if isinstance(source, dict) else None
+            for name in listed if isinstance(listed, list) else []:
+                if isinstance(name, str) and name.lower() not in {u.lower() for u in users}:
+                    users.append(name)
+        if len(users) > MAX_HOME_USERS:
+            raise PolicyError("more than %d home users across app.json and the release's app.json" % MAX_HOME_USERS)
+        if users:
             changes["home_users"] = tuple(users)
         if not changes:
             return self.policy
@@ -553,7 +568,12 @@ class _Run:
             if seed is None:
                 self.remediate(rel, tag, rules)
                 return
-            policy = self.policy_for(bid, seed)
+            try:
+                policy = self.policy_for(bid, seed)
+            except PolicyError as exc:  # this release only; the run goes on
+                self.error("%s: %s; skipped" % (tag, exc))
+                self.keep(path, prev, rel, tag, self.policy, int(asset["id"]))
+                return
         try:
             ipa = self.download(int(asset["id"]), digest)
         except Exception as exc:

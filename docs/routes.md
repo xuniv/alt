@@ -295,7 +295,8 @@ example `JAVA_HOME` or `GOFLAGS`) get them from the `env` entries or set them in
 
 ### Which tags are built
 
-`privateBuild.tagPattern` in `app.json` decides which tags of the private repository are versions. It
+With a [format 2 `.alt.json`](#altjson-format-2) on the policy branch, its `scope` decides (see
+below). Otherwise `privateBuild.tagPattern` in `app.json` decides which tags of the private repository are versions. It
 is a regular expression with a named group `version`, matched against the whole tag name. The default
 is `v` followed by a semver (`^v(?P<version>...)$`), so `v1.4.0` becomes release
 `io.example.demo-v1.4.0`. The captured version must be a valid semver as defined above.
@@ -334,6 +335,39 @@ The same keys can be stored in the `build` object of the app environment's `ALT_
 (`bin/alt register --build-json F`). Registered values win over `.alt.json`, and `env` objects are
 merged key by key. Settings can be kept out of the private repository this way, or overridden without
 a new tag.
+
+### `.alt.json` format 2
+
+With `"version": 2`, `.alt.json` is the repository's complete configuration. alt keeps only the
+registration (the deploy key, the repository and the branch that holds the policy) and its own
+invariants; no repository-specific setting has to be committed to alt.
+
+```json
+{
+  "version": 2,
+  "build": {"runner": "xcode-27", "xcode": "27.2", "setup": ["xcodegen"],
+            "command": "scripts/build-unsigned-ipa.sh", "ipa_glob": "*.ipa", "env": {"SCHEME": "Demo"}},
+  "gate": {"homeUsers": ["videolanci"]},
+  "scope": {"minVersion": "1.4.0", "prereleases": "skip"}
+}
+```
+
+| Key | Read from | Meaning |
+|---|---|---|
+| `build` | the tag | the keys of the table above. `xcode` is `major.minor`: the newest release of that minor on the runner, else its release candidate (never a beta); the log shows the build number it resolved to. The build command gets it as `DEVELOPER_DIR` too. The registered `build` object of `ALT_APP` is ignored |
+| `gate.homeUsers` | the tag | up to 16 build accounts of prebuilt third-party code inside the IPA (`[A-Za-z0-9._-]`): their `/Users/<name>/` paths only warn. The names travel from the build job to the gate job inside the encrypted payload (never as an output or in a step's environment, which the log prints). The gate checks them against the denylist, and stage attaches them to the release (`app.json` asset), so sync and `stage.yml` apply the same exception later |
+| `scope` | the policy branch | which tags `poll.yml` builds by itself: `tagPattern` (default `v` followed by a semver), `minVersion`, `prereleases` (`skip`, the default, or `build`) and `auto` (default `true`; `false` leaves only explicit builds). The policy branch is the registration's `policyRef` (`bin/alt register --policy-ref BRANCH`), else the repository's default branch, so the scope changes without a tag. If the file cannot be fetched, the poll fails instead of falling back. A `tagPattern` must capture as `version` the semver at the end of the tag (an optional `v` may precede it): build.yml takes the version from the ref before it can read the tag's file, and `poll.yml` counts other tags as refused. A `scope.tagPattern` in the tag's own file must match the tag too |
+
+Nothing in the file can relax the denylist, the structural gate rules, the bundle identifier check or
+a withdrawal (`retracted.json`), and `privateBuild.enabled` in alt's `app.json` stays the switch that
+registers the app. A blanket `allowHomePaths` is not available to a private repository. The public
+log shows the format, counts and the resolved Xcode, never the file's values. Unknown keys are errors;
+error messages in the public log do not name them.
+
+Tags without a format 2 file keep the format 1 behaviour: the registered `build` object wins over
+`.alt.json`, and the scope comes from `app.json` (`privateBuild.tagPattern`, `minVersion`). While both
+exist, `poll.yml` applies the higher `minVersion`. `poll.yml` reads the policy branch through a
+partial clone that fetches no file but `.alt.json`.
 
 The command must produce an unsigned IPA that passes the gate:
 

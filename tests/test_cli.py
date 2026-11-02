@@ -228,6 +228,20 @@ class StageCommandTests(CliCase):
         self.assertEqual(code, 1)
         self.assertIn("allowHomeUsers in the app's app.json is not valid", err)
 
+    def test_stage_takes_home_users_and_attaches_them_to_the_release(self):
+        ipa = self.ipa(payload="/Users/thirdpartyci/build")
+        code, out, err = self.run_cli("stage", ipa, "--bid", "io.example.demo", "--allow-home-user", "thirdpartyci")
+        self.assertEqual(code, 0, err)
+        rel = self.gh.releases[int(self.outputs()["release_id"])]
+        seeds = [a for a in rel["assets"] if a["name"] == "app.json"]
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(json.loads(self.gh.blobs[seeds[0]["id"]])["allowHomeUsers"], ["thirdpartyci"])
+        # a name that hits the denylist is refused, whatever the IPA holds
+        code, _, err = self.run_cli("stage", self.ipa(payload="clean"), "--bid", "io.example.demo", "--dry-run",
+                                    "--allow-home-user", "leaky-host-0", gh=Untouchable())
+        self.assertEqual(code, 2)
+        self.assertNotIn("leaky-host-0", err)
+
     def test_scan_allow_home_user(self):
         ipa = self.ipa(payload="/Users/thirdpartyci/build")
         self.assertEqual(self.run_cli("scan", ipa)[0], 2)
@@ -278,6 +292,30 @@ class StageCommandTests(CliCase):
         self.assertEqual(code, 0)
         self.assertIn("tag=io.example.demo-v2.0.0-beta.1\n", out)
         self.assertIn("published=false\n", out)
+
+    def test_stage_draft_uses_the_drafts_own_home_users(self):
+        # a format 2 release keeps gate.homeUsers in its app.json asset; alt's app.json does not list them
+        rel = self.gh.add_release("io.example.demo-v1.2.3", draft=True)
+        self.gh.add_asset(rel, "a.ipa", ipa_bytes(payload="/Users/thirdpartyci/build"))
+        self.gh.add_asset(rel, "app.json", b'{"allowHomeUsers": ["thirdpartyci"]}')
+        code, out, err = self.run_cli("stage-draft", "io.example.demo-v1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("published=true", out)
+        other = self.gh.add_release("io.example.demo-v1.2.4", draft=True)
+        self.gh.add_asset(other, "b.ipa", ipa_bytes(short_version="1.2.4", payload="/Users/thirdpartyci/build"))
+        self.assertEqual(self.run_cli("stage-draft", "io.example.demo-v1.2.4")[0], 2)
+
+    def test_stage_caps_the_merged_home_users(self):
+        names = ["n%d" % i for i in range(10)]
+        seed = os.path.join(self.dir, "seed.json")
+        with open(seed, "w", encoding="utf-8") as fh:
+            json.dump({"allowHomeUsers": names}, fh)
+        args = ["stage", self.ipa(payload="/Users/m10/x"), "--dry-run", "--app-json", seed]
+        for i in range(10, 17):
+            args += ["--allow-home-user", "m%d" % i]
+        code, _, err = self.run_cli(*args, gh=Untouchable())
+        self.assertEqual(code, 1)
+        self.assertIn("more than 16 home users", err)
 
     def test_stage_draft_single_and_all(self):
         a = self.gh.add_release("io.example.demo-v1.2.3", draft=True)
@@ -538,7 +576,8 @@ class ResolveBuildTests(CliCase):
         self.assertEqual(code, 0, err)
         values = self.outputs()
         self.assertEqual(values, {"runner": "xcode-27", "xcode": "27.0", "setup": "go xcodegen",
-                                  "version": "1.4.0", "tag": "io.example.demo-v1.4.0"})
+                                  "version": "1.4.0", "tag": "io.example.demo-v1.4.0", "format": "1",
+                                  "home_users_count": "0"})
         full = load_json(json_out)
         self.assertEqual(full["command"], "make ipa\nls")
         self.assertEqual(full["ipa_glob"], "build/*.ipa")
@@ -550,6 +589,87 @@ class ResolveBuildTests(CliCase):
             self.assertNotIn(secret, json.dumps(values))
         self.assertIn("runner=xcode-27\n", out)
         self.assertNotIn("::add-mask::", out)  # masks are only emitted inside GitHub Actions
+
+    V2 = {"version": 2,
+          "build": {"runner": "xcode-27", "xcode": "27.2", "setup": ["go"], "command": "make ipa",
+                    "ipa_glob": "out/*.ipa", "env": {"SCHEME": "Demo"}},
+          "gate": {"homeUsers": ["thirdpartyci"]},
+          "scope": {"minVersion": "1.0.0", "prereleases": "build"}}
+
+    def test_format_2_is_complete_and_the_registered_build_is_ignored(self):
+        self.alt_json(self.V2)
+        self.env["ALT_APP_CONFIG"] = json.dumps({"repo": "someone/private-thing", "policyRef": "dev", "build": {
+            "runner": "macos-15", "command": "registered", "env": {"MODE": "ci"}}})
+        json_out = os.path.join(self.dir, "resolved.json")
+        code, out, err = self.run_cli(
+            "resolve-build", "--bid", "io.example.demo", "--ref", "v1.4.0", "--checkout", self.checkout,
+            "--root", self.root, "--json-out", json_out)
+        self.assertEqual(code, 0, err)
+        values = self.outputs()
+        self.assertEqual((values["runner"], values["xcode"], values["setup"], values["format"]),
+                         ("xcode-27", "27.2", "go", "2"))
+        self.assertEqual(values["home_users_count"], "1")
+        self.assertNotIn("thirdpartyci", json.dumps(values))  # names never become an output
+        full = load_json(json_out)
+        self.assertEqual(json.loads(full["home_users"]), ["thirdpartyci"])
+        self.assertEqual((full["command"], full["ipa_glob"], json.loads(full["env"])),
+                         ("make ipa", "out/*.ipa", {"SCHEME": "Demo"}))
+        self.assertIn("the registered build section is ignored", err)
+        self.assertNotIn("thirdpartyci", out + err)  # the log shows the count only
+
+    def test_format_2_rules(self):
+        cases = [
+            (dict(self.V2, version=3), ".alt.json version must be 2"),
+            (dict(self.V2, extra=1), ".alt.json has 1 unknown key(s)"),
+            (dict(self.V2, build=dict(self.V2["build"], xcode="27")), "build.xcode must be major.minor"),
+            (dict(self.V2, build=dict(self.V2["build"], xcode="27.2.1")), "build.xcode must be major.minor"),
+            (dict(self.V2, gate={"homeUsers": ["a/b"]}), "gate.homeUsers must be a list"),
+            (dict(self.V2, gate={"allowHomePaths": True}), "gate has 1 unknown key(s)"),
+            (dict(self.V2, scope={"minVersion": "1.2"}), "scope.minVersion must be a semver"),
+            (dict(self.V2, scope={"prereleases": "maybe"}), "scope.prereleases must be one of"),
+            (dict(self.V2, scope={"tagPattern": "^v(.*)$"}), "needs a named group 'version'"),
+        ]
+        for obj, message in cases:
+            self.alt_json(obj)
+            code, _, err = self.resolve()
+            self.assertEqual(code, 1, obj)
+            self.assertIn(message, err, obj)
+        self.env["ALT_APP_CONFIG"] = json.dumps({"repo": "someone/private-thing", "policyRef": "../x"})
+        self.alt_json(self.V2)
+        code, _, err = self.resolve()
+        self.assertEqual(code, 1)
+        self.assertIn("policyRef must be a branch name", err)
+
+    def test_format_2_versions_agree_with_the_jobs_before_resolve(self):
+        self.alt_json(self.V2)  # no scope.tagPattern in the tag: the semver at the end of the ref
+        for ref, version in (("release-1.4.0", "1.4.0"), ("nb-v1.4.1", "1.4.1"), ("v1.4.2-rc.1", "1.4.2-rc.1")):
+            code, _, err = self.resolve(ref=ref)
+            self.assertEqual(code, 0, (ref, err))
+            self.assertEqual(self.outputs()["version"], version)
+        # a pattern whose version group is not that semver is refused before anything is built
+        self.alt_json(dict(self.V2, scope={"tagPattern": r"^v(?P<version>\d+\.\d+\.\d+)-ios$"}))
+        code, _, err = self.resolve(ref="v1.3.0-ios")
+        self.assertEqual(code, 1)
+        self.assertIn("must be the semver at the end of the ref", err)
+
+    def test_format_2_tag_pattern_comes_from_the_tag(self):
+        pattern = r"^release-(?P<version>\d+\.\d+\.\d+)$"
+        self.alt_json(dict(self.V2, scope={"tagPattern": pattern}))
+        code, _, err = self.resolve(ref="release-1.4.0")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.outputs()["version"], "1.4.0")
+        self.assertEqual(self.resolve(ref="v1.4.0")[0], 1)
+
+    def test_provisional_version(self):
+        self.assertEqual(cli.provisional_version("v1.2.3"), "1.2.3")
+        self.assertEqual(cli.provisional_version("release-1.2.3-rc.1"), "1.2.3-rc.1")
+        self.assertEqual(cli.provisional_version("app10.2.3"), None)
+        self.assertEqual(cli.provisional_version("v1.2"), None)
+        self.assertEqual(cli.provisional_version("v1.2.3", r"^r(?P<version>\d+\.\d+\.\d+)$"), None)
+        self.assertEqual(cli.provisional_version("r1.2.3", r"^r(?P<version>\d+\.\d+\.\d+)$"), "1.2.3")
+        self.assertEqual(cli.provisional_version("v1.2.3", "("), None)
+        self.assertEqual(cli.provisional_version("nb-v1.2.3"), "1.2.3")
+        self.assertEqual(cli.provisional_version("1.2.3"), "1.2.3")
 
     def test_private_values_are_masked_in_ci(self):
         self.alt_json({"command": "make ipa\n  ./pack 100%\nls", "ipa_glob": "build/*.ipa",
@@ -564,7 +684,8 @@ class ResolveBuildTests(CliCase):
         self.assertEqual(masks, ["someone/private-thing", "make ipa", "./pack 100%25", "Demo", "build/*.ipa"])
         first_plain = min(i for i, line in enumerate(out.splitlines()) if not line.startswith("::"))
         self.assertEqual(first_plain, len(masks))  # masks come before any other output
-        self.assertEqual(sorted(self.outputs()), ["runner", "setup", "tag", "version", "xcode"])
+        self.assertEqual(sorted(self.outputs()), ["format", "home_users_count", "runner", "setup", "tag", "version",
+                                                  "xcode"])
 
     def test_defaults_and_custom_tag_pattern(self):
         self.app_json({"privateBuild": {"enabled": True, "tagPattern": r"^release-(?P<version>\d+\.\d+\.\d+)$"}})
