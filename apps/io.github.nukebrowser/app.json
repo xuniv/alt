@@ -6,8 +6,5 @@
   "privateBuild": {
     "enabled": true,
     "minVersion": "0.2.1"
-  },
-  "allowHomeUsers": [
-    "videolanci"
-  ]
+  }
 }
