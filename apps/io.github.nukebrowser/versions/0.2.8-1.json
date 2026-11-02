@@ -21,5 +21,6 @@
     "NSLocalNetworkUsageDescription": "NukeBrowser connects to WebDAV servers on your local network.",
     "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
   },
-  "entitlements": []
+  "entitlements": [],
+  "appJsonAssetId": 702141933
 }
