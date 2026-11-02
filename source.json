@@ -18,6 +18,17 @@
       "category": "photo-video",
       "versions": [
         {
+          "version": "0.2.10",
+          "buildVersion": "1069",
+          "marketingVersion": "0.2.10",
+          "date": "2026-11-02T14:19:53Z",
+          "localizedDescription": "Version 0.2.10",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.10/NukeBrowser-0.2.10.ipa",
+          "size": 81225656,
+          "sha256": "0303a472707eed458a476530315372d60c07e341f0751d78818c8fef7ca77979",
+          "minOSVersion": "18.0"
+        },
+        {
           "version": "0.2.9",
           "buildVersion": "1067",
           "marketingVersion": "0.2.9",
@@ -125,11 +136,11 @@
           "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
         }
       },
-      "version": "0.2.9",
-      "versionDate": "2026-11-01T07:02:45Z",
-      "versionDescription": "Version 0.2.9",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.9/NukeBrowser-0.2.9.ipa",
-      "size": 80934790
+      "version": "0.2.10",
+      "versionDate": "2026-11-02T14:19:53Z",
+      "versionDescription": "Version 0.2.10",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.10/NukeBrowser-0.2.10.ipa",
+      "size": 81225656
     }
   ]
 }
