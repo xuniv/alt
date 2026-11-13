@@ -18,6 +18,17 @@
       "category": "photo-video",
       "versions": [
         {
+          "version": "0.2.12",
+          "buildVersion": "1073",
+          "marketingVersion": "0.2.12",
+          "date": "2026-11-13T01:10:10Z",
+          "localizedDescription": "Version 0.2.12",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.12/NukeBrowser-0.2.12.ipa",
+          "size": 88380062,
+          "sha256": "70dde10dd297197054a92b47c59de9fa6841c19ae6e6289b519e44295ac8b554",
+          "minOSVersion": "18.0"
+        },
+        {
           "version": "0.2.10",
           "buildVersion": "1069",
           "marketingVersion": "0.2.10",
@@ -115,17 +126,6 @@
           "size": 27321014,
           "sha256": "e3646faf21c11821874751111ce79a2d8144d1228dd0d1d3dbd044ebde8fa4b2",
           "minOSVersion": "27.0"
-        },
-        {
-          "version": "0.2.1",
-          "buildVersion": "724",
-          "marketingVersion": "0.2.1",
-          "date": "2026-10-23T12:47:26Z",
-          "localizedDescription": "Version 0.2.1",
-          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.1/NukeBrowser-0.2.1.ipa",
-          "size": 26988547,
-          "sha256": "38a6dd3dea95afa84f6d0ff6cc7ff2452a312c67bba61346529a257928baff29",
-          "minOSVersion": "27.0"
         }
       ],
       "appPermissions": {
@@ -136,11 +136,11 @@
           "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
         }
       },
-      "version": "0.2.10",
-      "versionDate": "2026-11-02T14:19:53Z",
-      "versionDescription": "Version 0.2.10",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.10/NukeBrowser-0.2.10.ipa",
-      "size": 81225656
+      "version": "0.2.12",
+      "versionDate": "2026-11-13T01:10:10Z",
+      "versionDescription": "Version 0.2.12",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.12/NukeBrowser-0.2.12.ipa",
+      "size": 88380062
     }
   ]
 }
