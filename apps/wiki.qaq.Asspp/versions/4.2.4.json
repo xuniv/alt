@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "tag": "wiki.qaq.Asspp-v4.2.4",
+  "bundleIdentifier": "wiki.qaq.Asspp",
+  "semver": "4.2.4",
+  "version": "4.2.4",
+  "buildVersion": "1",
+  "prerelease": false,
+  "date": "2026-11-16T07:22:20Z",
+  "localizedDescription": "On-device Apple authentication and Store downloads, with local IPA import. English source package.",
+  "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.4/Asspp-4.2.4.ipa",
+  "size": 81536313,
+  "sha256": "2b71a5468ec304da16dc0fb628e9c27a3886fc76c72b5d1263b62cde16bc984e",
+  "minOSVersion": "17.0",
+  "releaseId": 446717207,
+  "assetId": 753885692,
+  "assetDigest": "sha256:2b71a5468ec304da16dc0fb628e9c27a3886fc76c72b5d1263b62cde16bc984e",
+  "name": "Asspp",
+  "privacy": {
+    "NSLocalNetworkUsageDescription": "Asspp requires this permission to communicate with install service on your device."
+  },
+  "entitlements": []
+}

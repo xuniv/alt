@@ -173,6 +173,40 @@
       "versionDescription": "Unsigned Feather 2.9.3. Improves Local CA offline manifest handling, nested installation URL encoding, HEAD request handling and installation activity retention across system confirmation. Sign with your own certificate before installing.",
       "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.3/Feather-2.9.3.ipa",
       "size": 14355276
+    },
+    {
+      "name": "Asspp",
+      "bundleIdentifier": "wiki.qaq.Asspp",
+      "developerName": "Lakr233",
+      "subtitle": "App Store downloads and IPA installation",
+      "localizedDescription": "Manage Apple accounts, download apps you are entitled to use, and install IPA files. Apple authentication runs on the device, without a self-hosted authentication server. This unsigned fork includes the modern Store runtime and local IPA import. OTA installation requires installing and trusting the app's local CA profile in iOS Settings. The source package includes English resources.",
+      "iconURL": "https://xuniv.github.io/alt/apps/wiki.qaq.Asspp/icon.png",
+      "tintColor": "5B6CFF",
+      "category": "utilities",
+      "versions": [
+        {
+          "version": "4.2.4",
+          "buildVersion": "1",
+          "marketingVersion": "4.2.4",
+          "date": "2026-11-16T07:22:20Z",
+          "localizedDescription": "On-device Apple authentication and Store downloads, with local IPA import. English source package.",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.4/Asspp-4.2.4.ipa",
+          "size": 81536313,
+          "sha256": "2b71a5468ec304da16dc0fb628e9c27a3886fc76c72b5d1263b62cde16bc984e",
+          "minOSVersion": "17.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSLocalNetworkUsageDescription": "Asspp requires this permission to communicate with install service on your device."
+        }
+      },
+      "version": "4.2.4",
+      "versionDate": "2026-11-16T07:22:20Z",
+      "versionDescription": "On-device Apple authentication and Store downloads, with local IPA import. English source package.",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.4/Asspp-4.2.4.ipa",
+      "size": 81536313
     }
   ]
 }
