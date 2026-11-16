@@ -1,0 +1,10 @@
+{
+  "name": "Feather",
+  "developerName": "Samara",
+  "subtitle": "On-device app signing and installation",
+  "localizedDescription": "An unsigned build of the open-source Feather iOS app manager. Sign and install apps on device with per-bundle entitlements, user-managed patches, local CA installation and optional hosted manifests. Sign this build with your own certificate before installing.",
+  "category": "developer",
+  "tintColor": "848EF9",
+  "includePrereleases": false,
+  "maxVersions": 10
+}

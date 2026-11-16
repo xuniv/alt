@@ -141,6 +141,38 @@
       "versionDescription": "Version 0.2.15",
       "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.15/NukeBrowser-0.2.15.ipa",
       "size": 88414544
+    },
+    {
+      "name": "Feather",
+      "bundleIdentifier": "thewonderofyou.Feather",
+      "developerName": "Samara",
+      "subtitle": "On-device app signing and installation",
+      "localizedDescription": "An unsigned build of the open-source Feather iOS app manager. Sign and install apps on device with per-bundle entitlements, user-managed patches, local CA installation and optional hosted manifests. Sign this build with your own certificate before installing.",
+      "iconURL": "https://xuniv.github.io/alt/apps/thewonderofyou.Feather/icon.png",
+      "tintColor": "848EF9",
+      "category": "developer",
+      "versions": [
+        {
+          "version": "2.9.3",
+          "buildVersion": "2.9.3",
+          "marketingVersion": "2.9.3",
+          "date": "2026-11-16T06:59:14Z",
+          "localizedDescription": "Unsigned Feather 2.9.3. Improves Local CA offline manifest handling, nested installation URL encoding, HEAD request handling and installation activity retention across system confirmation. Sign with your own certificate before installing.",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.3/Feather-2.9.3.ipa",
+          "size": 14355276,
+          "sha256": "1ea3b971f3378fd2cfd23b44ef2e654472168deda02b89fd7a8dd95b6730667b",
+          "minOSVersion": "16.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {}
+      },
+      "version": "2.9.3",
+      "versionDate": "2026-11-16T06:59:14Z",
+      "versionDescription": "Unsigned Feather 2.9.3. Improves Local CA offline manifest handling, nested installation URL encoding, HEAD request handling and installation activity retention across system confirmation. Sign with your own certificate before installing.",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.3/Feather-2.9.3.ipa",
+      "size": 14355276
     }
   ]
 }
