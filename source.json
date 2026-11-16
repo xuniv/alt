@@ -196,6 +196,17 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "4.2.6",
+          "buildVersion": "1",
+          "marketingVersion": "4.2.6",
+          "date": "2026-11-16T12:24:25Z",
+          "localizedDescription": "Reduce interpreter memory with bounded asset streams, reusable staging buffers and isolated shared guest pages. English source package.",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.6/Asspp-4.2.6.ipa",
+          "size": 81255746,
+          "sha256": "4cb5d3a502a56b019d6f2c81e8fd3f9eb696e9a9aaf440e220a71e4cfe1f2042",
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "4.2.5",
           "buildVersion": "1",
           "marketingVersion": "4.2.5",
@@ -224,11 +235,11 @@
           "NSLocalNetworkUsageDescription": "Asspp requires this permission to communicate with install service on your device."
         }
       },
-      "version": "4.2.5",
-      "versionDate": "2026-11-16T08:51:15Z",
-      "versionDescription": "Fix FairPlay and ADI initialization with zero-filled guest memory and correct repeated host callbacks. Reduce authentication startup memory. English source package.",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.5/Asspp-4.2.5.ipa",
-      "size": 81547316
+      "version": "4.2.6",
+      "versionDate": "2026-11-16T12:24:25Z",
+      "versionDescription": "Reduce interpreter memory with bounded asset streams, reusable staging buffers and isolated shared guest pages. English source package.",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.6/Asspp-4.2.6.ipa",
+      "size": 81255746
     }
   ]
 }

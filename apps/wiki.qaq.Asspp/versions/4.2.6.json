@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "tag": "wiki.qaq.Asspp-v4.2.6",
+  "bundleIdentifier": "wiki.qaq.Asspp",
+  "semver": "4.2.6",
+  "version": "4.2.6",
+  "buildVersion": "1",
+  "prerelease": false,
+  "date": "2026-11-16T12:24:25Z",
+  "localizedDescription": "Reduce interpreter memory with bounded asset streams, reusable staging buffers and isolated shared guest pages. English source package.",
+  "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.6/Asspp-4.2.6.ipa",
+  "size": 81255746,
+  "sha256": "4cb5d3a502a56b019d6f2c81e8fd3f9eb696e9a9aaf440e220a71e4cfe1f2042",
+  "minOSVersion": "17.0",
+  "releaseId": 447006822,
+  "assetId": 754759751,
+  "assetDigest": "sha256:4cb5d3a502a56b019d6f2c81e8fd3f9eb696e9a9aaf440e220a71e4cfe1f2042",
+  "name": "Asspp",
+  "privacy": {
+    "NSLocalNetworkUsageDescription": "Asspp requires this permission to communicate with install service on your device."
+  },
+  "entitlements": []
+}
