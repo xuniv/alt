@@ -156,6 +156,7 @@ jobs:
           from altsource.stage import Toolkit
           want = os.environ.get("APP") or ""
           bids = []
+          public_feather = False
           for path in sorted(glob.glob(os.path.join("apps", "*", "app.json"))):
               bid = os.path.basename(os.path.dirname(path))
               if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", bid) or re.search(r"-v\d", bid):
@@ -168,9 +169,12 @@ jobs:
               except (OSError, ValueError):
                   continue
               private = app.get("privateBuild") if isinstance(app, dict) else None
+              if want == bid == "thewonderofyou.Feather" and isinstance(app, dict):
+                  # The public mirror job handles this app without private keys.
+                  public_feather = True
               if isinstance(private, dict) and private.get("enabled") is True:
                   bids.append(bid)
-          if want and not bids:
+          if want and not bids and not public_feather:
               print("::error::the app does not enable privateBuild")
               sys.exit(1)
           apps = []
