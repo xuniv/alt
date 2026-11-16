@@ -103,3 +103,7 @@ PYTHONPATH=tools python3 -m unittest discover -s tests -t .
 
 Exit codes of `python3 -m altsource`: `0` success, `2` gate rejected, `3` conflict with a published
 release, `1` any other error (including usage errors).
+
+Feather is also mirrored from the public `xuniv/feather` releases through the existing poll and ingest
+workflows. Only stable versions from 2.9.3 with the exact unsigned IPA asset and a GitHub SHA-256
+digest are eligible; existing releases, withdrawn versions and pending ingests are preserved.

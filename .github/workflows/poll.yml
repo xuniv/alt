@@ -83,6 +83,31 @@ jobs:
           PYTHONPATH: tools
         run: python3 -m altsource.asspp
 
+  feather:
+    if: >-
+      github.ref == 'refs/heads/main' && !inputs.dry_run &&
+      (inputs.app == '' || inputs.app == 'thewonderofyou.Feather')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Listing saved drafts requires push access; publication stays in ingest.
+      contents: write
+      actions: write
+    concurrency:
+      group: alt-public-feather
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Mirror a verified public Feather release through the ingest gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALT_REPO: ${{ github.repository }}
+          PYTHONPATH: tools
+        run: python3 -m altsource.feather
+
   list:
     runs-on: ubuntu-latest
     timeout-minutes: 10

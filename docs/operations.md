@@ -501,3 +501,19 @@ decrypted by the new identity.
 The `asspp` job in the existing poll workflow reads public release metadata from `xuniv/Asspp`. Only the exact `Asspp-AltStore.ipa` URL and its GitHub-provided SHA-256 digest are accepted. A missing digest, a missing source variant, a pre-release, an existing release/draft, a withdrawal record, or a pending ingest run results in no dispatch. API authorization failures remain errors. The normal ingest workflow owns scanning, normalization, publication and catalog deployment.
 
 This job uses alt's own `GITHUB_TOKEN` with `contents: read` and `actions: write`. It receives no private app settings or denylist; those remain confined to the existing gate. New public Asspp versions are picked up by the existing poll loop. To publish immediately, dispatch `ingest.yml` with the verified source-variant URL, digest, version and bundle identifier `wiki.qaq.Asspp`.
+
+## Public Feather mirror
+
+The `feather` job in the existing poll loop reads public release metadata from `xuniv/feather`.
+It accepts only stable `vX.Y.Z` tags from 2.9.3 onward and the exact `Feather-unsigned.ipa` URL
+with a GitHub-provided SHA-256 digest. It dispatches the existing ingest workflow; normalization,
+the configured leak gate, publication and catalog/Pages updates are unchanged. The job receives
+only alt's `GITHUB_TOKEN` (`contents: write`, `actions: write`), no private app settings or denylist.
+Contents write is needed to see saved drafts in the release listing; the mirror itself only reads
+release state and dispatches ingest, which retains responsibility for publication.
+
+Drafts, pre-releases, duplicate/missing assets, missing digests, existing releases/drafts, withdrawal
+records and an outstanding version record without its release prevent automatic publication.
+A pending ingest defers the mirror to a later poll. Authorization errors fail closed. A dry-run
+poll or a poll scoped to another app does not run the Feather mirror. Withdrawn versions require
+an explicit operator action to publish again.
