@@ -185,6 +185,17 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "4.2.5",
+          "buildVersion": "1",
+          "marketingVersion": "4.2.5",
+          "date": "2026-11-16T08:51:15Z",
+          "localizedDescription": "Fix FairPlay and ADI initialization with zero-filled guest memory and correct repeated host callbacks. Reduce authentication startup memory. English source package.",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.5/Asspp-4.2.5.ipa",
+          "size": 81547316,
+          "sha256": "222bc7ae415b95550ded49e5fb0fd0ead645156a2602e7af308c21193f1e6792",
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "4.2.4",
           "buildVersion": "1",
           "marketingVersion": "4.2.4",
@@ -202,11 +213,11 @@
           "NSLocalNetworkUsageDescription": "Asspp requires this permission to communicate with install service on your device."
         }
       },
-      "version": "4.2.4",
-      "versionDate": "2026-11-16T07:22:20Z",
-      "versionDescription": "On-device Apple authentication and Store downloads, with local IPA import. English source package.",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.4/Asspp-4.2.4.ipa",
-      "size": 81536313
+      "version": "4.2.5",
+      "versionDate": "2026-11-16T08:51:15Z",
+      "versionDescription": "Fix FairPlay and ADI initialization with zero-filled guest memory and correct repeated host callbacks. Reduce authentication startup memory. English source package.",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.5/Asspp-4.2.5.ipa",
+      "size": 81547316
     }
   ]
 }

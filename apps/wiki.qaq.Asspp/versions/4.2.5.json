@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "tag": "wiki.qaq.Asspp-v4.2.5",
+  "bundleIdentifier": "wiki.qaq.Asspp",
+  "semver": "4.2.5",
+  "version": "4.2.5",
+  "buildVersion": "1",
+  "prerelease": false,
+  "date": "2026-11-16T08:51:15Z",
+  "localizedDescription": "Fix FairPlay and ADI initialization with zero-filled guest memory and correct repeated host callbacks. Reduce authentication startup memory. English source package.",
+  "downloadURL": "https://github.com/xuniv/alt/releases/download/wiki.qaq.Asspp-v4.2.5/Asspp-4.2.5.ipa",
+  "size": 81547316,
+  "sha256": "222bc7ae415b95550ded49e5fb0fd0ead645156a2602e7af308c21193f1e6792",
+  "minOSVersion": "17.0",
+  "releaseId": 446790607,
+  "assetId": 754124119,
+  "assetDigest": "sha256:222bc7ae415b95550ded49e5fb0fd0ead645156a2602e7af308c21193f1e6792",
+  "name": "Asspp",
+  "privacy": {
+    "NSLocalNetworkUsageDescription": "Asspp requires this permission to communicate with install service on your device."
+  },
+  "entitlements": []
+}
