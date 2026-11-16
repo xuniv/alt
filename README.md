@@ -61,6 +61,12 @@ and runs the catalog). Sync then drops it from `source.json` and records it in
 `apps/<bundleId>/retracted.json`, so a private build does not bring it back by itself. See
 [docs/operations.md](docs/operations.md#withdraw-a-version).
 
+## Asspp releases
+
+`wiki.qaq.Asspp` mirrors the public unsigned builds from `xuniv/Asspp`. The existing poll loop checks for a new `Asspp-AltStore.ipa`, requires GitHub's SHA-256 digest, and dispatches the normal ingest gate. It never republishes a withdrawn version or bypasses an existing staged release. The initial publication can also be dispatched through `ingest.yml`.
+
+The source's existing gate allows English resources only. Asspp therefore publishes an English-only source package alongside its normal localized IPA; both are unsigned. This route needs no cross-repository personal token or private-build credentials.
+
 ## Documentation
 
 - [docs/routes.md](docs/routes.md): the three routes, the tag grammar, what the gate rejects.

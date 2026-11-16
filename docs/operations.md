@@ -494,3 +494,10 @@ bin/alt payload-key --rotate
 
 Run it while no build is running: a build that encrypted its IPA to the old recipient cannot be
 decrypted by the new identity.
+
+
+## Public Asspp mirror
+
+The `asspp` job in the existing poll workflow reads public release metadata from `xuniv/Asspp`. Only the exact `Asspp-AltStore.ipa` URL and its GitHub-provided SHA-256 digest are accepted. A missing digest, a missing source variant, a pre-release, an existing release/draft, a withdrawal record, or a pending ingest run results in no dispatch. API authorization failures remain errors. The normal ingest workflow owns scanning, normalization, publication and catalog deployment.
+
+This job uses alt's own `GITHUB_TOKEN` with `contents: read` and `actions: write`. It receives no private app settings or denylist; those remain confined to the existing gate. New public Asspp versions are picked up by the existing poll loop. To publish immediately, dispatch `ingest.yml` with the verified source-variant URL, digest, version and bundle identifier `wiki.qaq.Asspp`.

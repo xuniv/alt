@@ -1,0 +1,10 @@
+{
+  "name": "Asspp",
+  "developerName": "Lakr233",
+  "subtitle": "App Store downloads and IPA installation",
+  "localizedDescription": "Manage Apple accounts, download apps you are entitled to use, and install IPA files. Apple authentication runs on the device, without a self-hosted authentication server. This unsigned fork includes the modern Store runtime and local IPA import. OTA installation requires installing and trusting the app's local CA profile in iOS Settings. The source package includes English resources.",
+  "category": "utilities",
+  "tintColor": "5B6CFF",
+  "includePrereleases": false,
+  "maxVersions": 10
+}
