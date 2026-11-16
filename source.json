@@ -153,6 +153,17 @@
       "category": "developer",
       "versions": [
         {
+          "version": "2.9.4",
+          "buildVersion": "2.9.4",
+          "marketingVersion": "2.9.4",
+          "date": "2026-11-16T09:52:56Z",
+          "localizedDescription": "Unsigned Feather app manager with local installation and user-managed patches. Sign with your own certificate before installing.",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.4/Feather-2.9.4.ipa",
+          "size": 14358793,
+          "sha256": "955588ce1d9ca2bb4a27feceac10d7f0266f2bdb6eea2a15290b14edaed3c5b7",
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "2.9.3",
           "buildVersion": "2.9.3",
           "marketingVersion": "2.9.3",
@@ -168,11 +179,11 @@
         "entitlements": [],
         "privacy": {}
       },
-      "version": "2.9.3",
-      "versionDate": "2026-11-16T06:59:14Z",
-      "versionDescription": "Unsigned Feather 2.9.3. Improves Local CA offline manifest handling, nested installation URL encoding, HEAD request handling and installation activity retention across system confirmation. Sign with your own certificate before installing.",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.3/Feather-2.9.3.ipa",
-      "size": 14355276
+      "version": "2.9.4",
+      "versionDate": "2026-11-16T09:52:56Z",
+      "versionDescription": "Unsigned Feather app manager with local installation and user-managed patches. Sign with your own certificate before installing.",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.4/Feather-2.9.4.ipa",
+      "size": 14358793
     },
     {
       "name": "Asspp",
