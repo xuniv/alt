@@ -34,6 +34,21 @@ class FeatherPollTests(unittest.TestCase):
         self.assertIsNone(feather.candidate(obj))
         self.assertIsNone(feather.candidate(None))
 
+    def test_fork_label_maps_to_numeric_ipa_version_without_changing_ingest_rules(self):
+        release = copy.deepcopy(RELEASE)
+        release.update(tag_name='v2.9.0-5', body='Fork version: `2.9.0-5`\nPackage version: `2.9.5`\n')
+        release['assets'][0]['browser_download_url'] = 'https://github.com/xuniv/feather/releases/download/v2.9.0-5/Feather-unsigned.ipa'
+        candidate = feather.candidate(release)
+        self.assertEqual(candidate['semver'], '2.9.5')
+        self.assertIn('2.9.0-5', candidate['notes'])
+        self.assertEqual(candidate['allow_home_paths'], 'false')
+        for body in [None, '', 'Fork version: `2.9.0-4`\nPackage version: `2.9.5`',
+                     'Fork version: `2.9.0-5`\nPackage version: `2.9.4`',
+                     release['body'] + 'Package version: `2.9.6`\n',
+                     release['body'].replace('2.9.5', '2.9.5-beta')]:
+            invalid = copy.deepcopy(release); invalid['body'] = body
+            self.assertIsNone(feather.candidate(invalid))
+
     def invoke(self, existing=False, withdrawn=False, recorded=False, pending=False, corrupt=False, corrupt_list=False):
         calls = []
         def api(method, path, **kwargs):

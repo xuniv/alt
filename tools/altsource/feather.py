@@ -15,6 +15,7 @@ BUNDLE = "thewonderofyou.Feather"
 UPSTREAM = "xuniv/feather"
 ASSET = "Feather-unsigned.ipa"
 SEMVER = re.compile(r"v(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\Z")
+FORK_TAG = re.compile(r"v(?P<upstream>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-(?P<fix>[1-9]\d*)\Z")
 DIGEST = re.compile(r"sha256:([0-9a-f]{64})\Z")
 NOTES = "Unsigned Feather app manager with local installation and user-managed patches. Sign with your own certificate before installing."
 
@@ -24,10 +25,28 @@ def candidate(release: Dict[str, Any]) -> Optional[Dict[str, str]]:
         return None
     tag = release.get("tag_name")
     match = SEMVER.fullmatch(tag) if isinstance(tag, str) else None
-    if not match:
-        return None
-    version = match["version"]
-    if tuple(map(int, version.split("."))) < (2, 9, 3):
+    fork = FORK_TAG.fullmatch(tag) if isinstance(tag, str) else None
+    notes = NOTES
+    if fork:
+        # Public fork labels have an upstream-revision suffix, while the IPA
+        # keeps an independent numeric version for iOS and catalog ordering.
+        # The ingest gate still validates this version against the actual IPA.
+        body = release.get("body")
+        if not isinstance(body, str):
+            return None
+        labels = re.findall(r"^Fork version: `([^`]+)`$", body, re.M)
+        packages = re.findall(r"^Package version: `([^`]+)`$", body, re.M)
+        if labels != [tag[1:]] or len(packages) != 1 or not SEMVER.fullmatch("v" + packages[0]):
+            return None
+        version = packages[0]
+        if tuple(map(int, version.split("."))) < (2, 9, 5):
+            return None
+        notes = "Feather fork " + tag[1:] + ". " + NOTES
+    elif match:
+        version = match["version"]
+        if tuple(map(int, version.split("."))) < (2, 9, 3):
+            return None
+    else:
         return None
     raw_assets = release.get("assets")
     if not isinstance(raw_assets, list):
@@ -42,7 +61,7 @@ def candidate(release: Dict[str, Any]) -> Optional[Dict[str, str]]:
     if not digest or asset.get("browser_download_url") != expected or type(asset.get("size")) is not int or asset["size"] <= 0:
         return None
     return {"url": expected, "sha256": digest[1], "semver": version,
-            "bundle_id": BUNDLE, "notes": NOTES, "allow_home_paths": "false"}
+            "bundle_id": BUNDLE, "notes": notes, "allow_home_paths": "false"}
 
 
 def poll(api: Callable[..., Any] = gh.api) -> str:
