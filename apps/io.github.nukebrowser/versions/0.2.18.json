@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "tag": "io.github.nukebrowser-v0.2.18",
+  "bundleIdentifier": "io.github.nukebrowser",
+  "semver": "0.2.18",
+  "version": "0.2.18",
+  "buildVersion": "1087",
+  "prerelease": false,
+  "date": "2026-11-17T11:59:31Z",
+  "localizedDescription": "Version 0.2.18",
+  "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.18/NukeBrowser-0.2.18.ipa",
+  "size": 88778565,
+  "sha256": "573b69eed4e7d444b3bdb2aa259439163a1f29cee47925d9f714452942f4cdb7",
+  "minOSVersion": "18.0",
+  "releaseId": 448568637,
+  "assetId": 758885121,
+  "assetDigest": "sha256:573b69eed4e7d444b3bdb2aa259439163a1f29cee47925d9f714452942f4cdb7",
+  "name": "NukeBrowser",
+  "privacy": {
+    "NSFaceIDUsageDescription": "NukeBrowser uses Face ID to unlock the app.",
+    "NSLocalNetworkUsageDescription": "NukeBrowser connects to WebDAV servers on your local network.",
+    "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
+  },
+  "entitlements": [],
+  "appJsonAssetId": 758885242
+}
