@@ -18,6 +18,17 @@
       "category": "photo-video",
       "versions": [
         {
+          "version": "0.2.19",
+          "buildVersion": "1090",
+          "marketingVersion": "0.2.19",
+          "date": "2026-11-18T02:10:41Z",
+          "localizedDescription": "Version 0.2.19",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.19/NukeBrowser-0.2.19.ipa",
+          "size": 89084008,
+          "sha256": "52110b0e5e36fff10fdc85dc1798a5ecf5e98c106487aba1370ab5a113e8f846",
+          "minOSVersion": "18.0"
+        },
+        {
           "version": "0.2.18",
           "buildVersion": "1087",
           "marketingVersion": "0.2.18",
@@ -115,17 +126,6 @@
           "size": 80934790,
           "sha256": "ad9c61029befbd11c4b69434d82f9ccad241f43757004fed76f4f2a9253f21d1",
           "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.2.8",
-          "buildVersion": "1063",
-          "marketingVersion": "0.2.8",
-          "date": "2026-10-29T06:37:13Z",
-          "localizedDescription": "Version 0.2.8",
-          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.8/NukeBrowser-0.2.8.ipa",
-          "size": 80535809,
-          "sha256": "513c869864209b7b2bbd7e880d807742f8b74290520b9057d37b1f4cb5631a1a",
-          "minOSVersion": "18.0"
         }
       ],
       "appPermissions": {
@@ -136,11 +136,11 @@
           "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
         }
       },
-      "version": "0.2.18",
-      "versionDate": "2026-11-17T11:59:31Z",
-      "versionDescription": "Version 0.2.18",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.18/NukeBrowser-0.2.18.ipa",
-      "size": 88778565
+      "version": "0.2.19",
+      "versionDate": "2026-11-18T02:10:41Z",
+      "versionDescription": "Version 0.2.19",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.19/NukeBrowser-0.2.19.ipa",
+      "size": 89084008
     },
     {
       "name": "Feather",
