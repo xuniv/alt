@@ -18,6 +18,17 @@
       "category": "photo-video",
       "versions": [
         {
+          "version": "0.3.0",
+          "buildVersion": "1095",
+          "marketingVersion": "0.3.0",
+          "date": "2026-11-19T10:43:57Z",
+          "localizedDescription": "Version 0.3.0",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.3.0/NukeBrowser-0.3.0.ipa",
+          "size": 88850308,
+          "sha256": "35123b18d10609a5bb1db333c82a61ee3d18398b467da2b12c076040f021ee12",
+          "minOSVersion": "18.0"
+        },
+        {
           "version": "0.2.20",
           "buildVersion": "1092",
           "marketingVersion": "0.2.20",
@@ -115,17 +126,6 @@
           "size": 88380062,
           "sha256": "70dde10dd297197054a92b47c59de9fa6841c19ae6e6289b519e44295ac8b554",
           "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.2.10",
-          "buildVersion": "1069",
-          "marketingVersion": "0.2.10",
-          "date": "2026-11-02T14:19:53Z",
-          "localizedDescription": "Version 0.2.10",
-          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.10/NukeBrowser-0.2.10.ipa",
-          "size": 81225656,
-          "sha256": "0303a472707eed458a476530315372d60c07e341f0751d78818c8fef7ca77979",
-          "minOSVersion": "18.0"
         }
       ],
       "appPermissions": {
@@ -136,11 +136,11 @@
           "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
         }
       },
-      "version": "0.2.20",
-      "versionDate": "2026-11-18T14:46:30Z",
-      "versionDescription": "Version 0.2.20",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.20/NukeBrowser-0.2.20.ipa",
-      "size": 89146593
+      "version": "0.3.0",
+      "versionDate": "2026-11-19T10:43:57Z",
+      "versionDescription": "Version 0.3.0",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.3.0/NukeBrowser-0.3.0.ipa",
+      "size": 88850308
     },
     {
       "name": "Feather",
