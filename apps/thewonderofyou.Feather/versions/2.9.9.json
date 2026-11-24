@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "tag": "thewonderofyou.Feather-v2.9.9",
+  "bundleIdentifier": "thewonderofyou.Feather",
+  "semver": "2.9.9",
+  "version": "2.9.9",
+  "buildVersion": "2.9.9",
+  "prerelease": false,
+  "date": "2026-11-24T09:41:24Z",
+  "localizedDescription": "Feather fork 2.9.0-9. Unsigned Feather app manager with local installation and user-managed patches. Sign with your own certificate before installing.",
+  "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.9/Feather-2.9.9.ipa",
+  "size": 13719969,
+  "sha256": "fd8399d5086eb60ea7e68a706310af87dd453c13e482dd1ee9a619f011d2c0ec",
+  "minOSVersion": "16.0",
+  "releaseId": 456554075,
+  "assetId": 786555696,
+  "assetDigest": "sha256:fd8399d5086eb60ea7e68a706310af87dd453c13e482dd1ee9a619f011d2c0ec",
+  "name": "Feather",
+  "privacy": {},
+  "entitlements": []
+}
