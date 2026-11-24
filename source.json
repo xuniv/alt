@@ -153,6 +153,17 @@
       "category": "developer",
       "versions": [
         {
+          "version": "2.9.6",
+          "buildVersion": "2.9.6",
+          "marketingVersion": "2.9.6",
+          "date": "2026-11-24T06:12:31Z",
+          "localizedDescription": "Feather fork 2.9.0-6. Local CA (Offline) opens the iOS installation confirmation directly. The Safari Web View bypass defaults to on. The numeric package version is 2.9.6.",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.6/Feather-2.9.6.ipa",
+          "size": 14474998,
+          "sha256": "73de89b970a62c896ea2d2447414adedf0aaa45b1d23c1549a004534cbad89bc",
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "2.9.5",
           "buildVersion": "2.9.5",
           "marketingVersion": "2.9.5",
@@ -190,11 +201,11 @@
         "entitlements": [],
         "privacy": {}
       },
-      "version": "2.9.5",
-      "versionDate": "2026-11-17T02:01:08Z",
-      "versionDescription": "Feather fork 2.9.0-5. Unsigned Feather app manager with local installation and user-managed patches. Sign with your own certificate before installing.",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.5/Feather-2.9.5.ipa",
-      "size": 14471437
+      "version": "2.9.6",
+      "versionDate": "2026-11-24T06:12:31Z",
+      "versionDescription": "Feather fork 2.9.0-6. Local CA (Offline) opens the iOS installation confirmation directly. The Safari Web View bypass defaults to on. The numeric package version is 2.9.6.",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/thewonderofyou.Feather-v2.9.6/Feather-2.9.6.ipa",
+      "size": 14474998
     },
     {
       "name": "Asspp",
