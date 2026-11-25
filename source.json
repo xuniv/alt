@@ -18,6 +18,17 @@
       "category": "photo-video",
       "versions": [
         {
+          "version": "0.3.4",
+          "buildVersion": "1103",
+          "marketingVersion": "0.3.4",
+          "date": "2026-11-25T13:51:21Z",
+          "localizedDescription": "Version 0.3.4",
+          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.3.4/NukeBrowser-0.3.4.ipa",
+          "size": 89015866,
+          "sha256": "3a621cac4615a9d024ff18fab6a751cb883074263fef3633123d7d5ec7be05d0",
+          "minOSVersion": "18.0"
+        },
+        {
           "version": "0.3.3",
           "buildVersion": "1101",
           "marketingVersion": "0.3.3",
@@ -115,17 +126,6 @@
           "size": 88471992,
           "sha256": "b2649a9a5f1d1c4637586a64164452df82b1da5f18c55d795275df6ed84088b9",
           "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.2.15",
-          "buildVersion": "1079",
-          "marketingVersion": "0.2.15",
-          "date": "2026-11-14T06:25:28Z",
-          "localizedDescription": "Version 0.2.15",
-          "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.2.15/NukeBrowser-0.2.15.ipa",
-          "size": 88414544,
-          "sha256": "babd8137d6fcd5213a10b41542baff2d8fd20b6b8dce36755bffd81e6f68ff7d",
-          "minOSVersion": "18.0"
         }
       ],
       "appPermissions": {
@@ -136,11 +136,11 @@
           "NSPhotoLibraryAddUsageDescription": "NukeBrowser saves images you choose to your photo library."
         }
       },
-      "version": "0.3.3",
-      "versionDate": "2026-11-24T10:14:10Z",
-      "versionDescription": "Version 0.3.3",
-      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.3.3/NukeBrowser-0.3.3.ipa",
-      "size": 88776001
+      "version": "0.3.4",
+      "versionDate": "2026-11-25T13:51:21Z",
+      "versionDescription": "Version 0.3.4",
+      "downloadURL": "https://github.com/xuniv/alt/releases/download/io.github.nukebrowser-v0.3.4/NukeBrowser-0.3.4.ipa",
+      "size": 89015866
     },
     {
       "name": "Feather",
